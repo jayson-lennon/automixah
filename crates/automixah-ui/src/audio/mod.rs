@@ -5,3 +5,4 @@ pub mod bands;
 pub mod output;
 pub mod peaks;
 pub mod scrub;
+pub mod scrub_state;

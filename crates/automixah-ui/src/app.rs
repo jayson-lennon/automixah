@@ -21,6 +21,16 @@ pub struct AutomixahUiApp {
     edit_grid: crate::grid::EditableGrid,
     /// Waveform hover position in seconds (action target).
     cursor_time: Option<f32>,
+    /// Scrub interaction state machine.
+    scrub: crate::audio::scrub_state::ScrubMachine,
+    /// cpal output engine; `None` until a track loads or if audio fails.
+    engine: Option<crate::audio::output::OutputEngine>,
+    /// Last audio-time position of the pointer while dragging.
+    drag_last_seconds: Option<f32>,
+    /// Last frame instant for drag-velocity computation.
+    last_frame_time: Option<std::time::Instant>,
+    /// Shared PCM for the audio thread.
+    pcm: Option<std::sync::Arc<Vec<f32>>>,
     /// Status line shown in the top bar.
     status: String,
 }
@@ -40,13 +50,56 @@ impl AutomixahUiApp {
                 downbeat_phase: 0,
             },
             cursor_time: None,
+            scrub: crate::audio::scrub_state::ScrubMachine::new(1.0),
+            engine: None,
+            drag_last_seconds: None,
+            last_frame_time: None,
+            pcm: None,
             status: "open a track to begin".to_owned(),
+        }
+    }
+}
+
+impl AutomixahUiApp {
+    /// Rebuilds the output engine for a freshly loaded track.
+    fn start_engine(&mut self, track: &crate::track::LoadedTrack) {
+        let pcm = std::sync::Arc::new(track.audio.samples.clone());
+        self.engine = match crate::audio::output::OutputEngine::start(
+            std::sync::Arc::clone(&pcm),
+            track.audio.sample_rate,
+            track.audio.channels.max(1) as usize,
+            0.0,
+        ) {
+            Ok(engine) => {
+                // unit_speed: 1× playback rate-folded to the device.
+                self.scrub = crate::audio::scrub_state::ScrubMachine::new(1.0);
+                Some(engine)
+            }
+            Err(report) => {
+                self.status = format!("audio unavailable: {report:?}");
+                None
+            }
+        };
+        self.pcm = Some(pcm);
+    }
+}
+
+impl AutomixahUiApp {
+    /// Sends the current scrub command to the audio thread.
+    fn push_command(&mut self) {
+        let cmd = self.scrub.command();
+        if let Some(engine) = self.engine.as_ref() {
+            *engine.command.lock() = cmd;
         }
     }
 }
 
 impl eframe::App for AutomixahUiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.scrub.toggle_play();
+            self.push_command();
+        }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let open = ui.button("Open…");
@@ -58,6 +111,7 @@ impl eframe::App for AutomixahUiApp {
                                 track.audio.sample_rate,
                             );
                             self.edit_grid = crate::grid::EditableGrid::from_grid(&track.grid);
+                            self.start_engine(&track);
                             self.status = format!(
                                 "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
                                 track.path.display(),
@@ -128,9 +182,34 @@ impl eframe::App for AutomixahUiApp {
                 crate::view::waveform::show(ui, peaks, &mut self.view, None);
             let seconds_per_pixel = self.view.frames_per_pixel / sample_rate;
             let time_at_left = self.view.left_frame / sample_rate;
-            self.cursor_time = response
+            let pointer_time = response
                 .hover_pos()
                 .map(|p| time_at_left + (p.x - rect.left()) * seconds_per_pixel);
+            self.cursor_time = pointer_time;
+
+            let frame_dt = self.last_frame_time.map_or(1.0 / 60.0, |t| {
+                let dt = t.elapsed().as_secs_f32();
+                if dt > 0.0 { dt } else { 1.0 / 240.0 }
+            });
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                self.scrub.drag_start();
+                self.drag_last_seconds = pointer_time;
+            }
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let (Some(now), Some(prev)) = (pointer_time, self.drag_last_seconds) {
+                    self.scrub.drag_move(now - prev, frame_dt);
+                }
+                self.drag_last_seconds = pointer_time;
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.scrub.drag_end();
+                self.drag_last_seconds = None;
+                // Jump the engine to the release position.
+                if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
+                    *engine.playhead().seek.write() = Some(t * sample_rate);
+                }
+            }
+
             let painter = ui.painter_at(rect);
             crate::view::grid::paint(
                 &painter,
@@ -140,11 +219,24 @@ impl eframe::App for AutomixahUiApp {
                 time_at_left,
                 end,
             );
+
+            if let Some(engine) = self.engine.as_ref() {
+                let pos = *engine.playhead().position.read() / sample_rate;
+                let x = rect.left() + (pos - time_at_left) / seconds_per_pixel;
+                let x = x.clamp(rect.left(), rect.right());
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 60)),
+                );
+            }
         });
 
-        // Keep the UI live while a track is loaded (playhead ticking later).
+        self.push_command();
+        self.last_frame_time = Some(std::time::Instant::now());
+
+        // Keep the UI live while a track is loaded (playhead ticking).
         if self.track.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 }
