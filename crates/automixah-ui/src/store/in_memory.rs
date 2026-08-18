@@ -41,6 +41,11 @@ impl GridStore for InMemoryGridStore {
         Ok(())
     }
 
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
+        self.grids.lock().remove(&hash.0);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "in-memory"
     }

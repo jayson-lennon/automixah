@@ -48,6 +48,7 @@ fn run() -> Result<(), Report<UiError>> {
 
         Services {
             grid_store: GridStoreService::new(std::sync::Arc::new(store)),
+            analysis: automixah_ui_lib::analysis::AnalysisCache::default(),
             runtime,
             paths,
         }

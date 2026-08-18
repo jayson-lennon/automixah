@@ -23,6 +23,7 @@ fn each_grid_mutation_flushes_one_put() {
             library_db: dir.path().join("library.sqlite"),
         },
         grid_store: GridStoreService::new(counting.clone()),
+        analysis: automixah_ui_lib::analysis::AnalysisCache::default(),
         runtime: std::sync::Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)

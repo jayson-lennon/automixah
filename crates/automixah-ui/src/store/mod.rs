@@ -64,6 +64,13 @@ pub trait GridStore: Send + Sync {
         grid: &GridOverride,
     ) -> Result<(), Report<GridStoreError>>;
 
+    /// Deletes the stored override for `hash`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>>;
+
     /// Backend name for debugging.
     fn name(&self) -> &'static str;
 }
@@ -114,6 +121,15 @@ impl GridStoreService {
         grid: &GridOverride,
     ) -> Result<(), Report<GridStoreError>> {
         self.backend.put(hash, grid).await
+    }
+
+    /// Deletes the override for `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
+        self.backend.delete(hash).await
     }
 
     /// Backend name for debugging.
@@ -182,6 +198,10 @@ impl GridStore for CountingStore {
     ) -> Result<(), Report<GridStoreError>> {
         self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.backend.put(hash, grid).await
+    }
+
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
+        self.backend.delete(hash).await
     }
 
     fn name(&self) -> &'static str {

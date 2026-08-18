@@ -145,6 +145,18 @@ impl GridStore for SqliteGridStore {
         Ok(())
     }
 
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
+        self.pool
+            .execute(
+                "DELETE FROM beat_grids WHERE track_hash = ?",
+                vec![Box::new(hash.0.clone())],
+            )
+            .await
+            .change_context(GridStoreError)
+            .attach("failed to delete grid override")?;
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "sqlite"
     }

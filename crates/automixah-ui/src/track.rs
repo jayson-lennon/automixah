@@ -67,9 +67,12 @@ pub enum LoadStage {
     /// Reading + hashing the file bytes.
     Hashing,
     /// Container decode to PCM.
+    /// Container decode to PCM.
     Decoding,
     /// Beat-grid analysis + peak extraction.
     Analyzing,
+    /// Analysis skipped: session cache hit for this exact content.
+    CacheHit,
 }
 
 /// Events emitted by [`spawn_load`]; poll the receiver each frame.
@@ -92,6 +95,7 @@ pub enum LoadEvent {
 pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = services.runtime.handle().clone();
+    let analysis_cache = services.analysis.clone();
     handle.spawn_blocking(move || {
         let send_stage = |stage: LoadStage| {
             let _ = tx.send(LoadEvent::Stage(stage));
@@ -122,13 +126,22 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
             Err(report) => return send_done(Err(format!("{report:#}"))),
         };
 
-        send_stage(LoadStage::Analyzing);
-        let AnalyzerOutput {
-            beat_grid: auto_grid,
-            ..
-        } = match analyze(&audio) {
-            Ok(out) => out,
-            Err(report) => return send_done(Err(format!("{report:#}"))),
+        // Session analysis cache: skip the analyzing stage when the exact
+        // content was analyzed earlier in this session.
+        let auto_grid = match analysis_cache.get(&hash) {
+            Some(cached) => {
+                send_stage(LoadStage::CacheHit);
+                cached
+            }
+            None => {
+                send_stage(LoadStage::Analyzing);
+                let AnalyzerOutput { beat_grid, .. } = match analyze(&audio) {
+                    Ok(out) => out,
+                    Err(report) => return send_done(Err(format!("{report:#}"))),
+                };
+                analysis_cache.put(hash.clone(), beat_grid.clone());
+                beat_grid
+            }
         };
         #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
         let duration_seconds = audio.frames() as f32 / audio.sample_rate as f32;
@@ -267,6 +280,7 @@ mod tests {
         let services = Services {
             paths: AppPaths::for_test(dir.path()),
             grid_store: GridStoreService::new(std::sync::Arc::new(InMemoryGridStore::new())),
+            analysis: crate::analysis::AnalysisCache::default(),
             runtime,
         };
         (services, dir)
@@ -403,6 +417,42 @@ mod tests {
         assert_eq!(track.path, path);
         assert_eq!(track.grid_source, GridSource::Auto);
         assert!(!peaks.data.is_empty(), "peaks built off-thread");
+    }
+
+    // Given a track loaded once through spawn_load.
+    // When the identical file is spawned again in the same session.
+    // Then the second load reports a cache hit instead of analyzing.
+    #[test]
+    fn spawn_load_second_pass_hits_cache() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
+
+        let drain = |rx: std::sync::mpsc::Receiver<LoadEvent>| {
+            loop {
+                match rx.recv() {
+                    Ok(LoadEvent::Stage(_)) => (),
+                    Ok(LoadEvent::Done(payload)) => break *payload,
+                    Err(_) => unreachable!("channel closed before Done"),
+                }
+            }
+        };
+
+        drain(spawn_load(&services, path.clone())).expect("first load");
+        let rx = spawn_load(&services, path);
+        let mut saw_cache_hit = false;
+        loop {
+            match rx.recv() {
+                Ok(LoadEvent::Stage(LoadStage::CacheHit)) => saw_cache_hit = true,
+                Ok(LoadEvent::Stage(_)) => (),
+                Ok(LoadEvent::Done(payload)) => {
+                    payload.expect("second load");
+                    break;
+                }
+                Err(_) => unreachable!("channel closed before Done"),
+            }
+        }
+        assert!(saw_cache_hit, "second load must skip analysis");
     }
 
     // Given a nonexistent path.

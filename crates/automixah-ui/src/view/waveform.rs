@@ -16,6 +16,9 @@ pub struct WaveformView {
     pub frames_per_pixel: f32,
     /// Frame index at the left edge of the view.
     pub left_frame: f32,
+    /// Horizontal position of the pinned playhead line, as a fraction of
+    /// the viewport width (0.0 = left edge, 0.5 = center, 1.0 = right).
+    pub playhead_frac: f32,
 }
 
 impl Default for WaveformView {
@@ -23,6 +26,7 @@ impl Default for WaveformView {
         Self {
             frames_per_pixel: FRAMES_PER_PIXEL_MAX,
             left_frame: 0.0,
+            playhead_frac: 0.5,
         }
     }
 }
@@ -49,6 +53,15 @@ impl WaveformView {
             (self.frames_per_pixel * factor).clamp(FRAMES_PER_PIXEL_MIN, FRAMES_PER_PIXEL_MAX);
         self.left_frame = anchor_frame - anchor_px * self.frames_per_pixel;
     }
+
+    /// Places the view so `frame` sits at the pinned playhead position.
+    ///
+    /// The waveform moves around the playhead:
+    /// `left = frame − frac · visible`.
+    pub fn pin_frame(&mut self, frame: f32, width_px: f32) {
+        let visible = self.visible_frames(width_px);
+        self.left_frame = frame - self.playhead_frac * visible;
+    }
 }
 
 /// Renders the waveform and returns `(response, rect, sample_rate)` — the
@@ -57,7 +70,7 @@ pub fn show(
     ui: &mut egui::Ui,
     peaks: &Peaks,
     view: &mut WaveformView,
-    center_frame: Option<f32>,
+    pin_frame: Option<f32>,
 ) -> (Response, Rect, f32) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let mut response = response;
@@ -66,7 +79,7 @@ pub fn show(
     let total = total_frames(peaks);
 
     view.clamp_pan(total, width);
-    handle_input(&mut response, view, rect, center_frame);
+    handle_input(&mut response, view, rect, pin_frame);
     view.clamp_pan(total, width);
 
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
@@ -82,26 +95,30 @@ pub fn total_frames(peaks: &Peaks) -> f32 {
     peaks.data.len() as f32 * peaks.stride_frames
 }
 
-/// Wheel-zoom at cursor, drag-to-pan (or scrub), center-follow while playing.
+/// Wheel-zoom (at the pinned playhead while following, at the cursor
+/// otherwise) and playhead-pinned follow: the view is placed so the
+/// playhead sits at `playhead_frac` of the viewport width.
 fn handle_input(
     response: &mut Response,
     view: &mut WaveformView,
     rect: Rect,
-    center_frame: Option<f32>,
+    pin_frame: Option<f32>,
 ) {
-    // No pan branch: scrub subsumes pan; the view follows the playhead.
-
-    if let Some(pos) = response.hover_pos() {
+    let width = rect.width();
+    if let Some(frame) = pin_frame {
+        // Following: zoom keeps the pinned playhead fixed, not the cursor.
+        let wheel = response.ctx.input(|i| i.raw_scroll_delta.y);
+        if wheel != 0.0 {
+            view.zoom_at((wheel / 200.0).exp(), view.playhead_frac * width);
+        }
+        view.pin_frame(frame, width);
+    } else if let Some(pos) = response.hover_pos() {
+        // Not following (no engine): free zoom at the cursor.
         let anchor_px = pos.x - rect.left();
         let wheel = response.ctx.input(|i| i.raw_scroll_delta.y);
         if wheel != 0.0 {
             view.zoom_at((wheel / 200.0).exp(), anchor_px);
         }
-    }
-
-    if let Some(frame) = center_frame {
-        let visible = view.visible_frames(rect.width());
-        view.left_frame = frame - visible / 2.0;
     }
 }
 
@@ -206,6 +223,7 @@ mod tests {
         WaveformView {
             frames_per_pixel: fpp,
             left_frame: left,
+            playhead_frac: 0.5,
         }
     }
 
@@ -300,6 +318,17 @@ mod tests {
         let anchor_frame_after = view.left_frame + anchor_px * view.frames_per_pixel;
         assert!((anchor_frame_before - anchor_frame_after).abs() < 1e-3);
         assert_eq!(view.frames_per_pixel, 20.0);
+    }
+
+    // Given a pinned playhead at 25% of a 200 px viewport.
+    // When pinning frame 1000.
+    // Then the left edge is 1000 - 0.25 * (fpp * 200).
+    #[test]
+    fn pin_frame_places_frame_at_frac() {
+        let mut view = view_at(10.0, 0.0);
+        view.playhead_frac = 0.25;
+        view.pin_frame(1000.0, 200.0);
+        assert_eq!(view.left_frame, 1000.0 - 0.25 * 10.0 * 200.0);
     }
 
     // Given a view scrolled past the track end.

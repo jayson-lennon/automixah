@@ -69,6 +69,8 @@ pub struct Services {
     pub paths: AppPaths,
     /// Grid override persistence (SQLite behind a trait).
     pub grid_store: GridStoreService,
+    /// Session-local analysis cache (hash → detected grid).
+    pub analysis: crate::analysis::AnalysisCache,
     /// Shared async runtime, kept alive for the app's lifetime.
     ///
     /// An `Arc<Runtime>` (not a bare `Handle`): dropping the `Runtime`

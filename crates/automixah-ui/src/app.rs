@@ -56,7 +56,6 @@ pub struct AutomixahUiApp {
     /// Locked drag mode (chosen at drag start).
     drag_mode: DragMode,
     /// Last audio-time position of the pointer while dragging.
-    drag_last_seconds: Option<f32>,
     /// Last frame instant for drag-velocity computation.
     last_frame_time: Option<std::time::Instant>,
     /// Shared PCM for the audio thread.
@@ -132,7 +131,6 @@ impl AutomixahUiApp {
             scrub: crate::audio::scrub_state::ScrubMachine::new(1.0),
             engine: None,
             drag_mode: DragMode::None,
-            drag_last_seconds: None,
             last_frame_time: None,
             loading: None,
             save_outcomes: std::sync::mpsc::channel(),
@@ -142,8 +140,6 @@ impl AutomixahUiApp {
         }
     }
 }
-
-impl AutomixahUiApp {}
 
 impl AutomixahUiApp {
     /// Marks the current grid dirty; flushed on the next frame.
@@ -214,8 +210,6 @@ impl AutomixahUiApp {
     }
 }
 
-impl AutomixahUiApp {}
-
 impl AutomixahUiApp {
     /// Sends the current scrub command to the audio thread.
     fn push_command(&mut self) {
@@ -223,6 +217,24 @@ impl AutomixahUiApp {
         if let Some(engine) = self.engine.as_ref() {
             *engine.command.lock() = cmd;
         }
+    }
+
+    /// Re-analyzes the current track: drops the session cache entry and the
+    /// stored manual override, clears the waveform, and reloads so the
+    /// analyzing stage runs fresh.
+    fn reanalyze_current(&mut self) {
+        let Some(track) = self.track.take() else {
+            return;
+        };
+        self.services.analysis.invalidate(&track.hash);
+        let hash = track.hash.clone();
+        let store = self.services.grid_store.clone();
+        self.services.runtime.handle().spawn(async move {
+            let _ = store.delete(&hash).await;
+        });
+        self.peaks = None;
+        self.engine = None;
+        self.loading = Some(crate::track::spawn_load(&self.services, track.path.clone()));
     }
 
     /// Drains pending load events; applies the track when the load lands.
@@ -238,6 +250,7 @@ impl AutomixahUiApp {
                         crate::track::LoadStage::Hashing => "hashing…".to_owned(),
                         crate::track::LoadStage::Decoding => "decoding…".to_owned(),
                         crate::track::LoadStage::Analyzing => "analyzing…".to_owned(),
+                        crate::track::LoadStage::CacheHit => "cached analysis…".to_owned(),
                     };
                 }
                 crate::track::LoadEvent::Done(payload) => terminal = Some(payload),
@@ -291,11 +304,21 @@ impl eframe::App for AutomixahUiApp {
                         .set_title("Open audio track")
                         .add_filter("audio", &extensions);
                     if let Some(path) = dialog.pick_file() {
+                        // Clear the current track while the load runs:
+                        // the waveform disappears until the new one lands.
+                        self.track = None;
+                        self.peaks = None;
+                        self.engine = None;
                         self.loading = Some(crate::track::spawn_load(&self.services, path));
                     }
                 }
                 if self.loading.is_some() {
                     ui.spinner();
+                }
+                let can_reanalyze = self.loading.is_none() && self.track.is_some();
+                let reanalyze = ui.add_enabled(can_reanalyze, egui::Button::new("re-analyze"));
+                if reanalyze.clicked() {
+                    self.reanalyze_current();
                 }
                 ui.separator();
                 ui.label(&self.status);
@@ -305,16 +328,22 @@ impl eframe::App for AutomixahUiApp {
         egui::SidePanel::right("grid_controls").show(ctx, |ui| {
             let end = self.track.as_ref().map_or(0.0, |t| t.duration_seconds);
             ui.horizontal(|ui| {
-                let cursor = self.cursor_time;
-                if let Some(c) = cursor {
+                if let Some(c) = self.cursor_time {
                     if ui.button("snap beat → cursor").clicked() {
                         self.edit_grid.snap_nearest_beat(c);
+                        self.schedule_save();
                     }
                     if ui.button("set downbeat @ cursor").clicked() {
                         self.edit_grid.set_downbeat_at(c);
+                        self.schedule_save();
                     }
                 }
             });
+            ui.add(
+                egui::Slider::new(&mut self.view.playhead_frac, 0.05..=0.95)
+                    .text("playhead x")
+                    .custom_formatter(|n, _| format!("{n:.0}%")),
+            );
             if crate::view::grid::controls(ui, &mut self.edit_grid, end) {
                 self.schedule_save();
                 self.status = format!(
@@ -358,7 +387,11 @@ impl eframe::App for AutomixahUiApp {
             let pointer_time = response
                 .hover_pos()
                 .map(|p| time_at_left + (p.x - rect.left()) * seconds_per_pixel);
-            self.cursor_time = pointer_time;
+            // Latch: keep the last valid cursor time so the cursor buttons
+            // stay visible when the pointer leaves the waveform.
+            if pointer_time.is_some() {
+                self.cursor_time = pointer_time;
+            }
 
             let frame_dt = self.last_frame_time.map_or(1.0 / 60.0, |t| {
                 let dt = t.elapsed().as_secs_f32();
@@ -367,12 +400,16 @@ impl eframe::App for AutomixahUiApp {
             // Drag mode locks at drag start: SHIFT → grid move, else scrub.
             let shift_now = ctx.input(|i| i.modifiers.shift);
             if response.drag_started_by(egui::PointerButton::Primary) {
+                // Confine the cursor for the gesture so rapid dragging works
+                // even when the pointer outruns the window.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                    egui::viewport::CursorGrab::Confined,
+                ));
                 if shift_now {
                     self.drag_mode = DragMode::MoveGrid;
                 } else {
                     self.drag_mode = DragMode::Scrub;
                     self.scrub.drag_start();
-                    self.drag_last_seconds = pointer_time;
                 }
             }
             match self.drag_mode {
@@ -388,19 +425,26 @@ impl eframe::App for AutomixahUiApp {
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
                         self.drag_mode = DragMode::None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                            egui::viewport::CursorGrab::None,
+                        ));
                     }
                 }
                 DragMode::Scrub => {
                     if response.dragged_by(egui::PointerButton::Primary) {
-                        if let (Some(now), Some(prev)) = (pointer_time, self.drag_last_seconds) {
-                            self.scrub.drag_move(now - prev, frame_dt);
-                        }
-                        self.drag_last_seconds = pointer_time;
+                        // Screen-space delta: the view recenters under the
+                        // pinned playhead each frame, so measuring the
+                        // cursor's *time* between frames would double-count
+                        // the recenter and jump. Pixels are stable.
+                        let dx = response.drag_delta().x;
+                        self.scrub.drag_move(dx * seconds_per_pixel, frame_dt);
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
                         self.scrub.drag_end();
-                        self.drag_last_seconds = None;
                         self.drag_mode = DragMode::None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                            egui::viewport::CursorGrab::None,
+                        ));
                         // Jump the engine to the release position.
                         if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
                             *engine.playhead().seek.write() = Some(t * sample_rate);
@@ -410,11 +454,15 @@ impl eframe::App for AutomixahUiApp {
                 DragMode::None => {}
             }
             // Plain click (no drag) seeks the playhead; grid untouched.
+            // Position is written too so the pinned view re-centers on the
+            // very next paint instead of waiting for an audio callback.
             if response.clicked()
                 && !shift_now
                 && let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref())
             {
                 *engine.playhead().seek.write() = Some(t * sample_rate);
+                *engine.playhead().position.write() = t * sample_rate;
+                ctx.request_repaint();
             }
 
             let painter = ui.painter_at(rect);
@@ -427,10 +475,9 @@ impl eframe::App for AutomixahUiApp {
                 end,
             );
 
-            if let Some(engine) = self.engine.as_ref() {
-                let pos = *engine.playhead().position.read() / sample_rate;
-                let x = rect.left() + (pos - time_at_left) / seconds_per_pixel;
-                let x = x.clamp(rect.left(), rect.right());
+            if self.engine.is_some() {
+                // Pinned playhead: fixed x at `playhead_frac` of the viewport.
+                let x = rect.left() + self.view.playhead_frac * rect.width();
                 painter.line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                     egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 210, 60)),
