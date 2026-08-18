@@ -118,7 +118,6 @@ impl GridStoreService {
 
     /// Backend name for debugging.
     #[must_use]
-    #[expect(dead_code, reason = "used by Debug and the phase-5 status line")]
     pub fn name(&self) -> &'static str {
         self.backend.name()
     }

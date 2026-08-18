@@ -8,6 +8,10 @@ egui desktop tool for manual beat-grid alignment: Mixxx-style waveform,
 grid editing, vinyl-style scrub audition, SQLite grid library.
 """
 
+[lib]
+name = "automixah_ui_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "automixah-ui"
 path = "src/main.rs"

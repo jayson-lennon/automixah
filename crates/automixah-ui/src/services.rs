@@ -16,13 +16,6 @@ use crate::store::GridStoreService;
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     /// XDG data directory (`~/.local/share/automixah`).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "library_db already derives from it; future stores will read it"
-        )
-    )]
     pub data_dir: PathBuf,
     /// Grid library database (`<data_dir>/library.sqlite`).
     pub library_db: PathBuf,
@@ -74,10 +67,6 @@ pub struct AppPathsError;
 #[derive(Debug, Clone)]
 pub struct Services {
     /// Resolved application paths.
-    #[expect(
-        dead_code,
-        reason = "grid store owns the resolved DB path; kept for future services"
-    )]
     pub paths: AppPaths,
     /// Grid override persistence (SQLite behind a trait).
     pub grid_store: GridStoreService,

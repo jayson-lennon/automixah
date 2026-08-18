@@ -93,8 +93,8 @@ impl SqliteGridStore {
     }
 
     /// Exposes the pool for future sibling stores sharing `library.sqlite`.
+    #[cfg_attr(not(test), allow(dead_code, reason = "future sibling stores"))]
     #[must_use]
-    #[expect(dead_code, reason = "sibling stores arrive with phase 5+")]
     pub fn pool(&self) -> &Pool {
         &self.pool
     }

@@ -19,10 +19,6 @@ pub struct InMemoryGridStore {
 impl InMemoryGridStore {
     /// Creates an empty store.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used once the phase-5 UI save path lands")
-    )]
     pub fn new() -> Self {
         Self::default()
     }

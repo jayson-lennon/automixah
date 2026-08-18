@@ -87,7 +87,8 @@ pub fn show(
 }
 
 /// Total source frames represented by the peak track.
-fn total_frames(peaks: &Peaks) -> f32 {
+#[must_use]
+pub fn total_frames(peaks: &Peaks) -> f32 {
     peaks.data.len() as f32 * peaks.stride_frames
 }
 

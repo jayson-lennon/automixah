@@ -24,10 +24,6 @@ pub struct LoadedTrack {
     /// Effective grid: manual override if present, else the auto grid.
     pub grid: BeatGrid,
     /// Where the effective grid came from.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "surfaces in the phase-3 status line")
-    )]
     pub grid_source: GridSource,
 }
 
