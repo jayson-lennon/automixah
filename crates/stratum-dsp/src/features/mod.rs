@@ -3,7 +3,7 @@
 //! This module contains all feature extraction algorithms:
 //! - Onset detection (4 methods + consensus)
 //! - Period estimation (BPM detection)
-//! - Beat tracking (HMM + Bayesian)
+//! - Beat tracking (DP marking + constant-grid fit)
 //! - Chroma extraction
 //! - Key detection
 

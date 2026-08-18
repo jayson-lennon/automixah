@@ -289,10 +289,57 @@ fn next_transition(
             b_cue_session: SessionTime::ZERO,
             session_bpm,
             sample_rate,
+            a_grid_phase: if grid_confident {
+                a_grid_phase(a, session_bpm, sample_rate, cursor, stretched_len)
+            } else {
+                None
+            },
         },
     );
 
     Some((window, PresetName(transition_name.to_owned())))
+}
+
+/// A's stretched-grid phase in session samples, when its grid is
+/// confident: the session position of A's first grid beat at or
+/// after the source cue, computed from the grid anchor and the
+/// stretch ratio, then reduced onto the session beat grid.
+///
+/// A source beat at `t` lands at session time
+/// `session_start + (t - cue_seconds) * ratio`, and because every
+/// deck stretches by `grid_bpm/session_bpm`, the stretched beat
+/// period is exactly `60/session_bpm` — so this one phase pins
+/// A's whole beat pattern onto the shared session grid.
+fn a_grid_phase(
+    a: &TrackAnalysis,
+    session_bpm: f32,
+    sample_rate: u32,
+    session_start: SessionTime,
+    stretched_len: SessionTime,
+) -> Option<SessionTime> {
+    let grid_bpm = a.beat_grid.grid_bpm;
+    if !grid_bpm.is_finite() || grid_bpm <= 0.0 {
+        return None;
+    }
+    let cue_seconds = f64::from(session_start.as_seconds(sample_rate));
+    let ratio = f64::from(decide_stretch(a.bpm, session_bpm, a.sample_rate, sample_rate).ratio);
+    // First grid beat at or after time zero in source time: beats
+    // sit at anchor + n * beat_len, so n = ceil(-anchor / beat_len).
+    let beat_len = 60.0 / f64::from(grid_bpm);
+    let anchor = f64::from(a.beat_grid.anchor_seconds);
+    let n = (-anchor / beat_len).ceil();
+    let first_beat = anchor + n * beat_len;
+    let session_beat = 60.0 / f64::from(session_bpm);
+    let offset = ((first_beat - cue_seconds) * ratio).rem_euclid(session_beat);
+    let phase_samples = session_start
+        .0
+        .saturating_add(SessionTime::from_seconds(offset as f32, sample_rate).0);
+    // Guard: the phase must lie within A's audible session span.
+    let span_end = session_start.0.saturating_add(stretched_len.0);
+    if phase_samples > span_end {
+        return None;
+    }
+    Some(SessionTime(phase_samples))
 }
 
 /// Builds a synthetic [`TrackAnalysis`] for tests.
@@ -508,7 +555,7 @@ mod tests {
         );
         assert_eq!(
             snapshot,
-            "bpm=124.0 segments=4 first_len=18106608 second_start=16740931 cut_preset=LongCrossfade"
+            "bpm=124.0 segments=4 first_len=18106608 second_start=16750330 cut_preset=LongCrossfade"
         );
     }
 }

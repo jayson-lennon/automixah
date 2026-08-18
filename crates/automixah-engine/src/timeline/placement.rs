@@ -152,6 +152,10 @@ pub struct WindowInputs {
     pub session_bpm: f32,
     /// Engine sample rate.
     pub sample_rate: u32,
+    /// A's stretched-grid phase in session samples: a session-grid
+    /// beat that A's beat grid lands on. `None` when A's grid is
+    /// unconfident (fallback path, no snapping).
+    pub a_grid_phase: Option<SessionTime>,
 }
 
 /// Places the A→B transition window in *session* time.
@@ -178,6 +182,7 @@ pub fn place_window(
         b_cue_session: _,
         session_bpm,
         sample_rate,
+        a_grid_phase,
     } = inputs;
 
     let beat = 60.0 / session_bpm;
@@ -202,7 +207,61 @@ pub fn place_window(
     let len = requested.0.clamp(min_len as u64, max_len);
     let start = SessionTime(end.0.saturating_sub(len));
 
-    TransitionWindow { start, end }
+    match a_grid_phase {
+        Some(phase) => snap_window(phase, beat, sample_rate, start, end),
+        None => TransitionWindow { start, end },
+    }
+}
+
+/// Snaps both window boundaries to the nearest session-grid beat
+/// of A's stretched grid, keeping `end` from passing A's session
+/// end and the length at or above one bar.
+fn snap_window(
+    phase: SessionTime,
+    beat: f32,
+    sample_rate: u32,
+    start: SessionTime,
+    end: SessionTime,
+) -> TransitionWindow {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "sample counts fit f32 mantissa in practice"
+    )]
+    let beat_samples = (beat * sample_rate as f32) as u64;
+
+    let start_snap = snap_to_grid(start, phase, beat_samples);
+    let mut end_snap = snap_to_grid(end, phase, beat_samples);
+
+    // Clamp inward: the window must not extend past A's session
+    // end nor shrink below one bar.
+    if end_snap > end {
+        end_snap = SessionTime(end_snap.0.saturating_sub(beat_samples));
+    }
+    let min_samples = beat_samples * u64::from(BEATS_PER_BAR as u32);
+    if end_snap.0.saturating_sub(start_snap.0) < min_samples {
+        return TransitionWindow { start, end };
+    }
+    TransitionWindow {
+        start: start_snap,
+        end: end_snap,
+    }
+}
+
+/// Nearest grid beat to `t` on the grid `phase + k·beat`.
+fn snap_to_grid(t: SessionTime, phase: SessionTime, beat_samples: u64) -> SessionTime {
+    let delta = t.0.abs_diff(phase.0);
+    let beats_up = delta.div_ceil(beat_samples);
+    let down = phase
+        .0
+        .saturating_sub(beats_up.saturating_mul(beat_samples));
+    let up = phase
+        .0
+        .saturating_add(beats_up.saturating_mul(beat_samples));
+    if t.0.abs_diff(down) <= t.0.abs_diff(up) {
+        SessionTime(down)
+    } else {
+        SessionTime(up)
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +349,7 @@ mod tests {
                 b_cue_session: SessionTime(500_000),
                 session_bpm: 120.0,
                 sample_rate: 44_100,
+                a_grid_phase: None,
             },
         );
 
@@ -317,6 +377,7 @@ mod tests {
                 b_cue_session: SessionTime(900_000),
                 session_bpm: 120.0,
                 sample_rate: 44_100,
+                a_grid_phase: None,
             },
         );
 
@@ -343,6 +404,7 @@ mod tests {
                 b_cue_session: SessionTime(9_000),
                 session_bpm: 120.0,
                 sample_rate: 44_100,
+                a_grid_phase: None,
             },
         );
 
@@ -364,6 +426,7 @@ mod tests {
                 b_cue_session: SessionTime(0),
                 session_bpm: 120.0,
                 sample_rate: 44_100,
+                a_grid_phase: None,
             },
         );
 
@@ -427,5 +490,38 @@ mod tests {
             beats,
             bars: Vec::new(),
         }
+    }
+
+    #[test]
+    fn window_snaps_to_session_grid_phase() {
+        // Given a confident grid and a session at 150 BPM with an
+        // arbitrary phase offset of 37_000 samples.
+        let g = grid(2.0, 60);
+        let a = anchors_from_grid(&g, 120.0).expect("anchors");
+        let beat_samples = SessionTime::from_seconds(60.0 / 150.0, 44_100).0;
+        let phase = SessionTime(37_000);
+
+        // When placing a 64-beat window ending at 1_000_000 with a
+        // grid phase.
+        let w = place_window(
+            Some(&a),
+            Some(&a),
+            WindowInputs {
+                preset_beats: 64,
+                a_session_end: SessionTime(3_000_000),
+                b_cue_session: SessionTime(1_500_000),
+                session_bpm: 150.0,
+                sample_rate: 44_100,
+                a_grid_phase: Some(phase),
+            },
+        );
+
+        // Then both boundaries sit exactly on the session grid
+        // (phase + k * beat_samples).
+        assert_eq!((w.start.0 - phase.0) % beat_samples, 0);
+        assert_eq!((w.end.0 - phase.0) % beat_samples, 0);
+        assert!(w.end.0 <= 3_000_000);
+        // And the length stays near the requested 64 beats.
+        assert!(w.len_samples() >= beat_samples * 60);
     }
 }
