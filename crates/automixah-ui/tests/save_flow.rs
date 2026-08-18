@@ -13,8 +13,8 @@ use automixah_ui_lib::store::{GridOverride, GridStoreService};
 // Given an app over a counting in-memory store with a loaded track.
 // When the grid is mutated three times (shift, shift, downbeat).
 // Then exactly three puts flush and the last value round-trips.
-#[tokio::test(flavor = "multi_thread")]
-async fn each_grid_mutation_flushes_one_put() {
+#[test]
+fn each_grid_mutation_flushes_one_put() {
     let dir = tempfile::tempdir().expect("temp");
     let counting = Arc::new(CountingStore::new(Arc::new(InMemoryGridStore::new())));
     let services = Services {
@@ -23,7 +23,13 @@ async fn each_grid_mutation_flushes_one_put() {
             library_db: dir.path().join("library.sqlite"),
         },
         grid_store: GridStoreService::new(counting.clone()),
-        handle: tokio::runtime::Handle::current(),
+        runtime: std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        ),
     };
 
     let mut app = AutomixahUiApp::new(services);
@@ -40,7 +46,7 @@ async fn each_grid_mutation_flushes_one_put() {
     app.flush_save_if_due_for_test();
 
     // Give the spawned puts a beat to run.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     assert_eq!(counting.puts(), 3, "one put per mutation");
 }

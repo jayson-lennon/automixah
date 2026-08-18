@@ -3,9 +3,6 @@
 //! Runtime state (`UiState`) lives here, separate from the DI container
 //! (`Services`), which is cloned in at construction and never mutated.
 
-use std::path::PathBuf;
-
-use automixah_engine::timeline::types::TrackHash;
 use djcore::decoder::DecoderRegistry;
 use eframe::egui;
 
@@ -84,9 +81,9 @@ pub struct AutomixahUiApp {
 #[cfg(any(test, feature = "__test-hooks"))]
 impl AutomixahUiApp {
     /// Simulates a loaded track for save-path testing.
-    pub fn inject_track_for_test(&mut self, hash: TrackHash) {
+    pub fn inject_track_for_test(&mut self, hash: automixah_engine::timeline::types::TrackHash) {
         self.track = Some(crate::track::LoadedTrack {
-            path: PathBuf::from("test.ogg"),
+            path: std::path::PathBuf::from("test.ogg"),
             hash,
             audio: djcore::decoder::DecodeAudio {
                 samples: Vec::new(),
@@ -182,7 +179,7 @@ impl AutomixahUiApp {
                 .map_or(0, |d| d.as_secs() as i64),
         };
         let tx = self.save_outcomes.0.clone();
-        self.services.handle.spawn(async move {
+        self.services.runtime.handle().spawn(async move {
             let _ = tx.send(match store.put(&hash, &grid).await {
                 Ok(()) => SaveOutcome::Saved(
                     std::time::SystemTime::now()

@@ -91,7 +91,7 @@ pub enum LoadEvent {
 /// completion (harmless single-shot).
 pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = services.handle.clone();
+    let handle = services.runtime.handle().clone();
     handle.spawn_blocking(move || {
         let send_stage = |stage: LoadStage| {
             let _ = tx.send(LoadEvent::Stage(stage));
@@ -234,7 +234,7 @@ pub fn apply_stored_override(
     services: &Services,
     hash: &TrackHash,
 ) -> Result<Option<BeatGrid>, Report<TrackLoadError>> {
-    let handle = &services.handle;
+    let handle = services.runtime.handle();
     let store = services.grid_store.clone();
     let result = handle
         .block_on(async move { store.get(hash).await })
@@ -255,12 +255,19 @@ mod tests {
     use crate::services::{AppPaths, Services};
     use crate::store::{GridOverride, GridStoreService, in_memory::InMemoryGridStore};
 
-    fn test_services_with_runtime(rt: &tokio::runtime::Runtime) -> (Services, tempfile::TempDir) {
+    fn test_services() -> (Services, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp");
+        let runtime = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
         let services = Services {
             paths: AppPaths::for_test(dir.path()),
             grid_store: GridStoreService::new(std::sync::Arc::new(InMemoryGridStore::new())),
-            handle: rt.handle().clone(),
+            runtime,
         };
         (services, dir)
     }
@@ -298,8 +305,7 @@ mod tests {
     // Then the track decodes with the expected duration and an auto grid.
     #[test]
     fn load_decodes_and_analyzes() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (services, dir) = test_services_with_runtime(&rt);
+        let (services, dir) = test_services();
         let path = dir.path().join("tone.wav");
         std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
 
@@ -316,13 +322,12 @@ mod tests {
     // Then the manual grid wins.
     #[test]
     fn load_prefers_manual_override_by_content_hash() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (services, dir) = test_services_with_runtime(&rt);
+        let (services, dir) = test_services();
         let path = dir.path().join("a.wav");
         std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
 
         let hash = TrackHash(hash_file(&path).expect("hash"));
-        rt.block_on(async {
+        services.runtime.block_on(async {
             services
                 .grid_store
                 .put(
@@ -370,8 +375,7 @@ mod tests {
     // Then stages arrive in order and the track fields are complete.
     #[test]
     fn spawn_load_emits_stages_in_order() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (services, dir) = test_services_with_runtime(&rt);
+        let (services, dir) = test_services();
         let path = dir.path().join("tone.wav");
         std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
 
@@ -406,8 +410,7 @@ mod tests {
     // Then Done carries the rendered error, no panic.
     #[test]
     fn spawn_load_reports_missing_file() {
-        let rt = tokio::runtime::Runtime::new().expect("rt");
-        let (services, dir) = test_services_with_runtime(&rt);
+        let (services, dir) = test_services();
         let rx = spawn_load(&services, dir.path().join("nope.wav"));
         let outcome = loop {
             match rx.recv() {

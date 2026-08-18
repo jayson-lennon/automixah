@@ -30,12 +30,16 @@ fn run() -> Result<(), Report<UiError>> {
     let services = {
         let paths = AppPaths::resolve().change_context(UiError)?;
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .change_context(UiError)
-            .attach("build tokio runtime")?;
+        // Arc'd so the runtime outlives this block: the app spawns
+        // load/save tasks for the whole session via `Services::runtime`.
+        let runtime = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .change_context(UiError)
+                .attach("build tokio runtime")?,
+        );
 
         let store = runtime
             .block_on(SqliteGridStore::open_or_create(&paths.library_db))
@@ -44,7 +48,7 @@ fn run() -> Result<(), Report<UiError>> {
 
         Services {
             grid_store: GridStoreService::new(std::sync::Arc::new(store)),
-            handle: runtime.handle().clone(),
+            runtime,
             paths,
         }
     };

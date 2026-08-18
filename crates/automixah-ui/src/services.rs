@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use error_stack::Report;
-use tokio::runtime::Handle;
 
 use crate::store::GridStoreService;
 
@@ -64,14 +63,18 @@ pub struct AppPathsError;
 ///
 /// Constructed once in `main.rs`; the eframe app holds a clone. Adding a
 /// capability means adding a field here — zero call sites change.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Services {
     /// Resolved application paths.
     pub paths: AppPaths,
     /// Grid override persistence (SQLite behind a trait).
     pub grid_store: GridStoreService,
-    /// Async runtime handle for spawning store IO off the UI thread.
-    pub handle: Handle,
+    /// Shared async runtime, kept alive for the app's lifetime.
+    ///
+    /// An `Arc<Runtime>` (not a bare `Handle`): dropping the `Runtime`
+    /// shuts it down and leaves every later spawn a silent no-op —
+    /// the runtime must outlive the `Services` clones.
+    pub runtime: std::sync::Arc<tokio::runtime::Runtime>,
 }
 
 #[cfg(test)]
