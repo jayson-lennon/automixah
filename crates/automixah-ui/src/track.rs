@@ -61,6 +61,92 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Coarse progress stage of an off-thread load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStage {
+    /// Reading + hashing the file bytes.
+    Hashing,
+    /// Container decode to PCM.
+    Decoding,
+    /// Beat-grid analysis + peak extraction.
+    Analyzing,
+}
+
+/// Events emitted by [`spawn_load`]; poll the receiver each frame.
+pub enum LoadEvent {
+    /// A stage transition (drives the status line).
+    Stage(LoadStage),
+    /// Terminal outcome: the loaded track plus its visual peaks, or the
+    /// rendered error report (Reports are not `Send`).
+    Done(Box<Result<(LoadedTrack, crate::audio::peaks::Peaks), String>>),
+}
+
+/// Spawns the load pipeline on the blocking pool.
+///
+/// Stages emit as they begin; the registry is constructed inside the
+/// task — do not share it across threads. Override lookup happens on
+/// the caller thread after `Done` (see `stored_override`).
+///
+/// Dropping the receiver discards the result; the task still runs to
+/// completion (harmless single-shot).
+pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiver<LoadEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = services.handle.clone();
+    handle.spawn_blocking(move || {
+        let send_stage = |stage: LoadStage| {
+            let _ = tx.send(LoadEvent::Stage(stage));
+        };
+        let send_done = |payload: Result<(LoadedTrack, crate::audio::peaks::Peaks), String>| {
+            let _ = tx.send(LoadEvent::Done(Box::new(payload)));
+        };
+
+        send_stage(LoadStage::Hashing);
+        let hash = match hash_file(&path) {
+            Ok(h) => TrackHash(h),
+            Err(report) => return send_done(Err(format!("{report:#}"))),
+        };
+
+        send_stage(LoadStage::Decoding);
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return send_done(Err(format!("read {}: {e}", path.display()))),
+        };
+        let registry = DecoderRegistry::with_symphonia();
+        let audio = match registry.decode(&bytes, &extension) {
+            Ok(a) => a,
+            Err(report) => return send_done(Err(format!("{report:#}"))),
+        };
+
+        send_stage(LoadStage::Analyzing);
+        let AnalyzerOutput {
+            beat_grid: auto_grid,
+            ..
+        } = match analyze(&audio) {
+            Ok(out) => out,
+            Err(report) => return send_done(Err(format!("{report:#}"))),
+        };
+        #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
+        let duration_seconds = audio.frames() as f32 / audio.sample_rate as f32;
+        let track = LoadedTrack {
+            path: path.clone(),
+            hash,
+            duration_seconds,
+            audio,
+            grid: auto_grid,
+            grid_source: GridSource::Auto,
+        };
+        let peaks =
+            crate::audio::peaks::Peaks::build(&track.audio.samples, track.audio.sample_rate);
+        send_done(Ok((track, peaks)));
+    });
+    rx
+}
+
 /// Opens the file picker and loads the chosen track.
 ///
 /// Returns `Ok(None)` when the dialog is cancelled.
@@ -115,7 +201,7 @@ pub fn load(
         ..
     } = analyze(&audio)?;
 
-    let (grid, grid_source) = match stored_override(services, &hash) {
+    let (grid, grid_source) = match apply_stored_override(services, &hash) {
         Ok(Some(override_grid)) => (override_grid, GridSource::Manual),
         _ => (auto_grid, GridSource::Auto),
     };
@@ -142,8 +228,9 @@ fn analyze(audio: &DecodeAudio) -> Result<AnalyzerOutput, Report<TrackLoadError>
         .attach("analyze track")
 }
 
-/// Rebuilds a full grid from a stored override.
-fn stored_override(
+/// Rebuilds a full grid from a stored override (public: the UI thread
+/// applies it after an off-thread `Done`).
+pub fn apply_stored_override(
     services: &Services,
     hash: &TrackHash,
 ) -> Result<Option<BeatGrid>, Report<TrackLoadError>> {
@@ -276,5 +363,66 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 64, "SHA-256 hex");
+    }
+
+    // Given a written WAV file.
+    // When loaded through the off-thread pipeline.
+    // Then stages arrive in order and the track fields are complete.
+    #[test]
+    fn spawn_load_emits_stages_in_order() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (services, dir) = test_services_with_runtime(&rt);
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
+
+        let rx = spawn_load(&services, path.clone());
+        let mut stages = Vec::new();
+        let outcome = loop {
+            match rx.recv() {
+                Ok(LoadEvent::Stage(s)) => stages.push(s),
+                Ok(LoadEvent::Done(payload)) => break *payload,
+                Err(_) => unreachable!("channel closed before Done"),
+            }
+        };
+
+        assert_eq!(
+            stages,
+            [
+                LoadStage::Hashing,
+                LoadStage::Decoding,
+                LoadStage::Analyzing
+            ],
+            "stage order"
+        );
+        let (track, peaks) = outcome.expect("load ok");
+        assert!((track.duration_seconds - 2.0).abs() < 0.05, "≈2 s");
+        assert_eq!(track.path, path);
+        assert_eq!(track.grid_source, GridSource::Auto);
+        assert!(!peaks.data.is_empty(), "peaks built off-thread");
+    }
+
+    // Given a nonexistent path.
+    // When spawned.
+    // Then Done carries the rendered error, no panic.
+    #[test]
+    fn spawn_load_reports_missing_file() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let (services, dir) = test_services_with_runtime(&rt);
+        let rx = spawn_load(&services, dir.path().join("nope.wav"));
+        let outcome = loop {
+            match rx.recv() {
+                Ok(LoadEvent::Done(payload)) => break *payload,
+                Ok(_) => {}
+                Err(_) => unreachable!("channel closed before Done"),
+            }
+        };
+        let err = match outcome {
+            Err(e) => e,
+            Ok(_) => unreachable!("missing file must fail"),
+        };
+        assert!(
+            err.contains("track load error"),
+            "rendered report present: {err}"
+        );
     }
 }

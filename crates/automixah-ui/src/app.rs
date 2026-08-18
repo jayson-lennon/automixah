@@ -3,6 +3,7 @@
 //! Runtime state (`UiState`) lives here, separate from the DI container
 //! (`Services`), which is cloned in at construction and never mutated.
 
+use djcore::decoder::DecoderRegistry;
 use eframe::egui;
 
 use crate::services::Services;
@@ -31,7 +32,9 @@ pub struct AutomixahUiApp {
     last_frame_time: Option<std::time::Instant>,
     /// Shared PCM for the audio thread.
     pcm: Option<std::sync::Arc<Vec<f32>>>,
-    /// Debounced save: the (hash, grid) to flush 500 ms after the last edit.
+    /// Off-thread load in flight; drained each frame.
+    loading: Option<std::sync::mpsc::Receiver<crate::track::LoadEvent>>,
+    /// Dirty grid to flush on the next frame (immediate save).
     pending_save: Option<(
         automixah_engine::timeline::types::TrackHash,
         crate::grid::EditableGrid,
@@ -60,6 +63,7 @@ impl AutomixahUiApp {
             drag_last_seconds: None,
             last_frame_time: None,
             pcm: None,
+            loading: None,
             pending_save: None,
             status: "open a track to begin".to_owned(),
         }
@@ -128,41 +132,78 @@ impl AutomixahUiApp {
             *engine.command.lock() = cmd;
         }
     }
+
+    /// Drains pending load events; applies the track when the load lands.
+    fn poll_loading(&mut self) {
+        let Some(rx) = self.loading.take() else {
+            return;
+        };
+        let mut terminal = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::track::LoadEvent::Stage(stage) => {
+                    self.status = match stage {
+                        crate::track::LoadStage::Hashing => "hashing…".to_owned(),
+                        crate::track::LoadStage::Decoding => "decoding…".to_owned(),
+                        crate::track::LoadStage::Analyzing => "analyzing…".to_owned(),
+                    };
+                }
+                crate::track::LoadEvent::Done(payload) => terminal = Some(payload),
+            }
+        }
+        match terminal {
+            None => self.loading = Some(rx),
+            Some(boxed) => match *boxed {
+                Ok((mut track, peaks)) => {
+                    // Override lookup on the UI thread (single SQLite point-read).
+                    if let Ok(Some(override_grid)) =
+                        crate::track::apply_stored_override(&self.services, &track.hash)
+                    {
+                        track.grid = override_grid;
+                        track.grid_source = crate::track::GridSource::Manual;
+                    }
+                    self.edit_grid = crate::grid::EditableGrid::from_grid(&track.grid);
+                    self.pending_save = None;
+                    self.start_engine(&track);
+                    self.status = format!(
+                        "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
+                        track.path.display(),
+                        track.duration_seconds,
+                        self.edit_grid.grid_bpm,
+                        peaks.data.len()
+                    );
+                    self.view = crate::view::waveform::WaveformView::default();
+                    self.peaks = Some(peaks);
+                    self.track = Some(track);
+                }
+                Err(msg) => self.status = format!("⚠ load failed: {msg}"),
+            },
+        }
+    }
 }
 
 impl eframe::App for AutomixahUiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_loading();
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.scrub.toggle_play();
             self.push_command();
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let open = ui.button("Open…");
+                let open = ui.add_enabled(self.loading.is_none(), egui::Button::new("Open…"));
                 if open.clicked() {
-                    match crate::track::open_pick(&self.services) {
-                        Ok(Some(track)) => {
-                            let peaks = crate::audio::peaks::Peaks::build(
-                                &track.audio.samples,
-                                track.audio.sample_rate,
-                            );
-                            self.edit_grid = crate::grid::EditableGrid::from_grid(&track.grid);
-                            self.pending_save = None;
-                            self.start_engine(&track);
-                            self.status = format!(
-                                "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
-                                track.path.display(),
-                                track.duration_seconds,
-                                self.edit_grid.grid_bpm,
-                                peaks.data.len()
-                            );
-                            self.view = crate::view::waveform::WaveformView::default();
-                            self.peaks = Some(peaks);
-                            self.track = Some(track);
-                        }
-                        Ok(None) => {}
-                        Err(report) => self.status = format!("open failed: {report:#}"),
+                    let registry = DecoderRegistry::with_symphonia();
+                    let extensions = registry.supported_extensions();
+                    let dialog = rfd::FileDialog::new()
+                        .set_title("Open audio track")
+                        .add_filter("audio", &extensions);
+                    if let Some(path) = dialog.pick_file() {
+                        self.loading = Some(crate::track::spawn_load(&self.services, path));
                     }
+                }
+                if self.loading.is_some() {
+                    ui.spinner();
                 }
                 ui.separator();
                 ui.label(&self.status);
@@ -274,7 +315,7 @@ impl eframe::App for AutomixahUiApp {
         self.last_frame_time = Some(std::time::Instant::now());
 
         // Keep the UI live while a track is loaded (playhead ticking).
-        if self.track.is_some() {
+        if self.track.is_some() || self.loading.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
