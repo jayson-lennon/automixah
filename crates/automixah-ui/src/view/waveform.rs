@@ -61,13 +61,14 @@ impl WaveformView {
     }
 }
 
-/// Renders the waveform into `rect` and returns the interaction response.
+/// Renders the waveform and returns `(response, rect, sample_rate)` — the
+/// caller paints overlays onto `rect` in seconds/pixels derived from the view.
 pub fn show(
     ui: &mut egui::Ui,
     peaks: &Peaks,
     view: &mut WaveformView,
     center_frame: Option<f32>,
-) -> Response {
+) -> (Response, Rect, f32) {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let mut response = response;
     let painter = ui.painter_at(rect);
@@ -81,7 +82,8 @@ pub fn show(
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
     paint_peaks(&painter, peaks, view, rect);
 
-    response
+    let sample_rate = peaks.stride_frames * crate::audio::peaks::VISUAL_RATE;
+    (response, rect, sample_rate)
 }
 
 /// Total source frames represented by the peak track.

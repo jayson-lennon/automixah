@@ -77,6 +77,70 @@ impl EditableGrid {
     }
 }
 
+impl EditableGrid {
+    /// Extracts the editable subset from a decoded `BeatGrid`.
+    #[must_use]
+    pub fn from_grid(grid: &djcore::analyzer::BeatGrid) -> Self {
+        Self {
+            grid_bpm: grid.grid_bpm,
+            anchor_seconds: grid.anchor_seconds.rem_euclid(bar_len(grid.grid_bpm)),
+            downbeat_phase: phase_of(grid),
+        }
+    }
+}
+
+fn bar_len(bpm: f32) -> f32 {
+    BEATS_PER_BAR as f32 * 60.0 / bpm.max(0.01)
+}
+
+/// Beat-in-bar of the first downbeat at or after the anchor, wrapped to
+/// `[0, BEATS_PER_BAR)`.
+fn phase_of(grid: &djcore::analyzer::BeatGrid) -> u8 {
+    let Some(&first) = grid.downbeats.first() else {
+        return 0;
+    };
+    let beat = 60.0 / grid.grid_bpm.max(0.01);
+    let delta = (first - grid.anchor_seconds) / beat;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "phase is 0..4 after rem_euclid"
+    )]
+    let phase = delta.round().rem_euclid(BEATS_PER_BAR as f32) as i64;
+    u8::try_from(phase).unwrap_or(0)
+}
+
+// ── cursor-driven actions ──────────────────────────────────────────────────
+
+impl EditableGrid {
+    /// Moves the anchor so the nearest beat lands exactly at `cursor_s`.
+    ///
+    /// Equivalent to nudging the whole grid by the residual; BPM is
+    /// unchanged, so every other beat shifts by the same amount.
+    pub fn snap_nearest_beat(&mut self, cursor_s: f32) {
+        let beat = self.beat_seconds();
+        let nearest =
+            self.anchor_seconds + ((cursor_s - self.anchor_seconds) / beat).round() * beat;
+        let residual = cursor_s - nearest;
+        self.anchor_seconds = (self.anchor_seconds + residual).max(0.0);
+        self.normalize();
+    }
+
+    /// Sets the downbeat phase so the beat at `cursor_s` is beat 1 of its
+    /// bar. Anchor position is untouched — only the bar coloring moves.
+    pub fn set_downbeat_at(&mut self, cursor_s: f32) {
+        let beat = self.beat_seconds();
+        let k = ((cursor_s - self.anchor_seconds) / beat).round();
+        #[expect(clippy::cast_possible_truncation, reason = "k is small")]
+        let phase = k.rem_euclid(BEATS_PER_BAR as f32) as i64;
+        self.downbeat_phase = u8::try_from(phase).unwrap_or(0);
+    }
+
+    /// Wraps the anchor into `[0, bar)` in place.
+    pub fn normalize(&mut self) {
+        self.anchor_seconds = self.anchor_seconds.rem_euclid(self.bar_seconds());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +187,128 @@ mod tests {
         let g = grid(120.0, 2.5, 0); // bar = 2.0 s at 120 BPM
         let normalized = g.normalized_anchor();
         assert!((normalized - 0.5).abs() < 1e-4, "wraps into [0, bar)");
+    }
+
+    // Given a grid whose nearest beat to t=1.62 sits 0.02 s away.
+    // When snapping the nearest beat to the cursor.
+    // Then the anchor shifts by that residual (wrapped) and BPM is unchanged.
+    #[test]
+    fn snap_nearest_beat_shifts_anchor_by_residual() {
+        let mut g = grid(120.0, 0.5, 0); // beat = 0.5 s, beats at 0.5, 1.0, 1.5, 2.0…
+        let cursor = 1.62;
+        g.snap_nearest_beat(cursor);
+
+        // nearest beat to 1.62 was 1.5 → residual +0.12
+        let expected_anchor = f32::rem_euclid(0.5 + 0.12, 2.0);
+        assert!(
+            (g.anchor_seconds - expected_anchor).abs() < 1e-4,
+            "anchor {} vs {expected_anchor}",
+            g.anchor_seconds
+        );
+        assert_eq!(g.grid_bpm, 120.0);
+        // And a beat now lands exactly at the cursor.
+        let projected = g.project();
+        let nearest = projected
+            .beats
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - cursor).abs().total_cmp(&(b - cursor).abs()))
+            .expect("beats exist");
+        assert!((nearest - cursor).abs() < 1e-3);
+    }
+
+    // Given a cursor on the 3rd beat after the anchor.
+    // When setting the downbeat at the cursor.
+    // Then the phase becomes 3 and the anchor does not move.
+    #[test]
+    fn set_downbeat_marks_cursor_bar_start() {
+        let mut g = grid(128.0, 0.25, 0);
+        let beat = 60.0 / 128.0;
+        let cursor = 0.25 + 3.0 * beat;
+
+        g.set_downbeat_at(cursor);
+
+        assert_eq!(g.downbeat_phase, 3);
+        assert!((g.anchor_seconds - 0.25).abs() < 1e-6);
+        // And a downbeat now lands at the cursor.
+        let projected = g.project();
+        assert!(
+            projected
+                .downbeats
+                .iter()
+                .any(|&t| (t - cursor).abs() < 1e-3),
+            "downbeats {:?}",
+            &projected.downbeats[..4.min(projected.downbeats.len())]
+        );
+    }
+
+    // Given a decoded auto grid at 138 BPM anchored at 0.4 with downbeats on
+    // the anchor (phase 0).
+    // When converted to the editable subset and back.
+    // Then the round-trip preserves BPM, normalized anchor, and phase.
+    #[test]
+    fn from_grid_round_trips() {
+        let beat = 60.0 / 138.0;
+        let bar = 4.0 * beat;
+        let mut downbeats = Vec::new();
+        let mut k = 0;
+        while 0.4 + k as f32 * bar < 600.0 {
+            downbeats.push(0.4 + k as f32 * bar);
+            k += 1;
+        }
+        let decoded = djcore::analyzer::BeatGrid {
+            grid_bpm: 138.0,
+            anchor_seconds: 0.4 + 3.0 * bar, // unnormalized on purpose
+            downbeats: downbeats.clone(),
+            beats: Vec::new(),
+            bars: downbeats,
+        };
+
+        let editable = EditableGrid::from_grid(&decoded);
+
+        assert!((editable.grid_bpm - 138.0).abs() < 1e-4);
+        assert!(
+            (editable.anchor_seconds - (0.4 + 3.0 * bar).rem_euclid(bar)).abs() < 1e-4,
+            "anchor normalized into [0, bar)"
+        );
+        assert_eq!(editable.downbeat_phase, 0);
+
+        let reprojected = editable.project();
+        assert!(
+            (reprojected.downbeats[1] - reprojected.downbeats[0] - bar).abs() < 1e-4,
+            "downbeats repeat at one bar"
+        );
+    }
+
+    // Given a grid whose downbeat sits 3 beats after the anchor.
+    // When the phase is extracted.
+    // Then it is 3, and re-projection lands downbeats on the same times.
+    #[test]
+    fn phase_extracts_from_downbeat_offset() {
+        let beat = 60.0 / 128.0;
+        let mut downbeats = Vec::new();
+        let mut k = 0;
+        while 3.0 * beat + k as f32 * 4.0 * beat < 600.0 {
+            downbeats.push(3.0 * beat + k as f32 * 4.0 * beat);
+            k += 1;
+        }
+        let decoded = djcore::analyzer::BeatGrid {
+            grid_bpm: 128.0,
+            anchor_seconds: 0.0,
+            downbeats: downbeats.clone(),
+            beats: Vec::new(),
+            bars: downbeats,
+        };
+
+        let editable = EditableGrid::from_grid(&decoded);
+
+        assert_eq!(editable.downbeat_phase, 3);
+        let reprojected = editable.project();
+        assert!(
+            (reprojected.downbeats[0] - 3.0 * beat).abs() < 1e-3,
+            "reprojected first downbeat {} vs {}",
+            reprojected.downbeats[0],
+            3.0 * beat
+        );
     }
 }

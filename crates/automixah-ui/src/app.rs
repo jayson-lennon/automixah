@@ -17,6 +17,10 @@ pub struct AutomixahUiApp {
     peaks: Option<crate::audio::peaks::Peaks>,
     /// Waveform zoom/pan state.
     view: crate::view::waveform::WaveformView,
+    /// Live-editable grid for the loaded track.
+    edit_grid: crate::grid::EditableGrid,
+    /// Waveform hover position in seconds (action target).
+    cursor_time: Option<f32>,
     /// Status line shown in the top bar.
     status: String,
 }
@@ -30,6 +34,12 @@ impl AutomixahUiApp {
             track: None,
             peaks: None,
             view: crate::view::waveform::WaveformView::default(),
+            edit_grid: crate::grid::EditableGrid {
+                grid_bpm: 120.0,
+                anchor_seconds: 0.0,
+                downbeat_phase: 0,
+            },
+            cursor_time: None,
             status: "open a track to begin".to_owned(),
         }
     }
@@ -47,11 +57,12 @@ impl eframe::App for AutomixahUiApp {
                                 &track.audio.samples,
                                 track.audio.sample_rate,
                             );
+                            self.edit_grid = crate::grid::EditableGrid::from_grid(&track.grid);
                             self.status = format!(
                                 "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
                                 track.path.display(),
                                 track.duration_seconds,
-                                track.grid.grid_bpm,
+                                self.edit_grid.grid_bpm,
                                 peaks.data.len()
                             );
                             self.view = crate::view::waveform::WaveformView::default();
@@ -67,6 +78,29 @@ impl eframe::App for AutomixahUiApp {
             });
         });
 
+        egui::SidePanel::right("grid_controls").show(ctx, |ui| {
+            let end = self.track.as_ref().map_or(0.0, |t| t.duration_seconds);
+            ui.horizontal(|ui| {
+                let cursor = self.cursor_time;
+                if let Some(c) = cursor {
+                    if ui.button("snap beat → cursor").clicked() {
+                        self.edit_grid.snap_nearest_beat(c);
+                    }
+                    if ui.button("set downbeat @ cursor").clicked() {
+                        self.edit_grid.set_downbeat_at(c);
+                    }
+                }
+            });
+            if crate::view::grid::controls(ui, &mut self.edit_grid, end) {
+                self.status = format!(
+                    "grid: {:.3} BPM, anchor {:.3} s, phase {}",
+                    self.edit_grid.grid_bpm,
+                    self.edit_grid.anchor_seconds,
+                    self.edit_grid.downbeat_phase
+                );
+            }
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(peaks) = self.peaks.as_ref() else {
                 ui.centered_and_justified(|ui| {
@@ -74,6 +108,7 @@ impl eframe::App for AutomixahUiApp {
                 });
                 return;
             };
+            let end = self.track.as_ref().map_or(0.0, |t| t.duration_seconds);
 
             let mut zoom = self.view.frames_per_pixel;
             ui.horizontal(|ui| {
@@ -88,7 +123,23 @@ impl eframe::App for AutomixahUiApp {
                 );
             });
             self.view.frames_per_pixel = zoom;
-            crate::view::waveform::show(ui, peaks, &mut self.view, None);
+
+            let (response, rect, sample_rate) =
+                crate::view::waveform::show(ui, peaks, &mut self.view, None);
+            let seconds_per_pixel = self.view.frames_per_pixel / sample_rate;
+            let time_at_left = self.view.left_frame / sample_rate;
+            self.cursor_time = response
+                .hover_pos()
+                .map(|p| time_at_left + (p.x - rect.left()) * seconds_per_pixel);
+            let painter = ui.painter_at(rect);
+            crate::view::grid::paint(
+                &painter,
+                &self.edit_grid,
+                rect,
+                seconds_per_pixel,
+                time_at_left,
+                end,
+            );
         });
 
         // Keep the UI live while a track is loaded (playhead ticking later).
