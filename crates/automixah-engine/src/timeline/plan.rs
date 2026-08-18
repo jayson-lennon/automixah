@@ -80,16 +80,26 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
     let mut cursor = SessionTime::ZERO;
 
     for (i, track) in tracks.iter().enumerate() {
-        let stretch = decide_stretch(track.bpm, session_bpm, track.sample_rate, sample_rate);
+        // The constant-grid BPM drives stretching (fold-idempotent;
+        // it is the rounded, fitted grid tempo rather than the raw
+        // estimate in `track.bpm`).
+        let stretch = decide_stretch(
+            grid_bpm_of(track),
+            session_bpm,
+            track.sample_rate,
+            sample_rate,
+        );
         let grid_confident = grid_is_confident(&track.beat_grid, track.grid_stability);
 
         // Segment length: full track stretched to session tempo.
         let stretched_len =
             SessionTime::from_seconds(track.duration * stretch.ratio.max(0.0), sample_rate);
 
-        // Segment end in session time: full stretch minus the cue
-        // skipped into the source (incoming tracks only).
-        let (cue_src, cue_warn) = if i == 0 {
+        // Cue: where in the source track this segment starts. First
+        // track starts at zero; incoming tracks cue at a phrase
+        // anchor (a downbeat near 25% in) when their grid is
+        // confident, else at zero with a fallback.
+        let (src_start, cue_warn) = if i == 0 {
             (0_u64, None)
         } else {
             cue_for(track)
@@ -100,12 +110,18 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
                 track.hash.0, reason
             );
         }
-        let cue_session = src_stretched(track, cue_src);
-        let audible_len = SessionTime(stretched_len.0.saturating_sub(cue_session));
+
+        // Audible span: full stretch minus the cue skipped into
+        // the source (incoming tracks only).
+        let audible_len = SessionTime(
+            stretched_len
+                .0
+                .saturating_sub(src_stretched(track, src_start)),
+        );
+
         // Overlap geometry: an incoming segment starts at the
         // *previous* transition's window start, so its intro plays
-        // under the outgoing track's outro. (Computed BEFORE the
-        // outgoing transition so both use the same origin.)
+        // under the outgoing track's outro.
         let session_start = match segments.last() {
             Some(prev) => prev.transition.as_ref().map_or(cursor, |t| t.window.start),
             None => cursor,
@@ -144,9 +160,20 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
             sample_rate: u32,
             constant: StretchDecision,
         ) -> StretchDecision {
-            let prev_ratio =
-                decide_stretch(prev.bpm, session_bpm, prev.sample_rate, sample_rate).ratio;
-            let native = decide_stretch(track.bpm, track.bpm, track.sample_rate, sample_rate).ratio;
+            let prev_ratio = decide_stretch(
+                grid_bpm_of(prev),
+                session_bpm,
+                prev.sample_rate,
+                sample_rate,
+            )
+            .ratio;
+            let native = decide_stretch(
+                grid_bpm_of(track),
+                grid_bpm_of(track),
+                track.sample_rate,
+                sample_rate,
+            )
+            .ratio;
             StretchDecision {
                 strategy: TempoStrategy::DriftBack {
                     overlap_ratio: prev_ratio,
@@ -156,30 +183,6 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
                 ..constant
             }
         }
-
-        // Cue: where in the source track this segment starts. First
-        // track starts at zero; incoming tracks cue at a phrase anchor
-        // (a downbeat near 25% in) when their grid is confident,
-        // else at zero with a fallback.
-        let (src_start, cue_warn) = if i == 0 {
-            (0_u64, None)
-        } else {
-            cue_for(track)
-        };
-        if let Some(reason) = &cue_warn {
-            eprintln!(
-                "[plan] cue fallback for {} ({}): starting at 0",
-                track.hash.0, reason
-            );
-        }
-
-        // Overlap geometry: an incoming segment starts at the
-        // *previous* transition's window start, so its intro plays
-        // under the outgoing track's outro.
-        let session_start = match segments.last() {
-            Some(prev) => prev.transition.as_ref().map_or(cursor, |t| t.window.start),
-            None => cursor,
-        };
 
         // Length: the audible span is the full stretched track minus
         // the cue we skipped into it.
@@ -196,6 +199,13 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
             transition: transition.map(|(window, preset)| TransitionPlan { window, preset }),
         });
 
+        // Cue-on-grid verification: the incoming cue must coincide
+        // with the outgoing window's session-grid phase (within ~2 ms
+        // on the resample path; WSOLA adds ±10 ms out of band).
+        if i > 0 {
+            verify_cue_alignment(&segments[i - 1], &segments[i], session_bpm, sample_rate);
+        }
+
         cursor = SessionTime(session_start.0 + stretched_len.0);
     }
 
@@ -203,6 +213,49 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
         session_bpm,
         sample_rate,
         segments,
+    }
+}
+
+/// The constant-grid tempo driving stretch decisions: the fitted
+/// `grid_bpm` when present, else the raw BPM estimate (fallback
+/// path — grids are empty/unconfident there).
+fn grid_bpm_of(track: &TrackAnalysis) -> f32 {
+    let grid_bpm = track.beat_grid.grid_bpm;
+    if grid_bpm.is_finite() && grid_bpm > 0.0 {
+        grid_bpm
+    } else {
+        track.bpm
+    }
+}
+
+/// Warns when an incoming segment's cue does not land on the
+/// outgoing transition window's session-grid phase.
+///
+/// With a constant grid both decks share the session beat period,
+/// so a grid-derived cue lands on the grid by construction; drift
+/// beyond ~2 ms means a fallback cue (no grid); > 10 ms indicates
+/// WSOLA jitter or a mis-anchored grid.
+fn verify_cue_alignment(
+    outgoing: &Segment,
+    incoming: &Segment,
+    session_bpm: f32,
+    sample_rate: u32,
+) {
+    let Some(window) = outgoing.transition.as_ref().map(|t| &t.window) else {
+        return;
+    };
+    let beat_samples = SessionTime::from_seconds(60.0 / session_bpm, sample_rate).0;
+    let phase = window.start.0 % beat_samples;
+    let cue_phase = incoming.session_start.0 % beat_samples;
+    let raw = cue_phase.abs_diff(phase);
+    let drift = raw.min(beat_samples - raw);
+    #[expect(clippy::cast_precision_loss, reason = "sample counts are small")]
+    let ms = (drift as f64) * 1000.0 / f64::from(sample_rate);
+    if ms > 2.0 {
+        eprintln!(
+            "[plan] cue off session grid by {ms:.1} ms for {} (resample tolerance 2 ms, WSOLA 10 ms)",
+            incoming.track_hash.0
+        );
     }
 }
 
@@ -215,7 +268,13 @@ fn src_stretched(track: &TrackAnalysis, src_start: u64) -> u64 {
     )]
     let stretched = (src_start as f64
         * f64::from(
-            decide_stretch(track.bpm, track.bpm, track.sample_rate, track.sample_rate).ratio,
+            decide_stretch(
+                grid_bpm_of(track),
+                grid_bpm_of(track),
+                track.sample_rate,
+                track.sample_rate,
+            )
+            .ratio,
         )) as u64;
     stretched
 }
@@ -322,7 +381,8 @@ fn a_grid_phase(
         return None;
     }
     let cue_seconds = f64::from(session_start.as_seconds(sample_rate));
-    let ratio = f64::from(decide_stretch(a.bpm, session_bpm, a.sample_rate, sample_rate).ratio);
+    let ratio =
+        f64::from(decide_stretch(grid_bpm_of(a), session_bpm, a.sample_rate, sample_rate).ratio);
     // First grid beat at or after time zero in source time: beats
     // sit at anchor + n * beat_len, so n = ceil(-anchor / beat_len).
     let beat_len = 60.0 / f64::from(grid_bpm);
