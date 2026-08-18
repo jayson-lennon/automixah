@@ -108,10 +108,6 @@ impl GridStoreService {
     /// # Errors
     ///
     /// Returns an error if the backend write fails.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "save-on-edit wiring lands in phase 5")
-    )]
     pub async fn put(
         &self,
         hash: &TrackHash,

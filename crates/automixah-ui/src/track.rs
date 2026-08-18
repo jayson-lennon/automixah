@@ -16,10 +16,6 @@ pub struct LoadedTrack {
     /// Source file path.
     pub path: PathBuf,
     /// Content hash (SHA-256 hex of file bytes) — the store key.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the phase-5 save/load path")
-    )]
     pub hash: TrackHash,
     /// Decoded interleaved PCM.
     pub audio: DecodeAudio,

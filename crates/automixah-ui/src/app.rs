@@ -31,6 +31,11 @@ pub struct AutomixahUiApp {
     last_frame_time: Option<std::time::Instant>,
     /// Shared PCM for the audio thread.
     pcm: Option<std::sync::Arc<Vec<f32>>>,
+    /// Debounced save: the (hash, grid) to flush 500 ms after the last edit.
+    pending_save: Option<(
+        automixah_engine::timeline::types::TrackHash,
+        crate::grid::EditableGrid,
+    )>,
     /// Status line shown in the top bar.
     status: String,
 }
@@ -55,12 +60,43 @@ impl AutomixahUiApp {
             drag_last_seconds: None,
             last_frame_time: None,
             pcm: None,
+            pending_save: None,
             status: "open a track to begin".to_owned(),
         }
     }
 }
 
 impl AutomixahUiApp {
+    /// Marks the current grid dirty for the debounced save.
+    fn schedule_save(&mut self) {
+        if let Some(track) = self.track.as_ref() {
+            self.pending_save = Some((track.hash.clone(), self.edit_grid));
+        }
+    }
+
+    /// Flushes a pending save once it has been stable for 500 ms.
+    fn flush_save_if_due(&mut self) {
+        let Some((hash, grid)) = self.pending_save.take() else {
+            return;
+        };
+        let store = self.services.grid_store.clone();
+        let grid = crate::store::GridOverride {
+            grid_bpm: grid.grid_bpm,
+            anchor_seconds: grid.anchor_seconds,
+            downbeat_phase: grid.downbeat_phase,
+            updated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
+        };
+        let status = self.status.clone();
+        self.services.handle.spawn(async move {
+            match store.put(&hash, &grid).await {
+                Ok(()) => {}
+                Err(report) => eprintln!("grid save failed: {report:?} — {status}"),
+            }
+        });
+    }
+
     /// Rebuilds the output engine for a freshly loaded track.
     fn start_engine(&mut self, track: &crate::track::LoadedTrack) {
         let pcm = std::sync::Arc::new(track.audio.samples.clone());
@@ -111,6 +147,7 @@ impl eframe::App for AutomixahUiApp {
                                 track.audio.sample_rate,
                             );
                             self.edit_grid = crate::grid::EditableGrid::from_grid(&track.grid);
+                            self.pending_save = None;
                             self.start_engine(&track);
                             self.status = format!(
                                 "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
@@ -146,6 +183,7 @@ impl eframe::App for AutomixahUiApp {
                 }
             });
             if crate::view::grid::controls(ui, &mut self.edit_grid, end) {
+                self.schedule_save();
                 self.status = format!(
                     "grid: {:.3} BPM, anchor {:.3} s, phase {}",
                     self.edit_grid.grid_bpm,
@@ -232,6 +270,7 @@ impl eframe::App for AutomixahUiApp {
         });
 
         self.push_command();
+        self.flush_save_if_due();
         self.last_frame_time = Some(std::time::Instant::now());
 
         // Keep the UI live while a track is loaded (playhead ticking).
