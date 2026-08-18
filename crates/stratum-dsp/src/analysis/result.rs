@@ -143,6 +143,14 @@ impl Key {
 /// Beat grid structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeatGrid {
+    /// Canonical constant-tempo BPM (rounded by the fit ladder).
+    /// Zero means "no grid" (unconfident fallback).
+    pub grid_bpm: f32,
+
+    /// Phase anchor: a downbeat time in `[0, bar)` seconds. The
+    /// arrays below are projections of `anchor + k·60/grid_bpm`.
+    pub anchor_seconds: f32,
+
     /// Downbeat times (beat 1) in seconds
     pub downbeats: Vec<f32>,
 

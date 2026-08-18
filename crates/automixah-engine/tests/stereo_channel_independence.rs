@@ -43,6 +43,8 @@ fn analysis(hash: &str, bpm: f32) -> TrackAnalysis {
         },
         duration: bars as f32 * beat * 4.0,
         beat_grid: BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
             downbeats,
             beats,
             bars: Vec::new(),

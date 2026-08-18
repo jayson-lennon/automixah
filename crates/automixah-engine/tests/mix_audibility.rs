@@ -42,6 +42,8 @@ fn synth(hash: &str, bpm: f32, hz: f32, s: f32) -> SynthTrack {
             },
             duration: s,
             beat_grid: BeatGrid {
+                grid_bpm: 0.0,
+                anchor_seconds: 0.0,
                 downbeats,
                 beats,
                 bars: Vec::new(),

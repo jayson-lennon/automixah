@@ -30,6 +30,8 @@ fn synth(hash: &str, bpm: f32, duration_s: f32) -> TrackAnalysis {
         },
         duration: duration_s,
         beat_grid: BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
             downbeats,
             beats,
             bars: Vec::new(),

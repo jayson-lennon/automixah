@@ -318,6 +318,8 @@ mod tests {
             key_confidence,
             key_clarity,
             beat_grid: BeatGrid {
+                grid_bpm: 0.0,
+                anchor_seconds: 0.0,
                 downbeats: vec![],
                 beats: vec![],
                 bars: vec![],

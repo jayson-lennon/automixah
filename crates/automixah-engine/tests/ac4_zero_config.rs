@@ -30,6 +30,8 @@ fn synth(hash: &str, bpm: f32, duration_s: f32) -> TrackAnalysis {
         },
         duration: duration_s,
         beat_grid: djcore::analyzer::BeatGrid {
+            grid_bpm: 60.0 / beat,
+            anchor_seconds: 0.0,
             downbeats: (0..bars).map(|i| i as f32 * beat * 4.0).collect(),
             beats: (0..bars * 4).map(|i| i as f32 * beat).collect(),
             bars: Vec::new(),

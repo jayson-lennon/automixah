@@ -217,6 +217,8 @@ fn analysis_from(hash: &str, decoded: &DecodeAudio, out: &AnalyzerOutput) -> Tra
         key: out.key.clone(),
         duration: out.duration_seconds,
         beat_grid: djcore::analyzer::BeatGrid {
+            grid_bpm: out.beat_grid.grid_bpm,
+            anchor_seconds: out.beat_grid.anchor_seconds,
             downbeats: out.beat_grid.downbeats.clone(),
             beats: out.beat_grid.beats.clone(),
             bars: out.beat_grid.bars.clone(),

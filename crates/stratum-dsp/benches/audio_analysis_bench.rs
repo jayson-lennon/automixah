@@ -1,9 +1,7 @@
 //! Performance benchmarks for audio analysis
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use stratum_dsp::features::beat_tracking::bayesian::BayesianBeatTracker;
-use stratum_dsp::features::beat_tracking::hmm::HmmBeatTracker;
-use stratum_dsp::features::beat_tracking::{generate_beat_grid, tempo_variation, time_signature};
+use stratum_dsp::features::beat_tracking::time_signature;
 use stratum_dsp::features::chroma::extractor::{extract_chroma, extract_chroma_with_options};
 use stratum_dsp::features::chroma::normalization::sharpen_chroma;
 use stratum_dsp::features::chroma::smoothing::smooth_chroma;
@@ -166,65 +164,54 @@ fn period_estimation_benchmarks(c: &mut Criterion) {
 }
 
 fn beat_tracking_benchmarks(c: &mut Criterion) {
-    // Generate synthetic onsets for 120 BPM at 44.1kHz
+    // Generate a synthetic 120 BPM click novelty envelope at 44.1 kHz
+    // with a 512-sample hop.
     let sample_rate = 44100;
+    let hop_size = 512;
     let bpm = 120.0;
     let beat_interval = 60.0 / bpm; // 0.5 seconds
+    let hop_seconds = f64::from(hop_size) / f64::from(sample_rate);
 
-    // Generate 16 beats worth of onsets (8 seconds, 2 bars)
-    let mut onsets_seconds = Vec::new();
+    // 16 beats worth of envelope (8 seconds, 2 bars)
+    let duration = 16.0 * beat_interval;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let frames = (duration / hop_seconds) as usize + 8;
+    let mut novelty = vec![0.0_f32; frames];
     for beat in 0..16 {
-        onsets_seconds.push(beat as f32 * beat_interval);
+        let t = f64::from(beat as f32) * beat_interval;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frame = (t / hop_seconds).round() as usize;
+        if let Some(cell) = novelty.get_mut(frame) {
+            *cell = 1.0;
+        }
     }
 
     let mut group = c.benchmark_group("beat_tracking");
 
-    // HMM Viterbi beat tracking
-    group.bench_function("hmm_viterbi_16beats", |b| {
-        b.iter(|| {
-            let tracker = HmmBeatTracker::new(
-                black_box(bpm),
-                black_box(onsets_seconds.clone()),
-                black_box(sample_rate),
-            );
-            let _ = tracker.track_beats();
-        });
-    });
-
-    // Bayesian tempo tracking (single update)
-    group.bench_function("bayesian_update_16beats", |b| {
-        b.iter(|| {
-            let mut tracker = BayesianBeatTracker::new(black_box(bpm), black_box(0.8));
-            let _ = tracker.update_with_onsets(black_box(&onsets_seconds), black_box(sample_rate));
-        });
-    });
-
-    // Tempo variation detection
-    group.bench_function("tempo_variation_detection_16beats", |b| {
-        b.iter(|| {
-            let _ = tempo_variation::detect_tempo_variations(
-                black_box(&onsets_seconds),
-                black_box(bpm),
-            );
-        });
-    });
-
     // Time signature detection
     group.bench_function("time_signature_detection_16beats", |b| {
         b.iter(|| {
-            let _ =
-                time_signature::detect_time_signature(black_box(&onsets_seconds), black_box(bpm));
+            #[allow(clippy::cast_precision_loss)]
+            let beat_interval_f32 = beat_interval as f32;
+            let bpm_f32 = bpm as f32;
+            let onsets: Vec<f32> = (0..16).map(|i| i as f32 * beat_interval_f32).collect();
+            let _ = time_signature::detect_time_signature(black_box(&onsets), black_box(bpm_f32));
         });
     });
-
-    // Full beat grid generation (includes all steps)
+    // Full beat grid generation (DP marking + constant-grid fit)
+    #[allow(clippy::cast_precision_loss)]
+    let bpm_f32 = bpm as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let duration_f32 = duration as f32;
     group.bench_function("generate_beat_grid_16beats", |b| {
         b.iter(|| {
-            let _ = generate_beat_grid(
-                black_box(bpm),
+            let _ = stratum_dsp::features::beat_tracking::generate_beat_grid(
+                black_box(bpm_f32),
                 black_box(0.85),
-                black_box(&onsets_seconds),
+                black_box(&novelty),
+                black_box(hop_size),
                 black_box(sample_rate),
+                black_box(duration_f32),
             );
         });
     });

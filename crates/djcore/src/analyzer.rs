@@ -28,6 +28,12 @@ pub struct AnalyzerError;
 /// four-beat bar boundaries.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BeatGrid {
+    /// Canonical constant-tempo BPM (rounded by the fit ladder).
+    /// Zero means "no grid" (unconfident fallback).
+    pub grid_bpm: f32,
+    /// Phase anchor: a downbeat time in `[0, bar)` seconds; the
+    /// arrays below are projections of `anchor + k·60/grid_bpm`.
+    pub anchor_seconds: f32,
     /// Downbeat times (beat 1 of each bar) in seconds.
     pub downbeats: Vec<f32>,
     /// All beat times in seconds.
@@ -39,6 +45,8 @@ pub struct BeatGrid {
 impl From<stratum_dsp::BeatGrid> for BeatGrid {
     fn from(other: stratum_dsp::BeatGrid) -> Self {
         Self {
+            grid_bpm: other.grid_bpm,
+            anchor_seconds: other.anchor_seconds,
             downbeats: other.downbeats,
             beats: other.beats,
             bars: other.bars,
@@ -218,6 +226,8 @@ mod tests {
             key: Key::parse("C").expect("valid key"),
             duration_seconds: 42.0,
             beat_grid: BeatGrid {
+                grid_bpm: 120.0,
+                anchor_seconds: 0.0,
                 downbeats: vec![0.0, 2.0],
                 beats: vec![0.0, 0.5, 1.0, 1.5],
                 bars: vec![0.0, 2.0],
@@ -262,6 +272,8 @@ mod tests {
             key: Key::parse("F#m").expect("valid key"),
             duration_seconds: 217.25,
             beat_grid: BeatGrid {
+                grid_bpm: 124.0,
+                anchor_seconds: 0.0,
                 downbeats: vec![0.0, 1.935, 3.871],
                 beats: vec![0.0, 0.484],
                 bars: vec![0.0, 1.935],

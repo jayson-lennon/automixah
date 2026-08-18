@@ -179,7 +179,6 @@ pub fn analyze_audio(
     // beat tracker do. Since we will compare / integrate legacy + tempogram estimates,
     // we want the best onsets we can get.
     let mut onsets_for_legacy: Vec<usize> = energy_onsets.clone();
-    let mut onsets_for_beat_tracking: Vec<usize> = energy_onsets.clone();
 
     if config.enable_onset_consensus && !magnitude_spec_frames.is_empty() {
         use features::onset::consensus::{vote_onsets, OnsetConsensus};
@@ -286,8 +285,7 @@ pub fn analyze_audio(
                         candidates.iter().filter(|c| c.voted_by >= 2).count(),
                         candidates.len()
                     );
-                    onsets_for_legacy = chosen.clone();
-                    onsets_for_beat_tracking = chosen;
+                    onsets_for_legacy = chosen;
                 } else {
                     log::debug!("Onset consensus produced no candidates; using energy-flux onsets");
                 }
@@ -917,17 +915,23 @@ pub fn analyze_audio(
         );
     }
 
-    // Phase 1C: Beat Tracking
-    let (beat_grid, grid_stability) = if bpm > 0.0 && onsets_for_beat_tracking.len() >= 2 {
-        // Convert onsets from sample indices to seconds
-        let onsets_seconds: Vec<f32> = onsets_for_beat_tracking
-            .iter()
-            .map(|&sample_idx| sample_idx as f32 / sample_rate as f32)
-            .collect();
-
-        // Generate beat grid using HMM Viterbi algorithm
+    // Phase 1C: Beat Tracking (DP tracker over an energy-flux
+    // novelty envelope; the tempogram BPM seeds the period prior)
+    let novelty_envelope = {
+        use features::period::novelty::energy_flux_novelty;
+        energy_flux_novelty(&magnitude_spec_frames).unwrap_or_default()
+    };
+    let duration_seconds = trimmed_samples.len() as f32 / sample_rate as f32;
+    let (beat_grid, grid_stability) = if bpm > 0.0 && !novelty_envelope.is_empty() {
         use features::beat_tracking::generate_beat_grid;
-        match generate_beat_grid(bpm, bpm_confidence, &onsets_seconds, sample_rate) {
+        match generate_beat_grid(
+            bpm,
+            bpm_confidence,
+            &novelty_envelope,
+            config.hop_size as u32,
+            sample_rate,
+            duration_seconds,
+        ) {
             Ok((grid, stability)) => {
                 log::debug!(
                     "Beat grid generated: {} beats, {} downbeats, stability={:.3}",
@@ -939,30 +943,25 @@ pub fn analyze_audio(
             }
             Err(e) => {
                 log::warn!("Beat tracking failed: {}, using empty grid", e);
-                (
-                    BeatGrid {
-                        downbeats: vec![],
-                        beats: vec![],
-                        bars: vec![],
-                    },
-                    0.0,
-                )
+                empty_grid()
             }
         }
     } else {
         log::debug!(
-            "Skipping beat tracking: BPM={:.2}, onsets={}",
+            "Skipping beat tracking: BPM={:.2}, envelope={}",
             bpm,
-            energy_onsets.len()
+            novelty_envelope.len()
         );
-        (
-            BeatGrid {
-                downbeats: vec![],
-                beats: vec![],
-                bars: vec![],
-            },
-            0.0,
-        )
+        empty_grid()
+    };
+
+    // Report the canonical grid BPM as THE track BPM: the grid is
+    // the single source of truth for every downstream consumer
+    // (stretch decisions, beat-phase alignment).
+    let bpm = if beat_grid.grid_bpm > 0.0 {
+        beat_grid.grid_bpm
+    } else {
+        bpm
     };
 
     // Phase 1D: Key Detection
@@ -1643,4 +1642,18 @@ pub fn analyze_audio(
 
     // Return result with Phase 1E confidence scoring integrated
     Ok(result)
+}
+
+/// An unconfident, empty beat grid (fallback when tracking fails).
+fn empty_grid() -> (BeatGrid, f32) {
+    (
+        BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
+            downbeats: vec![],
+            beats: vec![],
+            bars: vec![],
+        },
+        0.0,
+    )
 }

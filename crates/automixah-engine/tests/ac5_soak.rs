@@ -36,6 +36,8 @@ fn twenty_tracks() -> Vec<TrackAnalysis> {
                 },
                 duration: 150.0,
                 beat_grid: BeatGrid {
+                    grid_bpm: 0.0,
+                    anchor_seconds: 0.0,
                     downbeats: (0..bars).map(|b| b as f32 * beat * 4.0).collect(),
                     beats: (0..bars * 4).map(|b| b as f32 * beat).collect(),
                     bars: Vec::new(),

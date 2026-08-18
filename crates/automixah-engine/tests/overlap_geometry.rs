@@ -25,6 +25,8 @@ fn track(hash: &str, bpm: f32, duration: f32) -> TrackAnalysis {
         },
         duration,
         beat_grid: BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
             downbeats,
             beats,
             bars: Vec::new(),
@@ -135,6 +137,8 @@ fn unconfident_grid_window_stays_inside_stretched_audio() {
         },
         duration: 363.0,
         beat_grid: BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
             downbeats: Vec::new(),
             beats: Vec::new(),
             bars: Vec::new(),
@@ -154,6 +158,8 @@ fn unconfident_grid_window_stays_inside_stretched_audio() {
         },
         duration: 364.0,
         beat_grid: BeatGrid {
+            grid_bpm: 0.0,
+            anchor_seconds: 0.0,
             downbeats: Vec::new(),
             beats: Vec::new(),
             bars: Vec::new(),

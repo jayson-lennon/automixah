@@ -217,6 +217,8 @@ mod tests {
             .map(|i| i as f32 * downbeat_period / 4.0)
             .collect();
         BeatGrid {
+            grid_bpm: 240.0 / downbeat_period,
+            anchor_seconds: 0.0,
             downbeats,
             beats,
             bars: Vec::new(),
@@ -419,6 +421,8 @@ mod tests {
             }
         }
         BeatGrid {
+            grid_bpm: 120.0,
+            anchor_seconds: 0.0,
             downbeats: bars.to_vec(),
             beats,
             bars: Vec::new(),

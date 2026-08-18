@@ -313,6 +313,8 @@ pub(crate) fn synthetic_track(hash: &str, bpm: f32, duration: f32, beats: usize)
         },
         duration,
         beat_grid: BeatGrid {
+            grid_bpm: bpm,
+            anchor_seconds: 0.0,
             downbeats,
             beats: beat_count,
             bars: Vec::new(),
