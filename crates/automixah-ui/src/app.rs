@@ -8,6 +8,17 @@ use eframe::egui;
 
 use crate::services::Services;
 
+/// Locked drag mode (chosen at drag start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DragMode {
+    #[default]
+    None,
+    /// Left-drag: scrub audio at drag velocity.
+    Scrub,
+    /// SHIFT+left-drag: move the grid anchor.
+    MoveGrid,
+}
+
 /// The automixah-ui application.
 pub struct AutomixahUiApp {
     /// DI container (paths, grid store, async handle). Clone-cheap.
@@ -26,6 +37,8 @@ pub struct AutomixahUiApp {
     scrub: crate::audio::scrub_state::ScrubMachine,
     /// cpal output engine; `None` until a track loads or if audio fails.
     engine: Option<crate::audio::output::OutputEngine>,
+    /// Locked drag mode (chosen at drag start).
+    drag_mode: DragMode,
     /// Last audio-time position of the pointer while dragging.
     drag_last_seconds: Option<f32>,
     /// Last frame instant for drag-velocity computation.
@@ -60,6 +73,7 @@ impl AutomixahUiApp {
             cursor_time: None,
             scrub: crate::audio::scrub_state::ScrubMachine::new(1.0),
             engine: None,
+            drag_mode: DragMode::None,
             drag_last_seconds: None,
             last_frame_time: None,
             pcm: None,
@@ -257,8 +271,10 @@ impl eframe::App for AutomixahUiApp {
             });
             self.view.frames_per_pixel = zoom;
 
+            // Follow the playhead whenever the audio engine exists.
+            let follow = self.engine.as_ref().map(|e| *e.playhead().position.read());
             let (response, rect, sample_rate) =
-                crate::view::waveform::show(ui, peaks, &mut self.view, None);
+                crate::view::waveform::show(ui, peaks, &mut self.view, follow);
             let seconds_per_pixel = self.view.frames_per_pixel / sample_rate;
             let time_at_left = self.view.left_frame / sample_rate;
             let pointer_time = response
@@ -270,20 +286,53 @@ impl eframe::App for AutomixahUiApp {
                 let dt = t.elapsed().as_secs_f32();
                 if dt > 0.0 { dt } else { 1.0 / 240.0 }
             });
+            // Drag mode locks at drag start: SHIFT → grid move, else scrub.
+            let shift_now = ctx.input(|i| i.modifiers.shift);
             if response.drag_started_by(egui::PointerButton::Primary) {
-                self.scrub.drag_start();
-                self.drag_last_seconds = pointer_time;
-            }
-            if response.dragged_by(egui::PointerButton::Primary) {
-                if let (Some(now), Some(prev)) = (pointer_time, self.drag_last_seconds) {
-                    self.scrub.drag_move(now - prev, frame_dt);
+                if shift_now {
+                    self.drag_mode = DragMode::MoveGrid;
+                } else {
+                    self.drag_mode = DragMode::Scrub;
+                    self.scrub.drag_start();
+                    self.drag_last_seconds = pointer_time;
                 }
-                self.drag_last_seconds = pointer_time;
             }
-            if response.drag_stopped_by(egui::PointerButton::Primary) {
-                self.scrub.drag_end();
-                self.drag_last_seconds = None;
-                // Jump the engine to the release position.
+            match self.drag_mode {
+                DragMode::MoveGrid => {
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        let dx = response.drag_delta().x;
+                        self.edit_grid.shift_by(dx * seconds_per_pixel);
+                        self.schedule_save();
+                        self.status = format!(
+                            "grid shifted: anchor {:.3} s",
+                            self.edit_grid.anchor_seconds
+                        );
+                    }
+                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                        self.drag_mode = DragMode::None;
+                    }
+                }
+                DragMode::Scrub => {
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        if let (Some(now), Some(prev)) = (pointer_time, self.drag_last_seconds) {
+                            self.scrub.drag_move(now - prev, frame_dt);
+                        }
+                        self.drag_last_seconds = pointer_time;
+                    }
+                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                        self.scrub.drag_end();
+                        self.drag_last_seconds = None;
+                        self.drag_mode = DragMode::None;
+                        // Jump the engine to the release position.
+                        if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
+                            *engine.playhead().seek.write() = Some(t * sample_rate);
+                        }
+                    }
+                }
+                DragMode::None => {}
+            }
+            // Plain click (no drag) seeks the playhead; grid untouched.
+            if response.clicked() && !shift_now {
                 if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
                     *engine.playhead().seek.write() = Some(t * sample_rate);
                 }
@@ -305,7 +354,7 @@ impl eframe::App for AutomixahUiApp {
                 let x = x.clamp(rect.left(), rect.right());
                 painter.line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 60)),
+                    egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 210, 60)),
                 );
             }
         });

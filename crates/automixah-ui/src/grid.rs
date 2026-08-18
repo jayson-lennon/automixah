@@ -135,6 +135,13 @@ impl EditableGrid {
     pub fn normalize(&mut self) {
         self.anchor_seconds = self.anchor_seconds.rem_euclid(self.bar_seconds());
     }
+
+    /// Shifts every beat line by `delta_seconds` (positive = later),
+    /// keeping the anchor inside `[0, bar)`.
+    pub fn shift_by(&mut self, delta_seconds: f32) {
+        self.anchor_seconds += delta_seconds;
+        self.normalize();
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +312,60 @@ mod tests {
             "reprojected first downbeat {} vs {}",
             reprojected.downbeats[0],
             3.0 * beat
+        );
+    }
+
+    // Given a grid at 120 BPM (bar = 2 s) with anchor at 0.5 s.
+    // When shifted by +0.25 s.
+    // Then the anchor advances by exactly the delta.
+    #[test]
+    fn shift_by_adds_delta() {
+        let mut g = EditableGrid {
+            grid_bpm: 120.0,
+            anchor_seconds: 0.5,
+            downbeat_phase: 0,
+        };
+        g.shift_by(0.25);
+        assert!((g.anchor_seconds - 0.75).abs() < 1e-6);
+    }
+
+    // Given a grid with anchor near the bar end.
+    // When shifted past the bar boundary.
+    // Then the anchor wraps into [0, bar).
+    #[test]
+    fn shift_by_wraps_into_bar() {
+        let mut g = EditableGrid {
+            grid_bpm: 120.0,
+            anchor_seconds: 1.9,
+            downbeat_phase: 0,
+        };
+        g.shift_by(0.5);
+        assert!(
+            g.anchor_seconds >= 0.0 && g.anchor_seconds < 2.0,
+            "wrapped: {}",
+            g.anchor_seconds
+        );
+        assert!(
+            (g.anchor_seconds - 0.4).abs() < 1e-6,
+            "wrap preserves phase"
+        );
+    }
+
+    // Given a grid with anchor near 0.
+    // When shifted negatively.
+    // Then the anchor wraps from the bar end (phase preserved).
+    #[test]
+    fn shift_by_negative_wraps_from_bar_end() {
+        let mut g = EditableGrid {
+            grid_bpm: 120.0,
+            anchor_seconds: 0.1,
+            downbeat_phase: 0,
+        };
+        g.shift_by(-0.5);
+        assert!(
+            (g.anchor_seconds - 1.6).abs() < 1e-6,
+            "wrapped to {}",
+            g.anchor_seconds
         );
     }
 }

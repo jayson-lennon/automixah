@@ -23,8 +23,6 @@ pub struct WaveformView {
     pub frames_per_pixel: f32,
     /// Frame index at the left edge of the view.
     pub left_frame: f32,
-    /// True while the user is dragging the waveform (scrub drag).
-    pub dragging: bool,
 }
 
 impl Default for WaveformView {
@@ -32,7 +30,6 @@ impl Default for WaveformView {
         Self {
             frames_per_pixel: FRAMES_PER_PIXEL_MAX,
             left_frame: 0.0,
-            dragging: false,
         }
     }
 }
@@ -99,15 +96,7 @@ fn handle_input(
     rect: Rect,
     center_frame: Option<f32>,
 ) {
-    if response.dragged_by(egui::PointerButton::Primary)
-        || response.dragged_by(egui::PointerButton::Secondary)
-    {
-        view.dragging = true;
-        let dx = response.drag_delta().x;
-        view.left_frame -= dx * view.frames_per_pixel;
-        return;
-    }
-    view.dragging = false;
+    // No pan branch: scrub subsumes pan; the view follows the playhead.
 
     if let Some(pos) = response.hover_pos() {
         let anchor_px = pos.x - rect.left();
@@ -198,7 +187,6 @@ mod tests {
         WaveformView {
             frames_per_pixel: fpp,
             left_frame: left,
-            dragging: false,
         }
     }
 
