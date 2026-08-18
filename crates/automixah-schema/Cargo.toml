@@ -1,0 +1,18 @@
+[package]
+name = "automixah-schema"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = """
+Standalone schema + migration crate for automixah's grid library.
+
+Leaf crate: depends only on rusqlite and error plumbing. Consumed by
+`automixah-ui`'s runtime migrator (through the dao pool). Living in its own
+crate keeps migrations out of the UI crate's dependency cycle and makes the
+DDL a single source of truth.
+"""
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+error-stack.workspace = true
+wherror.workspace = true
