@@ -16,6 +16,13 @@ use crate::store::GridStoreService;
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     /// XDG data directory (`~/.local/share/automixah`).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "library_db already derives from it; future stores will read it"
+        )
+    )]
     pub data_dir: PathBuf,
     /// Grid library database (`<data_dir>/library.sqlite`).
     pub library_db: PathBuf,
@@ -32,14 +39,14 @@ impl AppPaths {
         let base = dirs::data_dir()
             .ok_or_else(|| Report::new(AppPathsError).attach("no XDG data dir"))
             .map(|d| d.join("automixah"))?;
-        std::fs::create_dir_all(&base)
-            .map_err(|e| {
-                Report::new(AppPathsError)
-                    .attach(e.to_string())
-                    .attach(format!("create {}", base.display()))
-            })?;
+        std::fs::create_dir_all(&base).map_err(|e| {
+            Report::new(AppPathsError)
+                .attach(e.to_string())
+                .attach(format!("create {}", base.display()))
+        })?;
+        let library_db = base.join("library.sqlite");
         Ok(Self {
-            library_db: base.join("library.sqlite"),
+            library_db,
             data_dir: base,
         })
     }
@@ -67,6 +74,10 @@ pub struct AppPathsError;
 #[derive(Debug, Clone)]
 pub struct Services {
     /// Resolved application paths.
+    #[expect(
+        dead_code,
+        reason = "grid store owns the resolved DB path; kept for future services"
+    )]
     pub paths: AppPaths,
     /// Grid override persistence (SQLite behind a trait).
     pub grid_store: GridStoreService,

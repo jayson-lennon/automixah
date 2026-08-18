@@ -94,6 +94,7 @@ impl SqliteGridStore {
 
     /// Exposes the pool for future sibling stores sharing `library.sqlite`.
     #[must_use]
+    #[expect(dead_code, reason = "sibling stores arrive with phase 5+")]
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
@@ -116,7 +117,11 @@ impl GridStore for SqliteGridStore {
         Ok(row.map(GridOverride::from))
     }
 
-    async fn put(&self, hash: &TrackHash, grid: &GridOverride) -> Result<(), Report<GridStoreError>> {
+    async fn put(
+        &self,
+        hash: &TrackHash,
+        grid: &GridOverride,
+    ) -> Result<(), Report<GridStoreError>> {
         self.pool
             .execute(
                 "INSERT INTO beat_grids (track_hash, grid_bpm, anchor_seconds, downbeat_phase, updated_at) \
@@ -128,9 +133,7 @@ impl GridStore for SqliteGridStore {
                  updated_at = excluded.updated_at",
                 vec![
                     Box::new(hash.0.clone()),
-                    #[expect(clippy::cast_precision_loss, reason = "f32 to f64 widening")]
                     Box::new(f64::from(grid.grid_bpm)),
-                    #[expect(clippy::cast_precision_loss, reason = "f32 to f64 widening")]
                     Box::new(f64::from(grid.anchor_seconds)),
                     Box::new(i64::from(grid.downbeat_phase)),
                     Box::new(grid.updated_at),
@@ -226,10 +229,14 @@ mod tests {
             updated_at: 9,
         };
 
-        let first = SqliteGridStore::open_or_create(&path).await.expect("open 1");
+        let first = SqliteGridStore::open_or_create(&path)
+            .await
+            .expect("open 1");
         first.put(&hash, &grid).await.expect("save");
 
-        let second = SqliteGridStore::open_or_create(&path).await.expect("open 2");
+        let second = SqliteGridStore::open_or_create(&path)
+            .await
+            .expect("open 2");
         assert_eq!(second.get(&hash).await.expect("reload"), Some(grid));
     }
 }

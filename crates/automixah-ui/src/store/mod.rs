@@ -58,7 +58,11 @@ pub trait GridStore: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the write fails.
-    async fn put(&self, hash: &TrackHash, grid: &GridOverride) -> Result<(), Report<GridStoreError>>;
+    async fn put(
+        &self,
+        hash: &TrackHash,
+        grid: &GridOverride,
+    ) -> Result<(), Report<GridStoreError>>;
 
     /// Backend name for debugging.
     fn name(&self) -> &'static str;
@@ -104,6 +108,10 @@ impl GridStoreService {
     /// # Errors
     ///
     /// Returns an error if the backend write fails.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "save-on-edit wiring lands in phase 5")
+    )]
     pub async fn put(
         &self,
         hash: &TrackHash,
@@ -114,6 +122,7 @@ impl GridStoreService {
 
     /// Backend name for debugging.
     #[must_use]
+    #[expect(dead_code, reason = "used by Debug and the phase-5 status line")]
     pub fn name(&self) -> &'static str {
         self.backend.name()
     }
@@ -129,16 +138,14 @@ impl GridStoreService {
 /// Returns an error if the connection cannot be acquired or a migration
 /// fails.
 pub async fn run_migrations(pool: &daow::Pool) -> Result<(), Report<GridStoreError>> {
-    let outcome = pool
-        .with_conn(|conn| {
-            automixah_schema::run_migrations(conn)
-                .map(Ok::<_, Report<GridStoreError>>)
-                .or_else(|report| Ok(Err(report.change_context(GridStoreError))))
-        })
-        .await
-        .change_context(GridStoreError)
-        .attach("failed to run grid library migrations")?;
-    outcome
+    pool.with_conn(|conn| {
+        automixah_schema::run_migrations(conn)
+            .map(Ok::<_, Report<GridStoreError>>)
+            .or_else(|report| Ok(Err(report.change_context(GridStoreError))))
+    })
+    .await
+    .change_context(GridStoreError)
+    .attach("failed to run grid library migrations")?
 }
 
 #[cfg(test)]

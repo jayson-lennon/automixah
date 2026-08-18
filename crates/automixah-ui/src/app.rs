@@ -13,6 +13,10 @@ pub struct AutomixahUiApp {
     services: Services,
     /// Track-dependent runtime state; `None` until a track is opened.
     track: Option<crate::track::LoadedTrack>,
+    /// Visual-rate peaks for the loaded track (built at load).
+    peaks: Option<crate::audio::peaks::Peaks>,
+    /// Waveform zoom/pan state.
+    view: crate::view::waveform::WaveformView,
     /// Status line shown in the top bar.
     status: String,
 }
@@ -24,6 +28,8 @@ impl AutomixahUiApp {
         Self {
             services,
             track: None,
+            peaks: None,
+            view: crate::view::waveform::WaveformView::default(),
             status: "open a track to begin".to_owned(),
         }
     }
@@ -37,12 +43,19 @@ impl eframe::App for AutomixahUiApp {
                 if open.clicked() {
                     match crate::track::open_pick(&self.services) {
                         Ok(Some(track)) => {
+                            let peaks = crate::audio::peaks::Peaks::build(
+                                &track.audio.samples,
+                                track.audio.sample_rate,
+                            );
                             self.status = format!(
-                                "loaded {} ({:.1}s, {:.3} BPM)",
+                                "loaded {} ({:.1}s, {:.3} BPM, {} visual samples)",
                                 track.path.display(),
                                 track.duration_seconds,
-                                track.grid.grid_bpm
+                                track.grid.grid_bpm,
+                                peaks.data.len()
                             );
+                            self.view = crate::view::waveform::WaveformView::default();
+                            self.peaks = Some(peaks);
                             self.track = Some(track);
                         }
                         Ok(None) => {}
@@ -55,15 +68,27 @@ impl eframe::App for AutomixahUiApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.track.is_some() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("waveform arrives in phase 2");
-                });
-            } else {
+            let Some(peaks) = self.peaks.as_ref() else {
                 ui.centered_and_justified(|ui| {
                     ui.weak("no track loaded — use Open… to pick an audio file");
                 });
-            }
+                return;
+            };
+
+            let mut zoom = self.view.frames_per_pixel;
+            ui.horizontal(|ui| {
+                ui.label("zoom");
+                ui.add(
+                    egui::Slider::new(
+                        &mut zoom,
+                        crate::view::waveform::FRAMES_PER_PIXEL_MIN
+                            ..=crate::view::waveform::FRAMES_PER_PIXEL_MAX,
+                    )
+                    .logarithmic(true),
+                );
+            });
+            self.view.frames_per_pixel = zoom;
+            crate::view::waveform::show(ui, peaks, &mut self.view, None);
         });
 
         // Keep the UI live while a track is loaded (playhead ticking later).

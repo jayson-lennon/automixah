@@ -35,6 +35,10 @@ impl EditableGrid {
     ///
     /// Keeps the stored invariant after BPM edits shift the bar length.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the phase-3 grid overlay")
+    )]
     pub fn normalized_anchor(&self) -> f32 {
         self.anchor_seconds.rem_euclid(self.bar_seconds())
     }

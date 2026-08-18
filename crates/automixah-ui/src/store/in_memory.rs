@@ -19,6 +19,10 @@ pub struct InMemoryGridStore {
 impl InMemoryGridStore {
     /// Creates an empty store.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used once the phase-5 UI save path lands")
+    )]
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,7 +35,11 @@ impl GridStore for InMemoryGridStore {
         Ok(grids.get(&hash.0).copied())
     }
 
-    async fn put(&self, hash: &TrackHash, grid: &GridOverride) -> Result<(), Report<GridStoreError>> {
+    async fn put(
+        &self,
+        hash: &TrackHash,
+        grid: &GridOverride,
+    ) -> Result<(), Report<GridStoreError>> {
         let mut grids = self.grids.lock();
         grids.insert(hash.0.clone(), *grid);
         Ok(())

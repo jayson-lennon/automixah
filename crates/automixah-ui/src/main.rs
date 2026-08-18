@@ -5,17 +5,19 @@
 //! container and hands it to eframe.
 
 mod app;
+mod audio;
 mod grid;
 mod services;
 mod store;
 mod track;
+mod view;
 
 use error_stack::{Report, ResultExt as _};
 
 use app::AutomixahUiApp;
 use services::{AppPaths, Services};
-use store::sqlite::SqliteGridStore;
 use store::GridStoreService;
+use store::sqlite::SqliteGridStore;
 
 #[derive(Debug, wherror::Error)]
 #[error("automixah ui error")]

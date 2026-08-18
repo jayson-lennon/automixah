@@ -16,6 +16,10 @@ pub struct LoadedTrack {
     /// Source file path.
     pub path: PathBuf,
     /// Content hash (SHA-256 hex of file bytes) — the store key.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the phase-5 save/load path")
+    )]
     pub hash: TrackHash,
     /// Decoded interleaved PCM.
     pub audio: DecodeAudio,
@@ -24,6 +28,10 @@ pub struct LoadedTrack {
     /// Effective grid: manual override if present, else the auto grid.
     pub grid: BeatGrid,
     /// Where the effective grid came from.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "surfaces in the phase-3 status line")
+    )]
     pub grid_source: GridSource,
 }
 
@@ -152,12 +160,14 @@ fn stored_override(
     let result = handle
         .block_on(async move { store.get(hash).await })
         .map_err(|report| report.change_context(TrackLoadError))?;
-    Ok(result.map(|o| crate::grid::EditableGrid {
-        grid_bpm: o.grid_bpm,
-        anchor_seconds: o.anchor_seconds,
-        downbeat_phase: o.downbeat_phase,
-    }
-    .project()))
+    Ok(result.map(|o| {
+        crate::grid::EditableGrid {
+            grid_bpm: o.grid_bpm,
+            anchor_seconds: o.anchor_seconds,
+            downbeat_phase: o.downbeat_phase,
+        }
+        .project()
+    }))
 }
 
 #[cfg(test)]
@@ -196,8 +206,7 @@ mod tests {
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
         for i in 0..frames {
-            let sample =
-                ((i as f64) * 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate)).sin();
+            let sample = ((i as f64) * 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate)).sin();
             let value = (sample * 0.5 * 32_767.0) as i16;
             bytes.extend_from_slice(&value.to_le_bytes());
             bytes.extend_from_slice(&value.to_le_bytes());
