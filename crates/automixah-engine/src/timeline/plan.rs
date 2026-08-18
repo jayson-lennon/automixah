@@ -1,0 +1,512 @@
+//! Top-level session planning: playlist → [`SessionPlan`].
+//!
+//! Composes the pure pieces:
+//!
+//! 1. fold each track's BPM into [90, 180), then select the session
+//!    tempo (median, user override wins);
+//! 2. decide each track's stretch to the session tempo;
+//! 3. place each adjacent pair's transition window on phrase
+//!    boundaries (drift re-anchored grids, fallback when unconfident);
+//! 4. emit segments with session-absolute sample times.
+
+use crate::timeline::placement::{
+    WindowInputs, anchors_from_grid, grid_is_confident, place_window,
+};
+use crate::timeline::stretch::decide_stretch;
+use crate::timeline::tempo::select_target_bpm;
+use crate::timeline::types::{
+    PresetName, Segment, SessionPlan, SessionTime, StretchDecision, TempoStrategy, TrackAnalysis,
+    TrackHash, TransitionPlan, TransitionWindow,
+};
+
+/// Options for [`plan_session`].
+#[derive(Debug, Clone)]
+pub struct PlanOptions {
+    /// User-selected target BPM (None = auto median).
+    pub target_bpm: Option<f32>,
+    /// Force pairwise drift-back on every segment ("deal with it"
+    /// mode for outlier-heavy playlists). Default: constant
+    /// session-BPM, with automatic DriftBack for out-of-band tracks.
+    pub force_drift_back: bool,
+    /// The active transition pair's window length in beats
+    /// (default 64: the built-in 16-bar crossfade).
+    pub transition_beats: usize,
+    /// The active transition pair's name (surfaces in the plan).
+    pub transition_name: String,
+}
+
+impl Default for PlanOptions {
+    fn default() -> Self {
+        Self {
+            target_bpm: None,
+            force_drift_back: false,
+            transition_beats: DEFAULT_PRESET_BEATS,
+            transition_name: "LongCrossfade".into(),
+        }
+    }
+}
+
+/// Beats used by the default pair's window length (16 bars).
+const DEFAULT_PRESET_BEATS: usize = 64;
+
+/// Plans a continuous mix over the (user-ordered) playlist.
+///
+/// `user_bpm_override` selects the session tempo when provided;
+/// otherwise the median of folded BPMs is used. Segments are laid out
+/// sequentially: each transition overlaps the outgoing tail by its
+/// window, so segment *starts* are `prior end − window length`.
+#[must_use]
+pub fn plan_session(tracks: &[TrackAnalysis], user_bpm_override: Option<f32>) -> SessionPlan {
+    plan_with(
+        tracks,
+        PlanOptions {
+            target_bpm: user_bpm_override,
+            ..Default::default()
+        },
+    )
+}
+
+/// Plans with explicit [`PlanOptions`].
+#[must_use]
+pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan {
+    let sample_rate = tracks.first().map_or(44_100, |t| t.sample_rate);
+    let session_bpm = select_target_bpm(
+        &tracks.iter().map(|t| t.bpm).collect::<Vec<_>>(),
+        options.target_bpm,
+    )
+    .unwrap_or(120.0);
+
+    let mut segments: Vec<Segment> = Vec::with_capacity(tracks.len());
+    let mut cursor = SessionTime::ZERO;
+
+    for (i, track) in tracks.iter().enumerate() {
+        let stretch = decide_stretch(track.bpm, session_bpm, track.sample_rate, sample_rate);
+        let grid_confident = grid_is_confident(&track.beat_grid, track.grid_stability);
+
+        // Segment length: full track stretched to session tempo.
+        let stretched_len =
+            SessionTime::from_seconds(track.duration * stretch.ratio.max(0.0), sample_rate);
+
+        // Segment end in session time: full stretch minus the cue
+        // skipped into the source (incoming tracks only).
+        let (cue_src, cue_warn) = if i == 0 {
+            (0_u64, None)
+        } else {
+            cue_for(track)
+        };
+        if let Some(reason) = &cue_warn {
+            eprintln!(
+                "[plan] cue fallback for {} ({}): starting at 0",
+                track.hash.0, reason
+            );
+        }
+        let cue_session = src_stretched(track, cue_src);
+        let audible_len = SessionTime(stretched_len.0.saturating_sub(cue_session));
+        // Overlap geometry: an incoming segment starts at the
+        // *previous* transition's window start, so its intro plays
+        // under the outgoing track's outro. (Computed BEFORE the
+        // outgoing transition so both use the same origin.)
+        let session_start = match segments.last() {
+            Some(prev) => prev.transition.as_ref().map_or(cursor, |t| t.window.start),
+            None => cursor,
+        };
+
+        let transition = next_transition(
+            tracks,
+            i,
+            session_bpm,
+            sample_rate,
+            session_start,
+            audible_len,
+            grid_confident,
+            options.transition_beats,
+            &options.transition_name,
+        );
+
+        // Tempo strategy: constant session-BPM by default; DriftBack
+        // when forced or when this incoming track is out of band
+        // (it eases from the previous track's tempo back to its own).
+        let use_drift_back = i > 0 && (options.force_drift_back || stretch.out_of_comfort_band);
+        let stretch = if use_drift_back {
+            drift_back_decision(track, &tracks[i - 1], session_bpm, sample_rate, stretch)
+        } else {
+            stretch
+        };
+
+        /// Converts a constant-ratio decision into DriftBack: during the
+        /// overlap the incoming track plays at the *previous* track's
+        /// (stretched) tempo, easing back to its own native ratio over
+        /// `ease_bars` bars after the window.
+        fn drift_back_decision(
+            track: &TrackAnalysis,
+            prev: &TrackAnalysis,
+            session_bpm: f32,
+            sample_rate: u32,
+            constant: StretchDecision,
+        ) -> StretchDecision {
+            let prev_ratio =
+                decide_stretch(prev.bpm, session_bpm, prev.sample_rate, sample_rate).ratio;
+            let native = decide_stretch(track.bpm, track.bpm, track.sample_rate, sample_rate).ratio;
+            StretchDecision {
+                strategy: TempoStrategy::DriftBack {
+                    overlap_ratio: prev_ratio,
+                    native_ratio: native,
+                    ease_bars: 8,
+                },
+                ..constant
+            }
+        }
+
+        // Cue: where in the source track this segment starts. First
+        // track starts at zero; incoming tracks cue at a phrase anchor
+        // (a downbeat near 25% in) when their grid is confident,
+        // else at zero with a fallback.
+        let (src_start, cue_warn) = if i == 0 {
+            (0_u64, None)
+        } else {
+            cue_for(track)
+        };
+        if let Some(reason) = &cue_warn {
+            eprintln!(
+                "[plan] cue fallback for {} ({}): starting at 0",
+                track.hash.0, reason
+            );
+        }
+
+        // Overlap geometry: an incoming segment starts at the
+        // *previous* transition's window start, so its intro plays
+        // under the outgoing track's outro.
+        let session_start = match segments.last() {
+            Some(prev) => prev.transition.as_ref().map_or(cursor, |t| t.window.start),
+            None => cursor,
+        };
+
+        // Length: the audible span is the full stretched track minus
+        // the cue we skipped into it.
+        let len_samples = stretched_len
+            .0
+            .saturating_sub(src_stretched(track, src_start));
+
+        segments.push(Segment {
+            track_hash: TrackHash(track.hash.0.clone()),
+            src_start,
+            session_start,
+            len_samples,
+            stretch,
+            transition: transition.map(|(window, preset)| TransitionPlan { window, preset }),
+        });
+
+        cursor = SessionTime(session_start.0 + stretched_len.0);
+    }
+
+    SessionPlan {
+        session_bpm,
+        sample_rate,
+        segments,
+    }
+}
+
+/// Stretched-session length of a source-frame cue position.
+fn src_stretched(track: &TrackAnalysis, src_start: u64) -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "cue samples fit u64"
+    )]
+    let stretched = (src_start as f64
+        * f64::from(
+            decide_stretch(track.bpm, track.bpm, track.sample_rate, track.sample_rate).ratio,
+        )) as u64;
+    stretched
+}
+
+/// Picks the source cue for an incoming track: the downbeat nearest
+/// 25% of the track's duration when the grid is confident, else zero
+/// with a reason string for the caller to warn about.
+fn cue_for(track: &TrackAnalysis) -> (u64, Option<&'static str>) {
+    if !grid_is_confident(&track.beat_grid, track.grid_stability) {
+        return (0, Some("beat grid not confident"));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "cue samples fit u64"
+    )]
+    let anchor = (f64::from(track.duration) * 0.25 * f64::from(track.sample_rate)) as u64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "downbeat samples fit u64"
+    )]
+    let best = track
+        .beat_grid
+        .downbeats
+        .iter()
+        .map(|&t| (f64::from(t) * f64::from(track.sample_rate)).round() as u64)
+        .min_by_key(|&s| s.abs_diff(anchor))
+        .unwrap_or(0);
+    if best == 0 {
+        return (0, None);
+    }
+    (best, None)
+}
+
+/// Places the transition out of track `i` (into `i + 1`), if any.
+///
+/// The window ends at the outgoing segment's end; B's anchors seed the
+/// placement. Returns the placed window and the preset name.
+#[allow(clippy::too_many_arguments)]
+fn next_transition(
+    tracks: &[TrackAnalysis],
+    i: usize,
+    session_bpm: f32,
+    sample_rate: u32,
+    cursor: SessionTime,
+    stretched_len: SessionTime,
+    grid_confident: bool,
+    transition_beats: usize,
+    transition_name: &str,
+) -> Option<(TransitionWindow, PresetName)> {
+    let next = tracks.get(i + 1)?;
+    let a = &tracks[i];
+
+    let a_anchor = if grid_confident {
+        anchors_from_grid(&a.beat_grid, a.duration)
+    } else {
+        None
+    };
+    let b_anchor = anchors_from_grid(&next.beat_grid, next.duration);
+
+    // Window ends at this segment's stretched end, in session time.
+    let a_session_end = SessionTime(cursor.0 + stretched_len.0);
+
+    let window = place_window(
+        a_anchor.as_ref(),
+        b_anchor.as_ref(),
+        WindowInputs {
+            preset_beats: transition_beats.max(1),
+            a_session_end,
+            b_cue_session: SessionTime::ZERO,
+            session_bpm,
+            sample_rate,
+        },
+    );
+
+    Some((window, PresetName(transition_name.to_owned())))
+}
+
+/// Builds a synthetic [`TrackAnalysis`] for tests.
+#[cfg(test)]
+pub(crate) fn synthetic_track(hash: &str, bpm: f32, duration: f32, beats: usize) -> TrackAnalysis {
+    let beat_len = 60.0 / bpm;
+    #[expect(clippy::cast_precision_loss, reason = "test helper: small indices")]
+    let downbeats: Vec<f32> = (0..=beats / 4).map(|i| i as f32 * beat_len * 4.0).collect();
+    #[expect(clippy::cast_precision_loss, reason = "test helper: small indices")]
+    let beat_count: Vec<f32> = (0..beats).map(|i| i as f32 * beat_len).collect();
+    TrackAnalysis {
+        hash: TrackHash(hash.into()),
+        bpm,
+        bpm_confidence: 0.9,
+        key: djcore::Key {
+            root: 0,
+            mode: djcore::KeyMode::Major,
+        },
+        duration,
+        beat_grid: BeatGrid {
+            downbeats,
+            beats: beat_count,
+            bars: Vec::new(),
+        },
+        grid_stability: 0.9,
+        sample_rate: 44_100,
+        channels: 2,
+        format: "wav".into(),
+    }
+}
+
+#[cfg(test)]
+use djcore::analyzer::BeatGrid;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drift_back_used_for_out_of_band_incoming_track() {
+        // Given 120 → 150 with a 120 session target.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 150.0, 60.0, 240),
+        ];
+
+        // When planning at 120.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then segment 1 uses DriftBack (150 is 25% off = out of band).
+        assert!(matches!(
+            plan.segments[1].stretch.strategy,
+            TempoStrategy::DriftBack { .. }
+        ));
+    }
+
+    #[test]
+    fn in_band_incoming_track_stays_session_bpm() {
+        // Given 120 → 124 at target 120.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 124.0, 60.0, 240),
+        ];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then segment 1 stays constant-ratio.
+        assert_eq!(plan.segments[1].stretch.strategy, TempoStrategy::SessionBpm);
+    }
+
+    #[test]
+    fn force_drift_back_applies_to_all_but_first() {
+        // Given two in-band tracks.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 122.0, 60.0, 240),
+        ];
+
+        // When planning with force_drift_back.
+        let plan = plan_with(
+            &tracks,
+            PlanOptions {
+                target_bpm: Some(120.0),
+                force_drift_back: true,
+                ..Default::default()
+            },
+        );
+
+        // Then segment 0 is constant and segment 1 is DriftBack.
+        assert_eq!(plan.segments[0].stretch.strategy, TempoStrategy::SessionBpm);
+        assert!(matches!(
+            plan.segments[1].stretch.strategy,
+            TempoStrategy::DriftBack { .. }
+        ));
+    }
+
+    #[test]
+    fn drift_back_ratio_eases_from_overlap_to_native() {
+        // Given a DriftBack strategy.
+        let s = TempoStrategy::DriftBack {
+            overlap_ratio: 1.0,
+            native_ratio: 1.25,
+            ease_bars: 8,
+        };
+        // 120 BPM → bar = 2 s; overlap at [0, 16) s of segment time.
+        const BPM: f32 = 120.0;
+        const OV_START: f32 = 0.0;
+        const OV_LEN: f32 = 16.0;
+
+        // Then before/inside the overlap the ratio is overlap_ratio…
+        assert!((s.ratio_at(0.0, 5.0, OV_START, OV_LEN, BPM) - 1.0).abs() < f32::EPSILON);
+        assert!((s.ratio_at(0.0, 15.9, OV_START, OV_LEN, BPM) - 1.0).abs() < 1e-6);
+        // …halfway through the 16 s ease it is halfway in ratio…
+        let mid = s.ratio_at(0.0, OV_LEN + 8.0, OV_START, OV_LEN, BPM);
+        assert!((mid - 1.125).abs() < 1e-3);
+        // …and after the full ease it reaches native.
+        let end = s.ratio_at(0.0, OV_LEN + 16.1, OV_START, OV_LEN, BPM);
+        assert!((end - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plan_uses_median_target_bpm_by_default() {
+        // Given a mixed-BPM playlist.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 126.0, 60.0, 240),
+            synthetic_track("c", 130.0, 60.0, 240),
+        ];
+
+        // When planning without an override.
+        let plan = plan_session(&tracks, None);
+
+        // Then the session tempo is the folded median (126).
+        assert!((plan.session_bpm - 126.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn plan_honors_user_bpm_override() {
+        // Given the same playlist with a user override.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 126.0, 60.0, 240),
+            synthetic_track("c", 130.0, 60.0, 240),
+        ];
+
+        // When planning with an override of 124.
+        let plan = plan_session(&tracks, Some(124.0));
+
+        // Then the session tempo is 124.
+        assert!((plan.session_bpm - 124.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn plan_segments_are_sequential_and_overlapping() {
+        // Given two tracks.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 122.0, 60.0, 240),
+        ];
+
+        // When planning.
+        let plan = plan_session(&tracks, None);
+
+        // Then segment 0 has a transition whose window precedes segment 1.
+        let t = plan.segments[0].transition.as_ref().expect("transition");
+        assert!(t.window.end.0 <= plan.segments[1].session_start.0 + t.window.len_samples());
+        assert!(t.window.start.0 < t.window.end.0);
+    }
+
+    #[test]
+    fn plan_stretches_each_track_to_session_tempo() {
+        // Given tracks at 120 and 150 with a 120 target.
+        let tracks = vec![
+            synthetic_track("a", 120.0, 60.0, 240),
+            synthetic_track("b", 150.0, 60.0, 240),
+        ];
+
+        // When planning at 120.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then track b is stretched by 150/120 (duration ×1.25) and is out of band.
+        assert!((plan.segments[1].stretch.ratio - 150.0 / 120.0).abs() < 1e-6);
+        assert!(plan.segments[1].stretch.out_of_comfort_band);
+    }
+
+    #[test]
+    fn full_plan_snapshot_on_mixed_bpm_playlist() {
+        // Given a mixed-BPM playlist spanning fold boundaries.
+        let tracks = vec![
+            synthetic_track("a", 148.0, 344.0, 848),
+            synthetic_track("b", 100.0, 180.0, 300),
+            synthetic_track("c", 175.0, 200.0, 583),
+            synthetic_track("d", 96.0, 150.0, 240),
+        ];
+
+        // When planning with no override (median of folded = (148,100,175,96) → 124).
+        let plan = plan_session(&tracks, None);
+
+        // Then the snapshot holds: bpm, segment count, starts, stretch modes.
+        let snapshot = format!(
+            "bpm={:.1} segments={} first_len={} second_start={} cut_preset={}",
+            plan.session_bpm,
+            plan.segments.len(),
+            plan.segments[0].len_samples,
+            plan.segments[1].session_start.0,
+            plan.segments[0]
+                .transition
+                .as_ref()
+                .map_or("", |t| &t.preset.0),
+        );
+        assert_eq!(
+            snapshot,
+            "bpm=124.0 segments=4 first_len=18106608 second_start=16740931 cut_preset=LongCrossfade"
+        );
+    }
+}

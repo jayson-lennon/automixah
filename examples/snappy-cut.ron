@@ -1,0 +1,9 @@
+// Short 4-bar blend for tighter handovers.
+TransitionSpec(
+    name: "SnappyCut",
+    beats: 16,
+    curves: [
+        TransitionCurve(role: Outgoing, address: Gain, from: 1.0, to: 0.0, shape: Linear),
+        TransitionCurve(role: Incoming, address: Gain, from: 0.0, to: 1.0, shape: Linear),
+    ],
+)

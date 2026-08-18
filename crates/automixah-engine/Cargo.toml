@@ -1,0 +1,24 @@
+[package]
+name = "automixah-engine"
+description = "Pure-Rust auto-DJ engine: session planning, control bus, automation timelines, and mix rendering."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+
+[dependencies]
+error-stack.workspace = true
+wherror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+djcore.workspace = true
+ron.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "render_throughput"
+harness = false
+

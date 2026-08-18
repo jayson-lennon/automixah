@@ -1,0 +1,13 @@
+// Crossfade with a high-pass sweep on the outgoing deck: bass clears
+// out over the window so the incoming track's low end takes over.
+// Addresses available: Gain, EqLow, EqMid, EqHigh, HpfCutoff, LpfCutoff.
+// Shapes: EqualPower, Linear. Roles: Outgoing, Incoming.
+TransitionSpec(
+    name: "LowCutBlend",
+    beats: 64,
+    curves: [
+        TransitionCurve(role: Outgoing, address: Gain, from: 1.0, to: 0.0, shape: EqualPower),
+        TransitionCurve(role: Outgoing, address: HpfCutoff, from: 20.0, to: 400.0, shape: Linear),
+        TransitionCurve(role: Incoming, address: Gain, from: 0.0, to: 1.0, shape: EqualPower),
+    ],
+)
