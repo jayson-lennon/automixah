@@ -216,6 +216,12 @@ pub fn place_window(
 /// Snaps both window boundaries to the nearest session-grid beat
 /// of A's stretched grid, keeping `end` from passing A's session
 /// end and the length at or above one bar.
+///
+/// The snap runs in f64 on the *float* beat length: the session
+/// beat is generally not an integer sample count (19174.39 at
+/// 138 BPM), and integer-beat snapping accumulates fractional
+/// drift — after ~350 beats the window sits a full 136 samples
+/// off the true grid.
 fn snap_window(
     phase: SessionTime,
     beat: f32,
@@ -223,11 +229,7 @@ fn snap_window(
     start: SessionTime,
     end: SessionTime,
 ) -> TransitionWindow {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "sample counts fit f32 mantissa in practice"
-    )]
-    let beat_samples = (beat * sample_rate as f32) as u64;
+    let beat_samples = f64::from(beat) * f64::from(sample_rate);
 
     let start_snap = snap_to_grid(start, phase, beat_samples);
     let mut end_snap = snap_to_grid(end, phase, beat_samples);
@@ -235,10 +237,14 @@ fn snap_window(
     // Clamp inward: the window must not extend past A's session
     // end nor shrink below one bar.
     if end_snap > end {
-        end_snap = SessionTime(end_snap.0.saturating_sub(beat_samples));
+        #[expect(clippy::cast_possible_truncation, reason = "one beat")]
+        let one_beat = beat_samples as u64;
+        end_snap = SessionTime(end_snap.0.saturating_sub(one_beat));
     }
-    let min_samples = beat_samples * u64::from(BEATS_PER_BAR as u32);
-    if end_snap.0.saturating_sub(start_snap.0) < min_samples {
+    let min_samples = beat_samples * f64::from(BEATS_PER_BAR as u32);
+    let span = end_snap.0.saturating_sub(start_snap.0);
+    #[expect(clippy::cast_precision_loss, reason = "sample span")]
+    if (span as f64) < min_samples {
         return TransitionWindow { start, end };
     }
     TransitionWindow {
@@ -247,21 +253,18 @@ fn snap_window(
     }
 }
 
-/// Nearest grid beat to `t` on the grid `phase + k·beat`.
-fn snap_to_grid(t: SessionTime, phase: SessionTime, beat_samples: u64) -> SessionTime {
-    let delta = t.0.abs_diff(phase.0);
-    let beats_up = delta.div_ceil(beat_samples);
-    let down = phase
-        .0
-        .saturating_sub(beats_up.saturating_mul(beat_samples));
-    let up = phase
-        .0
-        .saturating_add(beats_up.saturating_mul(beat_samples));
-    if t.0.abs_diff(down) <= t.0.abs_diff(up) {
-        SessionTime(down)
-    } else {
-        SessionTime(up)
-    }
+/// Nearest grid beat to `t` on the float grid `phase + k·beat`,
+/// rounded to whole samples.
+fn snap_to_grid(t: SessionTime, phase: SessionTime, beat_samples: f64) -> SessionTime {
+    let t_f = (t.0.max(phase.0) - phase.0.min(t.0)) as f64;
+    let k = (t_f / beat_samples).round();
+    let snapped = phase.0 as f64 + k * beat_samples;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "snapped beat within session bounds"
+    )]
+    SessionTime(snapped.max(0.0).round() as u64)
 }
 
 #[cfg(test)]

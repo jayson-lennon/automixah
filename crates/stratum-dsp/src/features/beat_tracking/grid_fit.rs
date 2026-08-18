@@ -120,11 +120,16 @@ pub fn fit_constant_grid(
     let grid = materialize(grid_bpm, anchor, beat_length, f64::from(duration));
 
     log::debug!(
-        "constant-grid fit: seed {:.2} → grid {:.3} BPM, anchor {:.3}s, stability {:.3}",
+        "constant-grid fit: seed {:.2} → grid {:.3} BPM, anchor {:.3}s, stability {:.3}; span [{:.3}, {:.3}] beat_len {:.6} ({} regions, {} marks)",
         bpm_seed,
         grid_bpm,
         anchor,
-        stability
+        stability,
+        span.start,
+        span.end,
+        span.beat_length,
+        regions.len(),
+        cleaned.len()
     );
     Ok((grid, stability))
 }

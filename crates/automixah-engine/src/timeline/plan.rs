@@ -615,7 +615,7 @@ mod tests {
         );
         assert_eq!(
             snapshot,
-            "bpm=124.0 segments=4 first_len=18106608 second_start=16750330 cut_preset=LongCrossfade"
+            "bpm=124.0 segments=4 first_len=18106608 second_start=16750887 cut_preset=LongCrossfade"
         );
     }
 }
