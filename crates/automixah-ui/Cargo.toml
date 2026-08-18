@@ -10,7 +10,10 @@ grid editing, vinyl-style scrub audition, SQLite grid library.
 
 [lib]
 name = "automixah_ui_lib"
-path = "src/lib.rs"
+
+
+[features]
+__test-hooks = []
 
 [[bin]]
 name = "automixah-ui"
@@ -37,3 +40,7 @@ wherror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+automixah_ui_lib = { path = ".", package = "automixah-ui", features = ["__test-hooks"] }
+
+[package.metadata.cargo-shear]
+ignored = []

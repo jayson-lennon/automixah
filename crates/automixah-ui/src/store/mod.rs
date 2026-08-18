@@ -143,6 +143,52 @@ pub async fn run_migrations(pool: &daow::Pool) -> Result<(), Report<GridStoreErr
     .attach("failed to run grid library migrations")?
 }
 
+/// Test double wrapping a backend with put/get counters.
+pub struct CountingStore {
+    backend: Arc<dyn GridStore>,
+    puts: std::sync::atomic::AtomicUsize,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingStore {
+    pub fn new(backend: Arc<dyn GridStore>) -> Self {
+        Self {
+            backend,
+            puts: std::sync::atomic::AtomicUsize::new(0),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn puts(&self) -> usize {
+        self.puts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn gets(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl GridStore for CountingStore {
+    async fn get(&self, hash: &TrackHash) -> Result<Option<GridOverride>, Report<GridStoreError>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.backend.get(hash).await
+    }
+
+    async fn put(
+        &self,
+        hash: &TrackHash,
+        grid: &GridOverride,
+    ) -> Result<(), Report<GridStoreError>> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.backend.put(hash, grid).await
+    }
+
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

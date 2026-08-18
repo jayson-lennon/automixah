@@ -3,6 +3,9 @@
 //! Runtime state (`UiState`) lives here, separate from the DI container
 //! (`Services`), which is cloned in at construction and never mutated.
 
+use std::path::PathBuf;
+
+use automixah_engine::timeline::types::TrackHash;
 use djcore::decoder::DecoderRegistry;
 use eframe::egui;
 
@@ -17,6 +20,22 @@ enum DragMode {
     Scrub,
     /// SHIFT+left-drag: move the grid anchor.
     MoveGrid,
+}
+
+/// Terminal state of one grid save, reported to the status line.
+enum SaveOutcome {
+    Saved(String),
+    Failed(String),
+}
+
+/// `HH:MM:SS` (UTC) rendering of a unix duration for the status line.
+fn format_hhmmss(d: std::time::Duration) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        d.as_secs() / 3600,
+        (d.as_secs() / 60) % 60,
+        d.as_secs() % 60
+    )
 }
 
 /// The automixah-ui application.
@@ -47,6 +66,11 @@ pub struct AutomixahUiApp {
     pcm: Option<std::sync::Arc<Vec<f32>>>,
     /// Off-thread load in flight; drained each frame.
     loading: Option<std::sync::mpsc::Receiver<crate::track::LoadEvent>>,
+    /// Grid-save completion channel (sender cloned per flush).
+    save_outcomes: (
+        std::sync::mpsc::Sender<SaveOutcome>,
+        std::sync::mpsc::Receiver<SaveOutcome>,
+    ),
     /// Dirty grid to flush on the next frame (immediate save).
     pending_save: Option<(
         automixah_engine::timeline::types::TrackHash,
@@ -54,6 +78,43 @@ pub struct AutomixahUiApp {
     )>,
     /// Status line shown in the top bar.
     status: String,
+}
+
+/// Integration-test hooks: drive the save path without egui.
+#[cfg(any(test, feature = "__test-hooks"))]
+impl AutomixahUiApp {
+    /// Simulates a loaded track for save-path testing.
+    pub fn inject_track_for_test(&mut self, hash: TrackHash) {
+        self.track = Some(crate::track::LoadedTrack {
+            path: PathBuf::from("test.ogg"),
+            hash,
+            audio: djcore::decoder::DecodeAudio {
+                samples: Vec::new(),
+                sample_rate: 44_100,
+                channels: 2,
+            },
+            duration_seconds: 60.0,
+            grid: djcore::analyzer::BeatGrid::default(),
+            grid_source: crate::track::GridSource::Auto,
+        });
+    }
+
+    /// Applies a grid shift and marks dirty, like the gesture path.
+    pub fn test_shift_grid(&mut self, delta: f32) {
+        self.edit_grid.shift_by(delta);
+        self.schedule_save();
+    }
+
+    /// Changes the downbeat phase and marks dirty.
+    pub fn test_set_downbeat_phase(&mut self, phase: u8) {
+        self.edit_grid.downbeat_phase = phase;
+        self.schedule_save();
+    }
+
+    /// Flushes a pending save now.
+    pub fn flush_save_if_due_for_test(&mut self) {
+        self.flush_save_if_due();
+    }
 }
 
 impl AutomixahUiApp {
@@ -76,23 +137,37 @@ impl AutomixahUiApp {
             drag_mode: DragMode::None,
             drag_last_seconds: None,
             last_frame_time: None,
-            pcm: None,
             loading: None,
+            save_outcomes: std::sync::mpsc::channel(),
+            pcm: None,
             pending_save: None,
             status: "open a track to begin".to_owned(),
         }
     }
 }
 
+impl AutomixahUiApp {}
+
 impl AutomixahUiApp {
-    /// Marks the current grid dirty for the debounced save.
+    /// Marks the current grid dirty; flushed on the next frame.
     fn schedule_save(&mut self) {
         if let Some(track) = self.track.as_ref() {
             self.pending_save = Some((track.hash.clone(), self.edit_grid));
         }
     }
 
-    /// Flushes a pending save once it has been stable for 500 ms.
+    /// Drains save outcomes into the status line (one per flush).
+    fn poll_save_outcomes(&mut self) {
+        while let Ok(outcome) = self.save_outcomes.1.try_recv() {
+            self.status = match outcome {
+                SaveOutcome::Saved(at) => format!("grid saved {at}"),
+                SaveOutcome::Failed(msg) => format!("⚠ save failed: {msg}"),
+            };
+        }
+    }
+
+    /// Flushes a pending save immediately; the spawned task reports back
+    /// through the outcomes channel.
     fn flush_save_if_due(&mut self) {
         let Some((hash, grid)) = self.pending_save.take() else {
             return;
@@ -106,12 +181,16 @@ impl AutomixahUiApp {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64),
         };
-        let status = self.status.clone();
+        let tx = self.save_outcomes.0.clone();
         self.services.handle.spawn(async move {
-            match store.put(&hash, &grid).await {
-                Ok(()) => {}
-                Err(report) => eprintln!("grid save failed: {report:?} — {status}"),
-            }
+            let _ = tx.send(match store.put(&hash, &grid).await {
+                Ok(()) => SaveOutcome::Saved(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or_else(|_| "?".to_owned(), format_hhmmss),
+                ),
+                Err(report) => SaveOutcome::Failed(format!("{report:#}")),
+            });
         });
     }
 
@@ -137,6 +216,8 @@ impl AutomixahUiApp {
         self.pcm = Some(pcm);
     }
 }
+
+impl AutomixahUiApp {}
 
 impl AutomixahUiApp {
     /// Sends the current scrub command to the audio thread.
@@ -332,10 +413,11 @@ impl eframe::App for AutomixahUiApp {
                 DragMode::None => {}
             }
             // Plain click (no drag) seeks the playhead; grid untouched.
-            if response.clicked() && !shift_now {
-                if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
-                    *engine.playhead().seek.write() = Some(t * sample_rate);
-                }
+            if response.clicked()
+                && !shift_now
+                && let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref())
+            {
+                *engine.playhead().seek.write() = Some(t * sample_rate);
             }
 
             let painter = ui.painter_at(rect);
@@ -360,6 +442,7 @@ impl eframe::App for AutomixahUiApp {
         });
 
         self.push_command();
+        self.poll_save_outcomes();
         self.flush_save_if_due();
         self.last_frame_time = Some(std::time::Instant::now());
 
