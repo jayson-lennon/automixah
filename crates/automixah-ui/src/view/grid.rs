@@ -5,10 +5,10 @@ use eframe::egui::{Color32, Painter, Rect};
 
 use crate::grid::EditableGrid;
 
-/// Beat line tint (light).
-const BEAT_COLOR: Color32 = Color32::from_rgba_premultiplied(220, 220, 220, 40);
-/// Downbeat line tint (heavy, warm).
-const DOWNBEAT_COLOR: Color32 = Color32::from_rgba_premultiplied(255, 170, 0, 110);
+/// Beat line color: blue, opaque enough to read over the RGB waveform.
+const BEAT_COLOR: Color32 = Color32::from_rgba_premultiplied(70, 130, 255, 170);
+/// Downbeat line color: white, heavier than beats.
+const DOWNBEAT_COLOR: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 220);
 
 /// Draws beat/downbeat lines for `grid` over the visible span of `rect`.
 ///

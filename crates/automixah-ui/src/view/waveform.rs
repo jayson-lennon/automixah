@@ -5,13 +5,6 @@ use eframe::egui::{Color32, Painter, Pos2, Rect, Response, Sense, Vec2};
 
 use crate::audio::peaks::{PeakQuartet, Peaks};
 
-/// Mixxx low-band tint: red-leaning.
-const LOW_RGB: (u8, u8, u8) = (255, 0, 0);
-/// Mixxx mid-band tint: green-leaning.
-const MID_RGB: (u8, u8, u8) = (0, 255, 0);
-/// Mixxx high-band tint: blue-leaning.
-const HIGH_RGB: (u8, u8, u8) = (0, 0, 255);
-
 /// Zoom range in frames per pixel: near-sample level (4) to overview.
 pub const FRAMES_PER_PIXEL_MIN: f32 = 4.0;
 pub const FRAMES_PER_PIXEL_MAX: f32 = 20_000.0;
@@ -147,36 +140,62 @@ fn aggregate(peaks: &Peaks, frame_lo: f32, frame_hi: f32, stride: f32, total: f3
     column
 }
 
-/// One RGB-mixed column: height from the overall peak, hue from the band mix.
+/// One layered-RGB column (Mixxx style): each band is a centered column
+/// of its own height with alpha, tallest painted first so all bands show.
 fn paint_column(painter: &Painter, x: f32, center_y: f32, half_h: f32, q: &PeakQuartet) {
     if q.all == 0 {
         return;
     }
-    let amplitude = f32::from(q.all) / 255.0;
-    let len = (half_h * amplitude).max(1.0);
-    let color = band_mix(q, amplitude);
+    let heights = band_heights(q, half_h);
+    let bands = [
+        (heights[0], band_color(Band::Low)),
+        (heights[1], band_color(Band::Mid)),
+        (heights[2], band_color(Band::High)),
+    ];
+    let mut order = bands;
+    order.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (h, color) in order {
+        paint_band(painter, x, center_y, h, color);
+    }
+}
+
+/// Filled centered column of half-height `h`.
+fn paint_band(painter: &Painter, x: f32, center_y: f32, h: f32, color: Color32) {
+    if h < 0.5 {
+        return;
+    }
     painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(x - 0.5, center_y - len),
-            Vec2::new(1.0, len * 2.0),
-        ),
+        Rect::from_min_size(Pos2::new(x - 0.5, center_y - h), Vec2::new(1.0, h * 2.0)),
         0.0,
         color,
     );
 }
 
-/// Additive band tint scaled by overall amplitude, clamped per channel.
-fn band_mix(q: &PeakQuartet, amplitude: f32) -> Color32 {
-    let ch = |band: u8, tint: u8| f32::from(band) * f32::from(tint) / (255.0 * 255.0);
-    let r =
-        amplitude * 255.0 + ch(q.low, LOW_RGB.0) + ch(q.mid, MID_RGB.0) + ch(q.high, HIGH_RGB.0);
-    let g =
-        amplitude * 255.0 + ch(q.low, LOW_RGB.1) + ch(q.mid, MID_RGB.1) + ch(q.high, HIGH_RGB.1);
-    let b =
-        amplitude * 255.0 + ch(q.low, LOW_RGB.2) + ch(q.mid, MID_RGB.2) + ch(q.high, HIGH_RGB.2);
-    #[expect(clippy::cast_possible_truncation, reason = "clamped to 255")]
-    let byte = |v: f32| v.clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(byte(r), byte(g), byte(b))
+/// Which spectral band a column segment represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Band {
+    Low,
+    Mid,
+    High,
+}
+
+/// Band color (semi-transparent so layers blend).
+fn band_color(band: Band) -> Color32 {
+    match band {
+        Band::Low => Color32::from_rgba_premultiplied(180, 30, 30, 160),
+        Band::Mid => Color32::from_rgba_premultiplied(30, 180, 60, 140),
+        Band::High => Color32::from_rgba_premultiplied(70, 110, 255, 120),
+    }
+}
+
+/// Stacked band heights (px) from the peak quartet: each band's own value
+/// scaled to `half_h`, minimum 1 px when any signal exists.
+fn band_heights(q: &PeakQuartet, half_h: f32) -> [f32; 3] {
+    let v = |band: u8| {
+        let h = half_h * f32::from(band) / 255.0;
+        if q.all > 0 { h.max(1.0) } else { h }
+    };
+    [v(q.low), v(q.mid), v(q.high)]
 }
 
 #[cfg(test)]
@@ -203,6 +222,60 @@ mod tests {
                 .collect(),
             stride_frames: stride,
         }
+    }
+
+    fn quartet(low: u8, mid: u8, high: u8, all: u8) -> PeakQuartet {
+        PeakQuartet {
+            low,
+            mid,
+            high,
+            all,
+        }
+    }
+
+    // Given a low-only quartet at half amplitude.
+    // When band heights are computed for half-height 100 px.
+    // Then the low band is ~50 px and the others are the 1 px floor.
+    #[test]
+    fn band_heights_scale_per_band() {
+        let [lo, mid, hi] = band_heights(&quartet(128, 0, 0, 128), 100.0);
+        assert!((lo - 50.2).abs() < 1.0, "low {lo}");
+        assert_eq!(mid, 1.0, "mid floor when silent");
+        assert_eq!(hi, 1.0, "high floor when silent");
+    }
+
+    // Given a high-dominant quartet.
+    // When band heights are computed.
+    // Then the high band exceeds the others.
+    #[test]
+    fn band_heights_high_band_dominates() {
+        let [lo, mid, hi] = band_heights(&quartet(10, 20, 255, 255), 80.0);
+        assert!(hi > mid && mid > lo, "ordered {lo}/{mid}/{hi}");
+        assert!((hi - 80.0).abs() < 1.0, "high reaches full half-height");
+    }
+
+    // Given a fully silent quartet.
+    // When heights are computed.
+    // Then all bands are zero (paint early-outs on q.all == 0 anyway).
+    #[test]
+    fn band_heights_silent_is_zero() {
+        let [lo, mid, hi] = band_heights(&quartet(0, 0, 0, 0), 100.0);
+        assert_eq!([lo, mid, hi], [0.0, 0.0, 0.0]);
+    }
+
+    // Given the three bands.
+    // When colors are assigned.
+    // Then each band has a distinct, band-appropriate hue.
+    #[test]
+    fn band_colors_are_distinct_rgb() {
+        let low = band_color(Band::Low);
+        let mid = band_color(Band::Mid);
+        let high = band_color(Band::High);
+        assert!(low.r() > low.g() && low.r() > low.b(), "low is red");
+        assert!(mid.g() > mid.r() && mid.g() > mid.b(), "mid is green");
+        assert!(high.b() > high.r() && high.b() > high.g(), "high is blue");
+        assert_ne!(low, mid);
+        assert_ne!(mid, high);
     }
 
     // Given a view zoomed so one pixel spans two visual samples.
