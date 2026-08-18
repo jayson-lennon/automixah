@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 automixah-schema = { path = "../automixah-schema" }
+stratum-dsp.workspace = true
 djcore = { path = "../djcore" }
 automixah-engine = { path = "../automixah-engine" }
 

@@ -591,6 +591,7 @@ dependencies = [
  "parking_lot",
  "rfd",
  "sha2",
+ "stratum-dsp",
  "tempfile",
  "tokio",
  "wherror",
