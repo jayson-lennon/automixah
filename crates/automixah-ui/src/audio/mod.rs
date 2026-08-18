@@ -2,5 +2,6 @@
 //! playback.
 
 pub mod bands;
+pub mod output;
 pub mod peaks;
-pub mod scrub; // phase 4
+pub mod scrub;
