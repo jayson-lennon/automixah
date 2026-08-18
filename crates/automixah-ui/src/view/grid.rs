@@ -74,25 +74,31 @@ pub fn controls(ui: &mut egui::Ui, grid: &mut EditableGrid, track_end: f32) -> b
     });
 
     ui.horizontal(|ui| {
-        ui.label("anchor");
+        ui.label("anchor")
+            .on_hover_text("time of the first beat within one bar (the grid repeats every bar)");
+        let bar = grid.bar_seconds();
         ui.add_enabled(
             track_end > 0.0,
-            egui::Slider::new(&mut grid.anchor_seconds, 0.0..=track_end).suffix(" s"),
+            egui::Slider::new(&mut grid.anchor_seconds, 0.0..=bar)
+                .suffix(" s")
+                .custom_formatter(|n, _| format!("{n:.3}")),
         );
     });
 
     ui.horizontal(|ui| {
-        ui.label("nudge");
+        ui.label("shift grid").on_hover_text(
+            "moves every beat line left (‹) or right (›) by N milliseconds; wraps within one bar",
+        );
         for (label, ms) in [
-            ("−100", -100.0),
-            ("−10", -10.0),
-            ("−1", -1.0),
-            ("+1", 1.0),
-            ("+10", 10.0),
-            ("+100", 100.0),
+            ("‹100", -100.0),
+            ("‹10", -10.0),
+            ("‹1", -1.0),
+            ("1›", 1.0),
+            ("10›", 10.0),
+            ("100›", 100.0),
         ] {
             if ui.small_button(label).clicked() {
-                grid.anchor_seconds = (grid.anchor_seconds + ms / 1000.0).max(0.0);
+                grid.shift_by(ms / 1000.0);
             }
         }
     });
