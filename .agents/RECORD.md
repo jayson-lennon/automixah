@@ -1,18 +1,58 @@
-# automixah — Project Record
+# The Record
 
-This file records **current** facts about how the application works — factual, scoped statements about the present state, never future intent.
+A curated list of factual, scoped statements asserting the application's **current** state. Authoritative for the present, never the future.
 
-Entries are added at the end of implementation phases via the "Record Updates" mechanism described in `.plans/auto-dj-music-player/plan.md`.
+The planner consults this file before proposing a plan. If a feature **contradicts** an entry here, the contradiction is surfaced before the plan proceeds. If a feature **establishes a new high-level fact**, a verbatim entry is proposed for human approval as part of the plan.
 
-- The mixer is driven by an addressed, MIDI-shaped control bus; automations are data timelines of control events behind a `ControlSource` trait (future MIDI sources implement the same trait).
-- Default UX is zero-config: playlist → play; target BPM and transitions are auto-selected by rules, user overrides optional.
-- Playback is forward-only; seeking is permanently out of scope. Skip moves between transition points.
-- Track order is user-authored; the engine plans transitions between adjacent tracks only.
-- Analysis lives in the shared `djcore` crate (extracted from harmonic-playlist); djcore is a workspace member crate of automixah (`crates/djcore`), not a separate repository. djcore wraps stratum-dsp, whose beat grids are constant-tempo (one rounded BPM + one phase anchor; arrays are projections). Analysis uses a mono downmix.
-- automixah is a Rust-only terminal application; the Leptos/wasm UI and web build machinery were removed. The primary interface at this stage is offline rendering: the CLI mixes the given tracks and writes a WAV.
-- Track inputs are absolute paths passed via repeated `--track` flags in the given order; the CLI hashes, decodes, and analyzes them from scratch on every invocation. Manual grid alignments live in a SQLite library (`automixah-ui`, XDG data dir, keyed by content hash) which the CLI does not yet consume.
-- automixah-ui is an egui desktop binary for manual beat-grid alignment: Mixxx-style 3-band Bessel waveform, grid editing (BPM/anchor/downbeat phase), and vinyl-style varispeed scrub-audition over cpal. Grid overrides persist to a SQLite library behind a store trait.
-- Time-scaling supports pitch-adjusted resampling (default) and pitch-preserving WSOLA; default heuristic: ≤±8% stretch uses pitch-adjusted; decode, stretch, render, and WAV output are stereo (interleaved); analysis uses a mono downmix.
-- Transitions overlap: the incoming track cues at a grid downbeat at the window start, the window is phase-snapped to the outgoing track's stretched beat grid so both decks' beats coincide during the overlap, and the outgoing track's outro plays under the incoming track's intro; session length reflects the overlap.
-- Automations are authored as RON `TransitionSpec` pairs addressed by deck role (outgoing/incoming); the default is a 16-bar equal-power fade, and `--automation <file>` loads a custom pair applied to every transition.
-- Beat grids are constant-tempo: one rounded BPM and one phase anchor per track; beats/downbeats/bars arrays are projections of that grid, with the downbeat phase chosen by energy. Fixed-BPM tracks are the only supported input.
+## Format Rules
+
+- **Factual.** Assert how things are _now_. Never future intent ("we will...", "should..."). Each entry is the current state of the application.
+- **Scoped.** Name what each entry applies to — repo, app, frontend, or a named subsystem. An unscoped fact (e.g. "uses Fossil") is ambiguous: is that the repo, or the app's supported VCS list? Always disambiguate.
+- **High-level.** One-liners (a few sentences at most). Capture decisions and facts a planner needs, not implementation minutiae.
+- **Single tag.** Each entry carries exactly one subsystem tag as a `(tag)` prefix: `- (tools) The bash tool runs...`. One entry, one tag — this keeps tag usage a meaningful coverage metric (a tag growing large signals over-specification or a tag that should split). If you cannot decide between two tags for an entry, that is a signal to **re-evaluate the entry itself**, not to assign both. Use `(tag)` rather than `[tag]` to avoid colliding with markdown task-list (checkbox) syntax.
+- **Singular concept.** Each entry should be a single sentence and only concerned with a single concept. Prefer multiple entries versus combining many things into one.
+
+## Templates
+
+| Pattern     | Form                                                             | Example                                                                                 |
+| ----------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| State       | `[Scope] currently [does X / is Y].`                             | "The TUI's first screen at startup is the chat screen."                                 |
+| Persistence | `[Scope] persists [what] to [where].`                            | "Sessions persist to SQLite."                                                           |
+| Flow        | `[Input/event] is handled by [actor/subsystem], which [action].` | "File edits route through the `edit` tool, which validates `LINE#HASH` anchors."        |
+| Boundary    | `[Scope] is bounded by [constraint].`                            | "Project discovery walks ancestors until a VCS root or `$HOME`, whichever comes first." |
+
+## Absence
+
+A missing record, or an un-recorded area, simply means the list has no entry there yet. Absence is not a constraint — it is an open question, and a feature that fills a gap may establish the first entry for that area (proposed for human approval as part of the plan).
+
+## Editing
+
+Entries are added or amended **only with human approval**.
+
+---
+
+<!-- Add entries below. Keep them scoped, factual, and high-level. -->
+
+- (analysis) Analysis lives in the shared `djcore` crate (a workspace member at `crates/djcore`, not a separate repository); it wraps stratum-dsp and uses a mono downmix.
+- (analysis) Decode, stretch, render, and WAV output are stereo (interleaved).
+- (analysis) Beat grids are constant-tempo: one rounded BPM and one phase anchor per track; beats/downbeats/bars arrays are projections of that grid, with the downbeat phase chosen by energy.
+- (analysis) The grid BPM uses a Mixxx-style rounding ladder (integer → ½ → ⅓ → 1/12) within regression confidence bounds; near-musical values snap when the bounds admit them.
+- (boundary) Fixed-BPM tracks are the only supported input; variable-tempo tracks are out of scope.
+- (cli) Track inputs are absolute paths passed via repeated `--track` flags in the given order; the CLI hashes, decodes, and analyzes them from scratch on every invocation.
+- (cli) The CLI's primary interface is offline rendering: it mixes the given tracks and writes a WAV; the Leptos/wasm UI and web build machinery were removed.
+- (db) The grid library persists to a SQLite database in the XDG data dir, keyed by track content hash, behind a `GridStore` trait with SQLite and in-memory backends and versioned migrations.
+- (db) A stored grid (manual override or auto-detected) short-circuits re-analysis on load; a fresh analysis persists its auto grid to the library.
+- (engine) Playback is forward-only; seeking is permanently out of scope, and skip moves between transition points.
+- (engine) Track order is user-authored; the engine plans transitions between adjacent tracks only.
+- (engine) Transitions overlap: the incoming track cues at a grid downbeat at the window start, the window is phase-snapped to the outgoing track's stretched beat grid so both decks' beats coincide during the overlap, and session length reflects the overlap.
+- (engine) Time-scaling supports pitch-adjusted resampling (default) and pitch-preserving WSOLA; the default heuristic uses pitch-adjusted for stretches within ±8%.
+- (identity) automixah is an experimental auto-DJ application written in Rust, mixing fixed-BPM tracks into a continuous session.
+- (mixing) The mixer is driven by an addressed, MIDI-shaped control bus; automations are data timelines of control events behind a `ControlSource` trait.
+- (mixing) Automations are authored as RON `TransitionSpec` pairs addressed by deck role (outgoing/incoming); the default is a 16-bar equal-power fade, and `--automation <file>` loads a custom pair applied to every transition.
+- (mixing) Default UX is zero-config: playlist → play; target BPM and transitions are auto-selected by rules, user overrides optional.
+- (ui) automixah-ui is an egui desktop binary for manual beat-grid alignment: Mixxx-style 3-band Bessel waveform, grid editing (BPM/anchor/downbeat phase), and scrub-audition over cpal.
+- (ui) The waveform view pins the playhead at a definable x-position and scrolls the waveform around it; pan clamping allows one screen of over-scroll on each side so track extremes stay previewable.
+- (ui) Scrubbing is velocity-driven varispeed: drag speed sets playback speed (pitch follows, vinyl-style), and the audio thread advances position itself so there are no per-frame seek discontinuities.
+- (ui) Track loading runs off the UI thread (hash → decode → analyze) with progress stages surfaced in the UI; a re-analyze button drops cached analysis and the stored grid and reloads.
+- (ui) Grid edits save to the grid library keyed by content hash, with save status surfaced in the UI.
+- (workflow) This repository uses git; commits go through `just commit '<message>'`, checks through `just check`, `just test`, and `just lint`.
