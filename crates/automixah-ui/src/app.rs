@@ -56,8 +56,6 @@ pub struct AutomixahUiApp {
     /// Locked drag mode (chosen at drag start).
     drag_mode: DragMode,
 
-    /// Direct-drag anchor: audio position at drag start (seconds).
-    drag_accum_position: f32,
     /// Pointer x on the previous drag frame; deltas are measured per frame
     /// so the waveform/grid tracks the cursor 1:1 (stops when it stops).
     drag_last_x: Option<f32>,
@@ -140,7 +138,6 @@ impl AutomixahUiApp {
             scrub: crate::audio::scrub_state::ScrubMachine::new(1.0),
             engine: None,
             drag_mode: DragMode::None,
-            drag_accum_position: 0.0,
             drag_last_x: None,
             position_updated: None,
             position_at_update: 0.0,
@@ -460,7 +457,6 @@ impl eframe::App for AutomixahUiApp {
                 } else {
                     self.drag_mode = DragMode::Scrub;
                     self.scrub.drag_start();
-                    self.drag_accum_position = follow.unwrap_or(0.0) / sample_rate;
                 }
             }
             // Per-frame pointer movement; positions track the cursor 1:1.
@@ -482,16 +478,13 @@ impl eframe::App for AutomixahUiApp {
                 }
                 DragMode::Scrub => {
                     if response.dragged_by(egui::PointerButton::Primary) {
-                        // Direct position control: the position follows the
-                        // accumulated pointer movement 1:1 (like dragging
-                        // the waveform strip itself).
-                        self.drag_accum_position -= drag_dx * seconds_per_pixel;
-                        let target = self.drag_accum_position.clamp(0.0, end);
-                        if let Some(engine) = self.engine.as_ref() {
-                            *engine.playhead().seek.write() = Some(target * sample_rate);
-                            *engine.playhead().position.write() = target * sample_rate;
-                        }
-                        ctx.request_repaint();
+                        // Audio: velocity-driven varispeed from the smoothed
+                        // drag speed — the audio thread advances the
+                        // position itself (continuous output, no per-frame
+                        // seek rebuilds, so no crackle). The view re-syncs
+                        // to the audio position when the pointer stops.
+                        let frame_dt = ctx.input(|i| i.unstable_dt);
+                        self.scrub.drag_move(-drag_dx * seconds_per_pixel, frame_dt);
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
                         self.scrub.drag_end();
