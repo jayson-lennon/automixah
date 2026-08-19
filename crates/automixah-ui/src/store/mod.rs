@@ -28,7 +28,7 @@ pub struct GridStoreError;
 ///
 /// The canonical subset of a [`djcore::analyzer::BeatGrid`] that a human
 /// edits; beats/downbeats/bars are re-derived by projection at load time.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GridOverride {
     /// Constant-tempo BPM of the grid.
     pub grid_bpm: f32,
@@ -38,6 +38,10 @@ pub struct GridOverride {
     pub downbeat_phase: u8,
     /// Unix seconds of the last edit.
     pub updated_at: i64,
+    /// Detected musical key. `None` means unknown — on write it leaves any
+    /// stored key untouched (COALESCE upsert), on read it means the row
+    /// predates key analysis.
+    pub key: Option<djcore::key::Key>,
 }
 
 /// Persistence backend for manual grid overrides.
@@ -225,6 +229,7 @@ mod tests {
             anchor_seconds: 0.42,
             downbeat_phase: 2,
             updated_at: 1_700_000_000,
+            key: None,
         };
 
         service.put(&hash, &grid).await.expect("save");

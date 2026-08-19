@@ -10,6 +10,8 @@ use std::sync::Arc;
 use error_stack::{Report, ResultExt};
 use wherror::Error;
 
+pub mod meta;
+
 pub mod symphonia;
 
 pub use symphonia::SymphoniaDecoder;

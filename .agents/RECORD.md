@@ -41,6 +41,8 @@ Entries are added or amended **only with human approval**.
 - (cli) Track inputs are absolute paths passed via repeated `--track` flags in the given order; the CLI hashes, decodes, and analyzes them from scratch on every invocation.
 - (cli) The CLI's primary interface is offline rendering: it mixes the given tracks and writes a WAV; the Leptos/wasm UI and web build machinery were removed.
 - (db) The grid library persists to a SQLite database in the XDG data dir, keyed by track content hash, behind a `GridStore` trait with SQLite and in-memory backends and versioned migrations.
+- (db) Track analysis persists BPM, key, and the beat grid per content hash; manual grid edits preserve the stored key.
+- (db) Playlists persist to the library database as ordered content-hash references with add-time paths; track tags (artist/title/duration) persist keyed by content hash.
 - (db) A stored grid (manual override or auto-detected) short-circuits re-analysis on load; a fresh analysis persists its auto grid to the library.
 - (engine) Playback is forward-only; seeking is permanently out of scope, and skip moves between transition points.
 - (engine) Track order is user-authored; the engine plans transitions between adjacent tracks only.
@@ -55,4 +57,10 @@ Entries are added or amended **only with human approval**.
 - (ui) Scrubbing is velocity-driven varispeed: drag speed sets playback speed (pitch follows, vinyl-style), and the audio thread advances position itself so there are no per-frame seek discontinuities.
 - (ui) Track loading runs off the UI thread (hash → decode → analyze) with progress stages surfaced in the UI; a re-analyze button drops cached analysis and the stored grid and reloads.
 - (ui) Grid edits save to the grid library keyed by content hash, with save status surfaced in the UI.
+- (ui) automixah-ui's playlist section (bottom panel) lists playlists and their tracks; rows show BPM, Camelot key colored by harmonic distance to the previous row, and duration.
+- (ui) Track loading enters through the playlist: clicking a ready row loads the track into the grid editor; the Open button is removed.
+- (ui) Playlist analysis runs on a single-worker FIFO queue that decodes, analyzes, persists, and drops PCM; rows show queued/analyzing/ready state.
+- (ui) All async and threaded work reports back through a single UI event bus; frontend state is mutated only when applying events.
+- (ui) UI repaints are scheduled by event-bus sends with a 50 ms debounce; each frame drains events under a 10 ms budget before rendering.
+- (ui) Playlist contents load on selection: the view clears and shows a spinner until the load event replaces them; playlist rows carry database-minted ids.
 - (workflow) This repository uses git; commits go through `just commit '<message>'`, checks through `just check`, `just test`, and `just lint`.

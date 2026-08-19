@@ -28,7 +28,7 @@ impl InMemoryGridStore {
 impl GridStore for InMemoryGridStore {
     async fn get(&self, hash: &TrackHash) -> Result<Option<GridOverride>, Report<GridStoreError>> {
         let grids = self.grids.lock();
-        Ok(grids.get(&hash.0).copied())
+        Ok(grids.get(&hash.0).cloned())
     }
 
     async fn put(
@@ -37,7 +37,7 @@ impl GridStore for InMemoryGridStore {
         grid: &GridOverride,
     ) -> Result<(), Report<GridStoreError>> {
         let mut grids = self.grids.lock();
-        grids.insert(hash.0.clone(), *grid);
+        grids.insert(hash.0.clone(), grid.clone());
         Ok(())
     }
 
@@ -65,12 +65,14 @@ async fn last_write_wins() {
         anchor_seconds: 0.0,
         downbeat_phase: 0,
         updated_at: 1,
+        key: None,
     };
     let second = GridOverride {
         grid_bpm: 140.0,
         anchor_seconds: 0.1,
         downbeat_phase: 3,
         updated_at: 2,
+        key: None,
     };
 
     store.put(&hash, &first).await.expect("first write");
@@ -94,6 +96,7 @@ async fn distinct_hashes_are_independent() {
         anchor_seconds: 0.5,
         downbeat_phase: 1,
         updated_at: 3,
+        key: None,
     };
 
     store.put(&a, &grid).await.expect("write");

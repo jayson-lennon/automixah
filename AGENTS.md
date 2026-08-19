@@ -121,6 +121,7 @@ Data flows one direction:
 ```
 files → decode → analyze (constant grid) → plan (phase-snapped overlap) → render → WAV
                      ↘ sqlite grid library (manual overrides) ↗
+                         ↘ playlist library (playlists, track tags, analysis queue) ↗
 ```
 
 Rules that hold across all crates:

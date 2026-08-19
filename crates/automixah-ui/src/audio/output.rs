@@ -24,6 +24,16 @@ pub struct Playhead {
     pub speed: RwLock<f32>,
 }
 
+/// Consumes a pending UI seek by rebuilding the scrub reader at the
+/// requested frame. Runs before any position writeback in the callback
+/// so a paused stream still lands on the sought position instead of
+/// clobbering it with the stale scrub position.
+fn apply_pending_seek(playhead: &Playhead, scrub: &mut ScrubCore, channels: usize) {
+    if let Some(frame) = playhead.seek.write().take() {
+        *scrub = ScrubCore::new(channels, frame);
+    }
+}
+
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "wired to the scrub state machine next task")
@@ -208,14 +218,12 @@ impl OutputEngine {
                 &config,
                 move |out: &mut [f32], _| {
                     let cmd = *cb_command.lock();
+                    apply_pending_seek(&cb_playhead, &mut scrub, channels);
                     if !cmd.playing {
                         out.fill(0.0);
                         *cb_playhead.position.write() = scrub.position();
                         *cb_playhead.speed.write() = 0.0;
                         return;
-                    }
-                    if let Some(frame) = cb_playhead.seek.write().take() {
-                        scrub = ScrubCore::new(channels, frame);
                     }
                     scrub.set_speed(cmd.speed);
 
@@ -326,5 +334,25 @@ mod tests {
         let scale = folder.speed_scale();
         // 48k device frames × scale = 44.1k source frames per second.
         assert!((48_000.0 * scale - 44_100.0).abs() < 1.0, "scale {scale}");
+    }
+
+    // Given a paused stream with a pending UI seek to a nonzero frame.
+    // When the paused callback path runs.
+    // Then the seek is consumed and the reported position matches it
+    // (ordering: seek consumption precedes the paused position write).
+    #[test]
+    fn paused_seek_updates_position() {
+        let playhead = Playhead::new();
+        let mut scrub = ScrubCore::new(2, 0.0);
+        // The UI writes both, like the click-to-seek handler.
+        *playhead.seek.write() = Some(12_345.0);
+        *playhead.position.write() = 12_345.0;
+
+        // Paused callback: consume first, then write back position.
+        apply_pending_seek(&playhead, &mut scrub, 2);
+        let reported = scrub.position();
+
+        assert_eq!(reported, 12_345.0, "seek frame applied");
+        assert!(playhead.seek.read().is_none(), "seek consumed");
     }
 }

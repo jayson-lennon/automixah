@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use automixah_engine::timeline::types::TrackHash;
 use automixah_ui_lib::app::AutomixahUiApp;
+use automixah_ui_lib::playlist::store::PlaylistStoreService;
+use automixah_ui_lib::playlist::store::in_memory::InMemoryPlaylistStore;
 use automixah_ui_lib::services::{AppPaths, Services};
 use automixah_ui_lib::store::CountingStore;
 use automixah_ui_lib::store::in_memory::InMemoryGridStore;
@@ -23,7 +25,21 @@ fn each_grid_mutation_flushes_one_put() {
             library_db: dir.path().join("library.sqlite"),
         },
         grid_store: GridStoreService::new(counting.clone()),
-        analysis: automixah_ui_lib::analysis::AnalysisCache::default(),
+        playlist_store: PlaylistStoreService::new(Arc::new(InMemoryPlaylistStore::new())),
+        analyzer: std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
+            djcore::analyzer::AnalyzerOutput {
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 2.0,
+                beat_grid: Default::default(),
+                bpm_confidence: 1.0,
+                key_confidence: 1.0,
+                grid_stability: 1.0,
+            },
+        )),
         runtime: std::sync::Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -33,7 +49,7 @@ fn each_grid_mutation_flushes_one_put() {
         ),
     };
 
-    let mut app = AutomixahUiApp::new(services);
+    let mut app = AutomixahUiApp::new(services, automixah_ui_lib::bus::EventBus::without_repaint());
     app.inject_track_for_test(TrackHash("deadbeef".to_owned()));
 
     // Mutation 1: shift.
@@ -65,6 +81,7 @@ async fn sqlite_row_lands_and_round_trips() {
         anchor_seconds: 0.123,
         downbeat_phase: 1,
         updated_at: 42,
+        key: None,
     };
 
     let service = GridStoreService::new(Arc::new(

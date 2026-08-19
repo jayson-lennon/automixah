@@ -4,7 +4,9 @@
 pub mod analysis;
 pub mod app;
 pub mod audio;
+pub mod bus;
 pub mod grid;
+pub mod playlist;
 pub mod services;
 pub mod store;
 pub mod track;

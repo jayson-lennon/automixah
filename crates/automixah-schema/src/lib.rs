@@ -9,9 +9,9 @@
 //! DDL addressable from any future consumer — the eventual CLI remake will
 //! call the same [`run_migrations`] before reading grids.
 //!
-//! Only one migration exists today (v1: the `beat_grids` table). The runner
-//! structure mirrors the schema-crate pattern used by jinn's session store
-//! so additional versions slot in mechanically.
+//! Versions today: v1 (`beat_grids`), v2 (musical-key columns on
+//! `beat_grids`), v3 (playlist tables). The runner structure mirrors the
+//! schema-crate pattern used by jinn's session store so additional versions slot in mechanically.
 
 use error_stack::{Report, ResultExt as _};
 use wherror::Error;
@@ -20,7 +20,7 @@ use wherror::Error;
 ///
 /// `run_pending` skips `BEGIN` when the DB is already at this version, so an
 /// up-to-date database pays no transaction cost on startup.
-const LATEST_VERSION: i32 = 1;
+const LATEST_VERSION: i32 = 3;
 
 /// Runs all pending schema migrations on the given connection.
 ///
@@ -138,6 +138,14 @@ fn apply_migration_chain(
         migrate_v1(conn)?;
         record_version(conn, 1, "create_beat_grids")?;
     }
+    if current < 2 {
+        migrate_v2(conn)?;
+        record_version(conn, 2, "add_beat_grids_key_columns")?;
+    }
+    if current < 3 {
+        migrate_v3(conn)?;
+        record_version(conn, 3, "create_playlist_tables")?;
+    }
     Ok(())
 }
 
@@ -158,6 +166,54 @@ fn migrate_v1(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrat
     )
     .change_context(SchemaMigrationError)
     .attach("failed to create beat_grids table")?;
+    Ok(())
+}
+
+/// v2: Musical-key columns on `beat_grids`.
+///
+/// `key_root` (0..=11, 0=C) and `key_mode` (0=major, 1=minor) are both
+/// NULL on legacy rows — a grid stored before this version simply hasn't
+/// been key-analyzed yet, and consumers treat NULL as "unknown". Ranges
+/// are validated in Rust on read/write; SQLite `ALTER TABLE` cannot add
+/// CHECK constraints to existing tables.
+fn migrate_v2(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrationError>> {
+    conn.execute_batch(
+        "ALTER TABLE beat_grids ADD COLUMN key_root INTEGER;\
+         ALTER TABLE beat_grids ADD COLUMN key_mode INTEGER;",
+    )
+    .change_context(SchemaMigrationError)
+    .attach("failed to add key columns to beat_grids")?;
+    Ok(())
+}
+
+/// v3: Playlist tables — `tracks` (tags keyed by content hash),
+/// `playlists`, and the ordered `playlist_tracks` join.
+///
+/// Referential ordering (tracks row before playlist_tracks row) is
+/// enforced in store code, not by FK pragmas — the daow pool does not
+/// promise `foreign_keys` is enabled.
+fn migrate_v3(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrationError>> {
+    conn.execute_batch(
+        "CREATE TABLE tracks (\
+         track_hash TEXT PRIMARY KEY,\
+         title TEXT NOT NULL,\
+         artist TEXT NOT NULL,\
+         duration_seconds REAL,\
+         updated_at INTEGER NOT NULL);\
+         CREATE TABLE playlists (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         name TEXT NOT NULL UNIQUE,\
+         created_at INTEGER NOT NULL);\
+         CREATE TABLE playlist_tracks (\
+         playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,\
+         position INTEGER NOT NULL,\
+         track_hash TEXT NOT NULL REFERENCES tracks(track_hash),\
+         added_path TEXT NOT NULL,\
+         PRIMARY KEY (playlist_id, position),\
+         UNIQUE (playlist_id, track_hash));",
+    )
+    .change_context(SchemaMigrationError)
+    .attach("failed to create playlist tables")?;
     Ok(())
 }
 
@@ -194,7 +250,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .expect("count versions");
-        assert_eq!(count, 1, "one version row per applied migration");
+        assert_eq!(count, 3, "one version row per applied migration");
     }
 
     // Given a migrated database.
@@ -219,6 +275,67 @@ mod tests {
             )
             .expect("read back");
         assert!((bpm - 138.0).abs() < 1e-9);
+    }
+
+    // Given a database migrated only to v1 with a stored grid row.
+    // When pending migrations run.
+    // Then the legacy row survives with NULL key columns and the
+    // playlist tables exist.
+    #[test]
+    fn legacy_v1_row_survives_to_v3_with_null_key() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        // Hand-build a v1 database (migrate v1 only, no version rows).
+        bootstrap_tracking_table(&mut conn).expect("bootstrap");
+        conn.execute_batch(
+            "CREATE TABLE beat_grids (\
+             track_hash TEXT PRIMARY KEY,\
+             grid_bpm REAL NOT NULL,\
+             anchor_seconds REAL NOT NULL,\
+             downbeat_phase INTEGER NOT NULL CHECK (downbeat_phase BETWEEN 0 AND 3),\
+             updated_at INTEGER NOT NULL);\
+             INSERT INTO beat_grids VALUES ('legacy', 128.0, 0.5, 2, 1);\
+             INSERT INTO _migrations (version, name) VALUES (1, 'create_beat_grids');",
+        )
+        .expect("seed v1");
+
+        run_migrations(&mut conn).expect("migrate to v3");
+
+        let (root, mode): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT key_root, key_mode FROM beat_grids WHERE track_hash = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read legacy row");
+        assert_eq!((root, mode), (None, None), "legacy row keeps NULL key");
+
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tracks', 'playlists', 'playlist_tracks')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(tables, 3, "v3 tables created");
+    }
+
+    // Given a fresh database.
+    // When migrations run and rows are inserted into the v3 tables.
+    // Then the playlist schema contract holds (UNIQUE duplicate rejected).
+    #[test]
+    fn v3_playlist_tables_reject_duplicate_hash() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+
+        conn.execute_batch(
+            "INSERT INTO tracks VALUES ('h', 'T', 'A', NULL, 0);\
+             INSERT INTO playlists (name, created_at) VALUES ('p', 0);\
+             INSERT INTO playlist_tracks VALUES (1, 0, 'h', '/x');",
+        )
+        .expect("seed playlist");
+
+        let dup = conn.execute_batch("INSERT INTO playlist_tracks VALUES (1, 1, 'h', '/y');");
+        assert!(dup.is_err(), "UNIQUE(playlist_id, track_hash) rejects");
     }
 
     // Given a migrated database.

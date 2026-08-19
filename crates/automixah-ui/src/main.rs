@@ -46,9 +46,17 @@ fn run() -> Result<(), Report<UiError>> {
             .change_context(UiError)
             .attach("open grid library")?;
 
+        // Same database file, same pool: grids, keys, tags, playlists.
+        let playlist_store = automixah_ui_lib::playlist::store::sqlite::SqlitePlaylistStore::new(
+            store.pool().clone(),
+        );
+
         Services {
             grid_store: GridStoreService::new(std::sync::Arc::new(store)),
-            analysis: automixah_ui_lib::analysis::AnalysisCache::default(),
+            playlist_store: automixah_ui_lib::playlist::store::PlaylistStoreService::new(
+                std::sync::Arc::new(playlist_store),
+            ),
+            analyzer: std::sync::Arc::new(djcore::analyzer::StratumAnalyzer::new()),
             runtime,
             paths,
         }
@@ -64,7 +72,12 @@ fn run() -> Result<(), Report<UiError>> {
     eframe::run_native(
         "automixah-ui",
         options,
-        Box::new(|_cc| Ok(Box::new(AutomixahUiApp::new(services)))),
+        Box::new(|cc| {
+            let bus = automixah_ui_lib::bus::EventBus::new(cc.egui_ctx.clone());
+            let app = AutomixahUiApp::new(services, bus);
+            app.spawn_startup_load();
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| Report::new(UiError).attach(e.to_string()))
     .attach("run eframe app")

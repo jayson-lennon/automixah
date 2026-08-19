@@ -92,11 +92,14 @@ pub enum LoadEvent {
 ///
 /// Dropping the receiver discards the result; the task still runs to
 /// completion (harmless single-shot).
-pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiver<LoadEvent> {
+pub fn spawn_load(
+    services: &Services,
+    path: PathBuf,
+    cached_grid: Option<BeatGrid>,
+) -> std::sync::mpsc::Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = services.runtime.handle().clone();
     let block_handle = services.runtime.handle().clone();
-    let analysis_cache = services.analysis.clone();
     let grid_store = services.grid_store.clone();
     handle.spawn_blocking(move || {
         let send_stage = |stage: LoadStage| {
@@ -130,10 +133,11 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
 
         // Analysis reuse: a stored grid (manual override or the persisted
         // auto grid) means the content was already analyzed — skip straight
-        // to it. The session cache short-circuits before the DB round-trip.
-        let stored: Option<crate::grid::EditableGrid> = analysis_cache
-            .get(&hash)
-            .map(|cached| crate::grid::EditableGrid::from_grid(&cached))
+        // to it. The UI passes its cached grid in as a message input, so
+        // this task holds no shared state with the frontend.
+        let stored: Option<crate::grid::EditableGrid> = cached_grid
+            .as_ref()
+            .map(crate::grid::EditableGrid::from_grid)
             .or_else(|| {
                 block_handle
                     .block_on(async { grid_store.get(&hash).await })
@@ -148,17 +152,14 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
         let auto_grid = match stored {
             Some(cached) => {
                 send_stage(LoadStage::CacheHit);
-                let projected = cached.project();
-                analysis_cache.put(hash.clone(), projected.clone());
-                projected
+                cached.project()
             }
             None => {
                 send_stage(LoadStage::Analyzing);
-                let AnalyzerOutput { beat_grid, .. } = match analyze(&audio) {
+                let AnalyzerOutput { beat_grid, key, .. } = match analyze(&audio) {
                     Ok(out) => out,
                     Err(report) => return send_done(Err(format!("{report:#}"))),
                 };
-                analysis_cache.put(hash.clone(), beat_grid.clone());
                 // Persist the auto grid so future sessions skip analysis.
                 let editable = crate::grid::EditableGrid::from_grid(&beat_grid);
                 let _ = block_handle.block_on(async {
@@ -172,6 +173,7 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
                                 updated_at: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map_or(0, |d| d.as_secs() as i64),
+                                key: Some(key),
                             },
                         )
                         .await
@@ -194,25 +196,6 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
         send_done(Ok((track, peaks)));
     });
     rx
-}
-
-/// Opens the file picker and loads the chosen track.
-///
-/// Returns `Ok(None)` when the dialog is cancelled.
-///
-/// # Errors
-///
-/// Returns an error if reading, decoding, or analysis fails.
-pub fn open_pick(services: &Services) -> Result<Option<LoadedTrack>, Report<TrackLoadError>> {
-    let registry = DecoderRegistry::with_symphonia();
-    let extensions = registry.supported_extensions();
-    let dialog = rfd::FileDialog::new()
-        .set_title("Open audio track")
-        .add_filter("audio", &extensions);
-    let Some(path) = dialog.pick_file() else {
-        return Ok(None);
-    };
-    load(&path, services, &registry).map(Some)
 }
 
 /// Loads and analyzes `path`, applying any stored manual grid override.
@@ -316,7 +299,23 @@ mod tests {
         let services = Services {
             paths: AppPaths::for_test(dir.path()),
             grid_store: GridStoreService::new(std::sync::Arc::new(InMemoryGridStore::new())),
-            analysis: crate::analysis::AnalysisCache::default(),
+            playlist_store: crate::playlist::store::PlaylistStoreService::new(std::sync::Arc::new(
+                crate::playlist::store::in_memory::InMemoryPlaylistStore::new(),
+            )),
+            analyzer: std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
+                djcore::analyzer::AnalyzerOutput {
+                    bpm: 128.0,
+                    key: djcore::key::Key {
+                        root: 9,
+                        mode: djcore::key::KeyMode::Minor,
+                    },
+                    duration_seconds: 2.0,
+                    beat_grid: Default::default(),
+                    bpm_confidence: 1.0,
+                    key_confidence: 1.0,
+                    grid_stability: 1.0,
+                },
+            )),
             runtime,
         };
         (services, dir)
@@ -387,6 +386,7 @@ mod tests {
                         anchor_seconds: 0.25,
                         downbeat_phase: 1,
                         updated_at: 7,
+                        key: None,
                     },
                 )
                 .await
@@ -429,7 +429,7 @@ mod tests {
         let path = dir.path().join("tone.wav");
         std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
 
-        let rx = spawn_load(&services, path.clone());
+        let rx = spawn_load(&services, path.clone(), None);
         let mut stages = Vec::new();
         let outcome = loop {
             match rx.recv() {
@@ -475,7 +475,7 @@ mod tests {
             }
         };
 
-        let (stages, _) = drain(spawn_load(&services, path.clone()));
+        let (stages, _) = drain(spawn_load(&services, path.clone(), None));
         assert!(
             stages.contains(&LoadStage::Analyzing),
             "first pass analyzes"
@@ -483,12 +483,13 @@ mod tests {
 
         // Fresh session: same store, empty memory cache.
         let fresh = Services {
-            analysis: crate::analysis::AnalysisCache::default(),
             paths: services.paths.clone(),
             grid_store: services.grid_store.clone(),
+            playlist_store: services.playlist_store.clone(),
+            analyzer: services.analyzer.clone(),
             runtime: services.runtime.clone(),
         };
-        let (stages, outcome) = drain(spawn_load(&fresh, path));
+        let (stages, outcome) = drain(spawn_load(&fresh, path, None));
         assert!(
             stages.contains(&LoadStage::CacheHit),
             "second session must reuse the persisted grid: {stages:?}"
@@ -515,8 +516,8 @@ mod tests {
             }
         };
 
-        drain(spawn_load(&services, path.clone())).expect("first load");
-        let rx = spawn_load(&services, path);
+        drain(spawn_load(&services, path.clone(), None)).expect("first load");
+        let rx = spawn_load(&services, path, None);
         let mut saw_cache_hit = false;
         loop {
             match rx.recv() {
@@ -538,7 +539,7 @@ mod tests {
     #[test]
     fn spawn_load_reports_missing_file() {
         let (services, dir) = test_services();
-        let rx = spawn_load(&services, dir.path().join("nope.wav"));
+        let rx = spawn_load(&services, dir.path().join("nope.wav"), None);
         let outcome = loop {
             match rx.recv() {
                 Ok(LoadEvent::Done(payload)) => break *payload,
@@ -554,5 +555,41 @@ mod tests {
             err.contains("track load error"),
             "rendered report present: {err}"
         );
+    }
+
+    // Given a grid passed in as a message input (the UI-owned cache's
+    // entry for this content).
+    // When the load pipeline runs.
+    // Then it reports CacheHit without analyzing — the task shares no
+    // cache state with the frontend.
+    #[test]
+    fn spawn_load_cached_grid_input_skips_analysis() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
+
+        let cached = BeatGrid {
+            grid_bpm: 128.0,
+            ..BeatGrid::default()
+        };
+        let rx = spawn_load(&services, path, Some(cached));
+
+        let mut saw_cache_hit = false;
+        let mut saw_analyzing = false;
+        loop {
+            match rx.recv() {
+                Ok(LoadEvent::Stage(LoadStage::CacheHit)) => saw_cache_hit = true,
+                Ok(LoadEvent::Stage(LoadStage::Analyzing)) => saw_analyzing = true,
+                Ok(LoadEvent::Stage(_)) => (),
+                Ok(LoadEvent::Done(payload)) => {
+                    let (track, _) = payload.expect("load with cached grid");
+                    assert!((track.grid.grid_bpm - 128.0).abs() < f32::EPSILON);
+                    break;
+                }
+                Err(_) => unreachable!("channel closed before Done"),
+            }
+        }
+        assert!(saw_cache_hit, "cached input short-circuits analysis");
+        assert!(!saw_analyzing, "analysis must not re-run");
     }
 }
