@@ -15,10 +15,11 @@ use super::scrub::ScrubCore;
 /// Shared playhead: the audio thread writes position; the UI reads it.
 #[allow(dead_code, reason = "wired to the scrub state machine next task")]
 pub struct Playhead {
-    /// Current read position in source frames.
-    pub position: RwLock<f32>,
+    /// Current read position in source frames (f64: an f32 position
+    /// freezes past 2²⁴ frames, stopping long tracks near their end).
+    pub position: RwLock<f64>,
     /// Requested position jump (UI sets Some(frame); audio consumes it).
-    pub seek: RwLock<Option<f32>>,
+    pub seek: RwLock<Option<f64>>,
     /// Effective playback speed (source frames per second) at the last
     /// callback; the UI extrapolates position between callbacks.
     pub speed: RwLock<f32>,
@@ -207,7 +208,7 @@ impl OutputEngine {
         pcm: Arc<Vec<f32>>,
         source_rate: u32,
         channels: usize,
-        start_frame: f32,
+        start_frame: f64,
     ) -> Result<Self, error_stack::Report<OutputEngineError>> {
         use error_stack::ResultExt as _;
         let host = cpal::default_host();

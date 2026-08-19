@@ -57,7 +57,7 @@ pub struct AutomixahUiApp {
     /// When the playhead position last changed (for extrapolation).
     position_updated: Option<std::time::Instant>,
     /// The position value at that instant.
-    position_at_update: f32,
+    position_at_update: f64,
     /// Last frame instant for drag-velocity computation.
     last_frame_time: Option<std::time::Instant>,
     /// Shared PCM for the audio thread.
@@ -899,7 +899,7 @@ impl eframe::App for AutomixahUiApp {
             // audio speed is ±8-clamped, so at high zoom-out following
             // the audio thread would lag the cursor.
             let follow = if self.drag_mode == DragMode::Scrub && self.drag_view_frame.is_some() {
-                self.drag_view_frame
+                self.drag_view_frame.map(f64::from)
             } else {
                 self.engine.as_ref().map(|e| {
                     let ph = e.playhead();
@@ -912,11 +912,14 @@ impl eframe::App for AutomixahUiApp {
                         let speed = *ph.speed.read();
                         let elapsed = self
                             .position_updated
-                            .map_or(0.0, |t| t.elapsed().as_secs_f32());
-                        raw + speed * elapsed
+                            .map_or(0.0, |t| f64::from(t.elapsed().as_secs_f32()));
+                        raw + f64::from(speed) * elapsed
                     }
                 })
             };
+            // The display view is pixel-grained; f32 pinning is fine there
+            // and keeps `WaveformView` in its f32 domain.
+            let follow = follow.map(|frame| frame as f32);
             let (response, rect, sample_rate) =
                 crate::view::waveform::show(ui, peaks, &mut self.view, follow);
             let seconds_per_pixel = self.view.frames_per_pixel / sample_rate;
@@ -989,8 +992,8 @@ impl eframe::App for AutomixahUiApp {
                         if let (Some(frame), Some(engine)) =
                             (self.drag_view_frame, self.engine.as_ref())
                         {
-                            *engine.playhead().seek.write() = Some(frame);
-                            *engine.playhead().position.write() = frame;
+                            *engine.playhead().seek.write() = Some(f64::from(frame));
+                            *engine.playhead().position.write() = f64::from(frame);
                         }
                         self.end_drag_gesture(ctx);
                     }
@@ -1004,8 +1007,8 @@ impl eframe::App for AutomixahUiApp {
                 && !shift_now
                 && let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref())
             {
-                *engine.playhead().seek.write() = Some(t * sample_rate);
-                *engine.playhead().position.write() = t * sample_rate;
+                *engine.playhead().seek.write() = Some(f64::from(t) * f64::from(sample_rate));
+                *engine.playhead().position.write() = f64::from(t) * f64::from(sample_rate);
                 ctx.request_repaint();
             }
 

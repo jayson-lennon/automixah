@@ -67,3 +67,4 @@ Entries are added or amended **only with human approval**.
 - (analysis) djcore decodes mp3, flac, wav, ogg, aac, opus, and m4a (AAC or ALAC) input via symphonia; opus uses a bundled libopus adapter available on native targets only.
 - (cli) The CLI writes the output WAV at the session sample rate (the first track's rate) rather than a fixed 44.1 kHz.
 - (ui) Audition playback is source-rate agnostic: scrub reads at 1x in source frames, a single RateFolder pass converts to the device rate, and source channels fold to the device channel count.
+- (ui) The scrub playhead is tracked in f64 frames; playback reaches the true end of any track (an f32 position would freeze at 2²⁴ frames ≈ 6.3 min).

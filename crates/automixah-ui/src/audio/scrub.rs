@@ -29,7 +29,11 @@ pub struct ScrubCore {
     /// Channel count of the source buffer.
     channels: usize,
     /// Current fractional read position in frames.
-    position: f32,
+    ///
+    /// f64, not f32: an f32 frame position freezes past 2²⁴ frames
+    /// (~6.3 min at 44.1 kHz) because `pos + 1.0` rounds back to `pos`,
+    /// so long tracks stop playing near their end.
+    position: f64,
     /// Current step per output frame (target speed).
     step: f32,
     /// Step being faded out (previous speed).
@@ -45,7 +49,7 @@ pub struct ScrubCore {
 impl ScrubCore {
     /// Creates a reader parked at `start_frame`.
     #[must_use]
-    pub fn new(channels: usize, start_frame: f32) -> Self {
+    pub fn new(channels: usize, start_frame: f64) -> Self {
         Self {
             channels: channels.max(1),
             position: start_frame,
@@ -57,7 +61,7 @@ impl ScrubCore {
 
     /// Current read position in frames (for playhead sync).
     #[must_use]
-    pub fn position(&self) -> f32 {
+    pub fn position(&self) -> f64 {
         self.position
     }
 
@@ -91,7 +95,8 @@ impl ScrubCore {
     pub fn read(&mut self, samples: &[f32], out: &mut [f32]) {
         let channels = self.channels;
         let frames = samples.len() / channels;
-        let last = frames.saturating_sub(1) as f32;
+        #[expect(clippy::cast_precision_loss, reason = "frame index fits f64 exactly")]
+        let last = frames.saturating_sub(1) as f64;
 
         for chunk in out.chunks_mut(channels) {
             let step = self.effective_step();
@@ -110,7 +115,7 @@ impl ScrubCore {
             for (ch, o) in chunk.iter_mut().enumerate() {
                 *o = hermite(samples, channels, ch, pos);
             }
-            self.position = (pos + step).clamp(0.0, last);
+            self.position = (pos + f64::from(step)).clamp(0.0, last);
         }
     }
 }
@@ -121,13 +126,21 @@ impl ScrubCore {
     not(test),
     allow(dead_code, reason = "called via read in the cpal task")
 )]
-fn hermite(samples: &[f32], channels: usize, ch: usize, pos: f32) -> f32 {
+fn hermite(samples: &[f32], channels: usize, ch: usize, pos: f64) -> f32 {
     let frames = samples.len() / channels;
     if frames == 0 {
         return 0.0;
     }
-    let i = pos.floor().clamp(0.0, (frames - 1) as f32) as usize;
-    let t = pos - pos.floor();
+    // The integer index comes from the f64 floor directly: at f32 the
+    // integer part consumes all 24 mantissa bits past 2²⁴ frames, and the
+    // fractional part (the interpolation) would vanish.
+    let floor = pos.floor();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "floored index within bounds"
+    )]
+    let i = (floor as usize).min(frames - 1);
+    let t = (pos - floor) as f32;
     let at = |frame: isize| -> f32 {
         let idx = frame.clamp(0, frames as isize - 1) as usize;
         samples[idx * channels + ch]
@@ -194,7 +207,7 @@ mod tests {
     #[test]
     fn one_x_preserves_frequency() {
         let src = sine_sine(440.0, 3.0);
-        let mut core = ScrubCore::new(2, RATE);
+        let mut core = ScrubCore::new(2, f64::from(RATE));
         core.set_speed(1.0);
         let mut out = vec![0.0_f32; (RATE * 1.0) as usize * 2];
         core.read(&src, &mut out);
@@ -208,7 +221,7 @@ mod tests {
     #[test]
     fn half_x_drops_an_octave() {
         let src = sine_sine(440.0, 4.0);
-        let mut core = ScrubCore::new(2, RATE);
+        let mut core = ScrubCore::new(2, f64::from(RATE));
         core.set_speed(0.5);
         let mut out = vec![0.0_f32; (RATE * 1.0) as usize * 2];
         core.read(&src, &mut out);
@@ -222,7 +235,7 @@ mod tests {
     #[test]
     fn two_x_rises_an_octave() {
         let src = sine_sine(440.0, 3.0);
-        let mut core = ScrubCore::new(2, RATE);
+        let mut core = ScrubCore::new(2, f64::from(RATE));
         core.set_speed(2.0);
         let mut out = vec![0.0_f32; (RATE * 1.0) as usize * 2];
         core.read(&src, &mut out);
@@ -237,7 +250,7 @@ mod tests {
     #[test]
     fn speed_change_crossfades() {
         let src = sine_sine(440.0, 5.0);
-        let mut core = ScrubCore::new(2, RATE);
+        let mut core = ScrubCore::new(2, f64::from(RATE));
         core.set_speed(1.0);
         core.fade_remaining = 0.0;
         // Jump 1x -> 3x.
@@ -254,6 +267,23 @@ mod tests {
         assert!((core.effective_step() - 3.0).abs() < 1e-6);
     }
 
+    // Given a reader parked at 2²⁴ frames (16,777,216) — the exact f32
+    // integer limit where an f32 position would freeze (`pos + 1.0 == pos`)
+    // — over a mono buffer long enough to span that frame (zeroed vec:
+    // lazily-mapped pages, only a few are ever touched).
+    // When one frame is read at 1×.
+    // Then the position advances by exactly one frame (integer-exact).
+    #[test]
+    fn position_advances_exactly_past_2p24_frames() {
+        let src = vec![0.0_f32; 16_777_218];
+        let mut core = ScrubCore::new(1, 16_777_216.0);
+        core.set_speed(1.0);
+        core.fade_remaining = 0.0;
+        let mut out = vec![0.0_f32; 1];
+        core.read(&src, &mut out);
+        assert_eq!(core.position(), 16_777_217.0, "position must not freeze");
+    }
+
     // Given a reader at the buffer end.
     // When reading forward.
     // Then output is silence and the position stays clamped.
@@ -261,12 +291,12 @@ mod tests {
     fn end_of_track_clamps() {
         let src = sine_sine(440.0, 0.1);
         let frames = src.len() / 2;
-        let mut core = ScrubCore::new(2, frames as f32 - 0.5);
+        let mut core = ScrubCore::new(2, frames as f64 - 0.5);
         core.set_speed(1.0);
         let mut out = vec![0.0_f32; 256 * 2];
         core.read(&src, &mut out);
         assert!(out.iter().all(|&v| v.abs() < 1e-6), "silence at end");
-        assert!(core.position() <= (frames - 1) as f32 + 1e-3);
+        assert!(core.position() <= (frames - 1) as f64 + 1e-3);
     }
 
     // Given a requested speed of 100.
