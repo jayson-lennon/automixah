@@ -58,9 +58,9 @@ pub struct AutomixahUiApp {
 
     /// Direct-drag anchor: audio position at drag start (seconds).
     drag_accum_position: f32,
-    /// Warp anchor: pointer is re-centered here each drag frame so the
-    /// cursor never reaches a screen edge (hidden cursor, infinite drag).
-    drag_warp_anchor: Option<egui::Pos2>,
+    /// Pointer x on the previous drag frame; deltas are measured per frame
+    /// so the waveform/grid tracks the cursor 1:1 (stops when it stops).
+    drag_last_x: Option<f32>,
     /// When the playhead position last changed (for extrapolation).
     position_updated: Option<std::time::Instant>,
     /// The position value at that instant.
@@ -141,7 +141,7 @@ impl AutomixahUiApp {
             engine: None,
             drag_mode: DragMode::None,
             drag_accum_position: 0.0,
-            drag_warp_anchor: None,
+            drag_last_x: None,
             position_updated: None,
             position_at_update: 0.0,
             last_frame_time: None,
@@ -224,33 +224,27 @@ impl AutomixahUiApp {
 }
 
 impl AutomixahUiApp {
-    /// Accumulated pointer x movement since the last warp, in points.
+    /// Pointer x movement since the previous drag frame, in points.
     ///
-    /// Each drag frame measures the pointer against the warp anchor and then
-    /// re-warps the (hidden) cursor back, so the gesture never reaches a
-    /// screen edge. Returns 0.0 when no anchor is set (gesture not started).
-    fn pointer_delta_since_warp(&mut self, response: &egui::Response) -> f32 {
-        let Some(anchor) = self.drag_warp_anchor else {
-            return 0.0;
-        };
+    /// Measured per frame against the last pointer position, so the dragged
+    /// quantity tracks the cursor exactly: it moves when the cursor moves
+    /// and stops when the cursor stops.
+    fn pointer_drag_delta(&mut self, response: &egui::Response) -> f32 {
         let Some(pos) = response.interact_pointer_pos() else {
             return 0.0;
         };
-        let dx = pos.x - anchor.x;
-        // Re-center immediately so the next frame measures only new movement.
-        // (If the platform rejects warps, deltas just saturate at the screen
-        // edge — no worse than the previous confined-cursor behavior.)
-        response
-            .ctx
-            .send_viewport_cmd(egui::ViewportCommand::CursorPosition(anchor));
+        let dx = self.drag_last_x.map_or(0.0, |last| pos.x - last);
+        self.drag_last_x = Some(pos.x);
         dx
     }
 
-    /// Restores cursor visibility after a drag gesture ends.
+    /// Ends the drag gesture and releases the confined cursor.
     fn end_drag_gesture(&mut self, ctx: &egui::Context) {
         self.drag_mode = DragMode::None;
-        self.drag_warp_anchor = None;
-        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        self.drag_last_x = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
     }
 
     /// Sends the current scrub command to the audio thread.
@@ -455,11 +449,12 @@ impl eframe::App for AutomixahUiApp {
             // Drag mode locks at drag start: SHIFT → grid move, else scrub.
             let shift_now = ctx.input(|i| i.modifiers.shift);
             if response.drag_started_by(egui::PointerButton::Primary) {
-                // Infinite drag: hide the cursor and re-warp it to the
-                // anchor every frame, so the pointer never reaches a screen
-                // edge and the gesture can continue indefinitely.
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-                self.drag_warp_anchor = response.interact_pointer_pos();
+                // Confine the cursor to the window so rapid drags keep
+                // working at the edge (wayland-safe; no warp needed).
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                    egui::viewport::CursorGrab::Confined,
+                ));
+                self.drag_last_x = response.interact_pointer_pos().map(|p| p.x);
                 if shift_now {
                     self.drag_mode = DragMode::MoveGrid;
                 } else {
@@ -468,9 +463,8 @@ impl eframe::App for AutomixahUiApp {
                     self.drag_accum_position = follow.unwrap_or(0.0) / sample_rate;
                 }
             }
-            // Physical pointer movement since the last warp; the cursor is
-            // warped back to the anchor afterwards so it never nears an edge.
-            let drag_dx = self.pointer_delta_since_warp(&response);
+            // Per-frame pointer movement; positions track the cursor 1:1.
+            let drag_dx = self.pointer_drag_delta(&response);
 
             match self.drag_mode {
                 DragMode::MoveGrid => {

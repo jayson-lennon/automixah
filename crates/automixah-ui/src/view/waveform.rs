@@ -38,11 +38,12 @@ impl WaveformView {
         self.frames_per_pixel * width_px.max(1.0)
     }
 
-    /// Clamps `left_frame` so the view stays within `[0, total]`.
+    /// Clamps `left_frame` to one screen of over-scroll on each side, so
+    /// the pinned playhead can sit at position 0 or the track end without
+    /// detaching from its pin, and the extremes remain reachable by drag.
     pub fn clamp_pan(&mut self, total_frames: f32, width_px: f32) {
         let visible = self.visible_frames(width_px);
-        let max_left = (total_frames - visible).max(0.0);
-        self.left_frame = self.left_frame.clamp(0.0, max_left);
+        self.left_frame = self.left_frame.clamp(-visible, total_frames);
     }
 
     /// Zooms by `factor`, keeping `anchor_px` (screen x) fixed on the same
@@ -343,10 +344,19 @@ mod tests {
     // When clamped.
     // Then the last visible frame is the track end.
     #[test]
-    fn clamp_pan_bounds_the_view() {
-        let mut view = view_at(10.0, 9_999.0);
+    fn clamp_pan_allows_one_screen_overscroll_each_side() {
+        // Given a view dragged far past the track end.
+        // When clamping.
+        // Then it holds at one screen past the end (not snapped to it).
+        let mut view = view_at(10.0, 99_999.0);
         view.clamp_pan(4_000.0, 100.0);
-        assert_eq!(view.left_frame, 3_000.0);
+        assert_eq!(view.left_frame, 4_000.0, "end over-scroll limit");
+        // Given a view dragged far before the start.
+        // When clamping.
+        // Then it holds at one screen before the start.
+        let mut view = view_at(10.0, -99_999.0);
+        view.clamp_pan(4_000.0, 100.0);
+        assert_eq!(view.left_frame, -1_000.0, "start over-scroll limit");
     }
 
     // Given zoom out past the overview limit.
