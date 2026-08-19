@@ -55,7 +55,16 @@ pub struct AutomixahUiApp {
     engine: Option<crate::audio::output::OutputEngine>,
     /// Locked drag mode (chosen at drag start).
     drag_mode: DragMode,
-    /// Last audio-time position of the pointer while dragging.
+
+    /// Direct-drag anchor: audio position at drag start (seconds).
+    drag_accum_position: f32,
+    /// Warp anchor: pointer is re-centered here each drag frame so the
+    /// cursor never reaches a screen edge (hidden cursor, infinite drag).
+    drag_warp_anchor: Option<egui::Pos2>,
+    /// When the playhead position last changed (for extrapolation).
+    position_updated: Option<std::time::Instant>,
+    /// The position value at that instant.
+    position_at_update: f32,
     /// Last frame instant for drag-velocity computation.
     last_frame_time: Option<std::time::Instant>,
     /// Shared PCM for the audio thread.
@@ -131,6 +140,10 @@ impl AutomixahUiApp {
             scrub: crate::audio::scrub_state::ScrubMachine::new(1.0),
             engine: None,
             drag_mode: DragMode::None,
+            drag_accum_position: 0.0,
+            drag_warp_anchor: None,
+            position_updated: None,
+            position_at_update: 0.0,
             last_frame_time: None,
             loading: None,
             save_outcomes: std::sync::mpsc::channel(),
@@ -211,6 +224,35 @@ impl AutomixahUiApp {
 }
 
 impl AutomixahUiApp {
+    /// Accumulated pointer x movement since the last warp, in points.
+    ///
+    /// Each drag frame measures the pointer against the warp anchor and then
+    /// re-warps the (hidden) cursor back, so the gesture never reaches a
+    /// screen edge. Returns 0.0 when no anchor is set (gesture not started).
+    fn pointer_delta_since_warp(&mut self, response: &egui::Response) -> f32 {
+        let Some(anchor) = self.drag_warp_anchor else {
+            return 0.0;
+        };
+        let Some(pos) = response.interact_pointer_pos() else {
+            return 0.0;
+        };
+        let dx = pos.x - anchor.x;
+        // Re-center immediately so the next frame measures only new movement.
+        // (If the platform rejects warps, deltas just saturate at the screen
+        // edge — no worse than the previous confined-cursor behavior.)
+        response
+            .ctx
+            .send_viewport_cmd(egui::ViewportCommand::CursorPosition(anchor));
+        dx
+    }
+
+    /// Restores cursor visibility after a drag gesture ends.
+    fn end_drag_gesture(&mut self, ctx: &egui::Context) {
+        self.drag_mode = DragMode::None;
+        self.drag_warp_anchor = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+    }
+
     /// Sends the current scrub command to the audio thread.
     fn push_command(&mut self) {
         let cmd = self.scrub.command();
@@ -379,7 +421,24 @@ impl eframe::App for AutomixahUiApp {
             self.view.frames_per_pixel = zoom;
 
             // Follow the playhead whenever the audio engine exists.
-            let follow = self.engine.as_ref().map(|e| *e.playhead().position.read());
+            // Position changes only at audio-callback rate (~ms bursts);
+            // extrapolate with the callback-reported speed so the view
+            // scrolls smoothly at display frame rate.
+            let follow = self.engine.as_ref().map(|e| {
+                let ph = e.playhead();
+                let raw = *ph.position.read();
+                if raw != self.position_at_update {
+                    self.position_at_update = raw;
+                    self.position_updated = Some(std::time::Instant::now());
+                    raw
+                } else {
+                    let speed = *ph.speed.read();
+                    let elapsed = self
+                        .position_updated
+                        .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                    raw + speed * elapsed
+                }
+            });
             let (response, rect, sample_rate) =
                 crate::view::waveform::show(ui, peaks, &mut self.view, follow);
             let seconds_per_pixel = self.view.frames_per_pixel / sample_rate;
@@ -393,30 +452,30 @@ impl eframe::App for AutomixahUiApp {
                 self.cursor_time = pointer_time;
             }
 
-            let frame_dt = self.last_frame_time.map_or(1.0 / 60.0, |t| {
-                let dt = t.elapsed().as_secs_f32();
-                if dt > 0.0 { dt } else { 1.0 / 240.0 }
-            });
             // Drag mode locks at drag start: SHIFT → grid move, else scrub.
             let shift_now = ctx.input(|i| i.modifiers.shift);
             if response.drag_started_by(egui::PointerButton::Primary) {
-                // Confine the cursor for the gesture so rapid dragging works
-                // even when the pointer outruns the window.
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                    egui::viewport::CursorGrab::Confined,
-                ));
+                // Infinite drag: hide the cursor and re-warp it to the
+                // anchor every frame, so the pointer never reaches a screen
+                // edge and the gesture can continue indefinitely.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                self.drag_warp_anchor = response.interact_pointer_pos();
                 if shift_now {
                     self.drag_mode = DragMode::MoveGrid;
                 } else {
                     self.drag_mode = DragMode::Scrub;
                     self.scrub.drag_start();
+                    self.drag_accum_position = follow.unwrap_or(0.0) / sample_rate;
                 }
             }
+            // Physical pointer movement since the last warp; the cursor is
+            // warped back to the anchor afterwards so it never nears an edge.
+            let drag_dx = self.pointer_delta_since_warp(&response);
+
             match self.drag_mode {
                 DragMode::MoveGrid => {
                     if response.dragged_by(egui::PointerButton::Primary) {
-                        let dx = response.drag_delta().x;
-                        self.edit_grid.shift_by(dx * seconds_per_pixel);
+                        self.edit_grid.shift_by(drag_dx * seconds_per_pixel);
                         self.schedule_save();
                         self.status = format!(
                             "grid shifted: anchor {:.3} s",
@@ -424,31 +483,25 @@ impl eframe::App for AutomixahUiApp {
                         );
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
-                        self.drag_mode = DragMode::None;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                            egui::viewport::CursorGrab::None,
-                        ));
+                        self.end_drag_gesture(ctx);
                     }
                 }
                 DragMode::Scrub => {
                     if response.dragged_by(egui::PointerButton::Primary) {
-                        // Screen-space delta: the view recenters under the
-                        // pinned playhead each frame, so measuring the
-                        // cursor's *time* between frames would double-count
-                        // the recenter and jump. Pixels are stable.
-                        let dx = response.drag_delta().x;
-                        self.scrub.drag_move(dx * seconds_per_pixel, frame_dt);
+                        // Direct position control: the position follows the
+                        // accumulated pointer movement 1:1 (like dragging
+                        // the waveform strip itself).
+                        self.drag_accum_position -= drag_dx * seconds_per_pixel;
+                        let target = self.drag_accum_position.clamp(0.0, end);
+                        if let Some(engine) = self.engine.as_ref() {
+                            *engine.playhead().seek.write() = Some(target * sample_rate);
+                            *engine.playhead().position.write() = target * sample_rate;
+                        }
+                        ctx.request_repaint();
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
                         self.scrub.drag_end();
-                        self.drag_mode = DragMode::None;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                            egui::viewport::CursorGrab::None,
-                        ));
-                        // Jump the engine to the release position.
-                        if let (Some(t), Some(engine)) = (pointer_time, self.engine.as_ref()) {
-                            *engine.playhead().seek.write() = Some(t * sample_rate);
-                        }
+                        self.end_drag_gesture(ctx);
                     }
                 }
                 DragMode::None => {}
@@ -492,7 +545,7 @@ impl eframe::App for AutomixahUiApp {
 
         // Keep the UI live while a track is loaded (playhead ticking).
         if self.track.is_some() || self.loading.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint();
         }
     }
 }

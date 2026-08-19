@@ -19,6 +19,9 @@ pub struct Playhead {
     pub position: RwLock<f32>,
     /// Requested position jump (UI sets Some(frame); audio consumes it).
     pub seek: RwLock<Option<f32>>,
+    /// Effective playback speed (source frames per second) at the last
+    /// callback; the UI extrapolates position between callbacks.
+    pub speed: RwLock<f32>,
 }
 
 #[cfg_attr(
@@ -31,6 +34,7 @@ impl Playhead {
         Self {
             position: RwLock::new(0.0),
             seek: RwLock::new(None),
+            speed: RwLock::new(0.0),
         }
     }
 }
@@ -207,6 +211,7 @@ impl OutputEngine {
                     if !cmd.playing {
                         out.fill(0.0);
                         *cb_playhead.position.write() = scrub.position();
+                        *cb_playhead.speed.write() = 0.0;
                         return;
                     }
                     if let Some(frame) = cb_playhead.seek.write().take() {
@@ -219,6 +224,8 @@ impl OutputEngine {
                     let mut src = vec![0.0_f32; src_frames_needed as usize * channels + channels];
                     scrub.read(&pcm, &mut src);
                     *cb_playhead.position.write() = scrub.position();
+                    *cb_playhead.speed.write() =
+                        cmd.speed * folder.speed_scale() * source_rate as f32;
 
                     // Fold source rate → device rate, shape, write.
                     let mut folded = vec![0.0_f32; out.len()];

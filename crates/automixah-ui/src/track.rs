@@ -95,7 +95,9 @@ pub enum LoadEvent {
 pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiver<LoadEvent> {
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = services.runtime.handle().clone();
+    let block_handle = services.runtime.handle().clone();
     let analysis_cache = services.analysis.clone();
+    let grid_store = services.grid_store.clone();
     handle.spawn_blocking(move || {
         let send_stage = |stage: LoadStage| {
             let _ = tx.send(LoadEvent::Stage(stage));
@@ -126,12 +128,29 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
             Err(report) => return send_done(Err(format!("{report:#}"))),
         };
 
-        // Session analysis cache: skip the analyzing stage when the exact
-        // content was analyzed earlier in this session.
-        let auto_grid = match analysis_cache.get(&hash) {
+        // Analysis reuse: a stored grid (manual override or the persisted
+        // auto grid) means the content was already analyzed — skip straight
+        // to it. The session cache short-circuits before the DB round-trip.
+        let stored: Option<crate::grid::EditableGrid> = analysis_cache
+            .get(&hash)
+            .map(|cached| crate::grid::EditableGrid::from_grid(&cached))
+            .or_else(|| {
+                block_handle
+                    .block_on(async { grid_store.get(&hash).await })
+                    .ok()
+                    .flatten()
+                    .map(|o| crate::grid::EditableGrid {
+                        grid_bpm: o.grid_bpm,
+                        anchor_seconds: o.anchor_seconds,
+                        downbeat_phase: o.downbeat_phase,
+                    })
+            });
+        let auto_grid = match stored {
             Some(cached) => {
                 send_stage(LoadStage::CacheHit);
-                cached
+                let projected = cached.project();
+                analysis_cache.put(hash.clone(), projected.clone());
+                projected
             }
             None => {
                 send_stage(LoadStage::Analyzing);
@@ -140,6 +159,23 @@ pub fn spawn_load(services: &Services, path: PathBuf) -> std::sync::mpsc::Receiv
                     Err(report) => return send_done(Err(format!("{report:#}"))),
                 };
                 analysis_cache.put(hash.clone(), beat_grid.clone());
+                // Persist the auto grid so future sessions skip analysis.
+                let editable = crate::grid::EditableGrid::from_grid(&beat_grid);
+                let _ = block_handle.block_on(async {
+                    grid_store
+                        .put(
+                            &hash,
+                            &crate::store::GridOverride {
+                                grid_bpm: editable.grid_bpm,
+                                anchor_seconds: editable.anchor_seconds,
+                                downbeat_phase: editable.downbeat_phase,
+                                updated_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_secs() as i64),
+                            },
+                        )
+                        .await
+                });
                 beat_grid
             }
         };
@@ -417,6 +453,47 @@ mod tests {
         assert_eq!(track.path, path);
         assert_eq!(track.grid_source, GridSource::Auto);
         assert!(!peaks.data.is_empty(), "peaks built off-thread");
+    }
+
+    // Given a first load persisted its auto grid to the store.
+    // When the same file loads in a FRESH session (empty memory cache).
+    // Then the store row short-circuits analysis (cache-hit stage).
+    #[test]
+    fn spawn_load_persisted_grid_skips_analysis_next_session() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
+
+        let drain = |rx: std::sync::mpsc::Receiver<LoadEvent>| {
+            let mut stages = Vec::new();
+            loop {
+                match rx.recv() {
+                    Ok(LoadEvent::Stage(s)) => stages.push(s),
+                    Ok(LoadEvent::Done(payload)) => break (stages, payload),
+                    Err(_) => unreachable!("channel closed before Done"),
+                }
+            }
+        };
+
+        let (stages, _) = drain(spawn_load(&services, path.clone()));
+        assert!(
+            stages.contains(&LoadStage::Analyzing),
+            "first pass analyzes"
+        );
+
+        // Fresh session: same store, empty memory cache.
+        let fresh = Services {
+            analysis: crate::analysis::AnalysisCache::default(),
+            paths: services.paths.clone(),
+            grid_store: services.grid_store.clone(),
+            runtime: services.runtime.clone(),
+        };
+        let (stages, outcome) = drain(spawn_load(&fresh, path));
+        assert!(
+            stages.contains(&LoadStage::CacheHit),
+            "second session must reuse the persisted grid: {stages:?}"
+        );
+        assert!(outcome.is_ok());
     }
 
     // Given a track loaded once through spawn_load.

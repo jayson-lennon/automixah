@@ -78,9 +78,17 @@ pub fn show(
     let width = rect.width();
     let total = total_frames(peaks);
 
-    view.clamp_pan(total, width);
+    // Unclamped while a drag is in flight: the waveform must be free to
+    // move past the track ends so the pinned playhead can reach any
+    // position. Clamping returns when the gesture ends.
+    let dragging = response.dragged_by(egui::PointerButton::Primary);
+    if !dragging {
+        view.clamp_pan(total, width);
+    }
     handle_input(&mut response, view, rect, pin_frame);
-    view.clamp_pan(total, width);
+    if !dragging {
+        view.clamp_pan(total, width);
+    }
 
     painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
     paint_peaks(&painter, peaks, view, rect);
