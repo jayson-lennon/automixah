@@ -62,7 +62,8 @@ web-sys = { version = "0.3", features = [
 ] }
 console_error_panic_hook = "0.1"
 stratum-dsp = "1.0.0"
-symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "ogg", "aac"] }
+symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "ogg", "aac", "isomp4", "alac"] }
+symphonia-adapter-libopus = "0.2"
 rstest = "0.24"
 ron = "0.8"
 criterion = "0.5"

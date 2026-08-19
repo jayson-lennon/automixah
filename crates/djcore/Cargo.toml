@@ -16,6 +16,12 @@ serde.workspace = true
 stratum-dsp.workspace = true
 symphonia.workspace = true
 
+# libopus (bundled by the adapter's default features) cannot build for
+# wasm32-unknown-unknown; CI still clippy-checks that target, so the opus
+# adapter is native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+symphonia-adapter-libopus.workspace = true
+
 [dev-dependencies]
 hound = { workspace = true }
 serde_json.workspace = true

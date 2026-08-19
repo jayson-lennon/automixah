@@ -103,18 +103,19 @@ pub fn run(config: &Config) -> Result<SessionTime, Report<CliError>> {
 
     let mut provider = SessionPcm::new(&loaded, &plan);
     let total = SessionTime(plan.total_len_samples());
+    let session_rate = plan.sample_rate;
     let mut renderer = Renderer::with_transition(plan, transition.clone());
     let mix = renderer
         .render_until(&mut provider, total)
         .change_context(CliError)
         .attach("session render failed")?;
 
-    write_wav(&config.out, &mix, 44_100).change_context(CliError)?;
+    write_wav(&config.out, &mix, session_rate).change_context(CliError)?;
 
     eprintln!(
         "[mix] wrote {} samples ({:.1}s) to {}",
         mix.len(),
-        mix.len() as f64 / 44_100.0,
+        mix.len() as f64 / f64::from(session_rate),
         config.out.display()
     );
     Ok(total)
@@ -283,26 +284,26 @@ fn log_plan(
             "  segment {} starts @ {} ({} s, stretch ratio {:.3} {:?})",
             seg.track_hash.0,
             seg.session_start.0,
-            seg.len_samples / 44_100,
+            seg.len_samples / u64::from(plan.sample_rate),
             seg.stretch.ratio,
             seg.stretch.mode
         );
         if let Some(t) = &seg.transition {
-            log_transition(t);
+            log_transition(t, plan.sample_rate);
         }
     }
     eprintln!(
         "[plan] total {:.1}s",
-        plan.total_len_samples() as f64 / 44_100.0
+        plan.total_len_samples() as f64 / f64::from(plan.sample_rate)
     );
 }
 
 /// Prints one transition's window and automation preset.
-fn log_transition(t: &TransitionPlan) {
+fn log_transition(t: &TransitionPlan, sample_rate: u32) {
     eprintln!(
         "    transition @ {:.1}s→{:.1}s preset {}",
-        t.window.start.0 as f64 / 44_100.0,
-        t.window.end.0 as f64 / 44_100.0,
+        t.window.start.0 as f64 / f64::from(sample_rate),
+        t.window.end.0 as f64 / f64::from(sample_rate),
         t.preset.0
     );
 }

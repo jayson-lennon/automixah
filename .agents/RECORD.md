@@ -64,3 +64,6 @@ Entries are added or amended **only with human approval**.
 - (ui) UI repaints are scheduled by event-bus sends with a 50 ms debounce; each frame drains events under a 10 ms budget before rendering.
 - (ui) Playlist contents load on selection: the view clears and shows a spinner until the load event replaces them; playlist rows carry database-minted ids.
 - (workflow) This repository uses git; commits go through `just commit '<message>'`, checks through `just check`, `just test`, and `just lint`.
+- (analysis) djcore decodes mp3, flac, wav, ogg, aac, opus, and m4a (AAC or ALAC) input via symphonia; opus uses a bundled libopus adapter available on native targets only.
+- (cli) The CLI writes the output WAV at the session sample rate (the first track's rate) rather than a fixed 44.1 kHz.
+- (ui) Audition playback is source-rate agnostic: scrub reads at 1x in source frames, a single RateFolder pass converts to the device rate, and source channels fold to the device channel count.

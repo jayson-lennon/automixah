@@ -55,6 +55,26 @@ impl Default for Playhead {
     }
 }
 
+/// Folds interleaved audio from `in_channels` to `out_channels`, one
+/// output frame per input frame: mono duplicates to every output channel,
+/// equal counts pass through, and more-in-than-out downmixes to the
+/// first output channel (front pair for stereo devices).
+fn fold_channels(input: &[f32], in_channels: usize, out: &mut [f32], out_channels: usize) {
+    let in_frames = input.len() / in_channels.max(1);
+    let out_frames = out.len() / out_channels.max(1);
+    for f in 0..out_frames.min(in_frames) {
+        for oc in 0..out_channels {
+            let v = if in_channels == 1 {
+                input[f]
+            } else {
+                let c = oc.min(in_channels - 1);
+                input[f * in_channels + c]
+            };
+            out[f * out_channels + oc] = v;
+        }
+    }
+}
+
 /// Linear-interpolating resampler between distinct rates.
 ///
 /// Holds one source frame of history; produces `ratio` device frames per
@@ -200,16 +220,23 @@ impl OutputEngine {
             .attach("read default output config")?;
         let config: cpal::StreamConfig = supported.into();
         let device_rate = config.sample_rate.0;
+        let device_channels = usize::from(config.channels);
 
         let playhead = Arc::new(Playhead::new());
         *playhead.position.write() = start_frame;
         let command = Arc::new(Mutex::new(ScrubCommand {
-            speed: RateFolder::new(channels, source_rate, device_rate).speed_scale(),
+            speed: 1.0,
             playing: false,
         }));
 
+        // Scrub reads at source channels; fold converts to the device's.
         let mut scrub = ScrubCore::new(channels, start_frame);
-        let mut folder = RateFolder::new(channels, source_rate, device_rate);
+        let mut folder = RateFolder::new(device_channels, source_rate, device_rate);
+        // Scratch buffers, grown on demand and reused across callbacks so
+        // the real-time path does not allocate.
+        let mut src = Vec::<f32>::new();
+        let mut chan_folded = Vec::<f32>::new();
+        let mut folded = Vec::<f32>::new();
 
         let cb_playhead = Arc::clone(&playhead);
         let cb_command = Arc::clone(&command);
@@ -227,20 +254,27 @@ impl OutputEngine {
                     }
                     scrub.set_speed(cmd.speed);
 
-                    let src_frames_needed =
-                        (out.len() / channels.max(1)) as f32 / folder.speed_scale();
-                    let mut src = vec![0.0_f32; src_frames_needed as usize * channels + channels];
+                    // Fold needs one source frame per device frame scaled by
+                    // source/device (scrub speed spans more source *time*,
+                    // not more frames), plus margin for interpolation.
+                    let device_frames = out.len() / device_channels.max(1);
+                    #[expect(clippy::cast_precision_loss, reason = "rates fit f32 exactly")]
+                    let needed = (device_frames as f32 * source_rate as f32 / device_rate as f32)
+                        .ceil() as usize
+                        + 4;
+                    src.resize(needed * channels, 0.0);
                     scrub.read(&pcm, &mut src);
                     *cb_playhead.position.write() = scrub.position();
-                    *cb_playhead.speed.write() =
-                        cmd.speed * folder.speed_scale() * source_rate as f32;
+                    *cb_playhead.speed.write() = cmd.speed * source_rate as f32;
 
-                    // Fold source rate → device rate, shape, write.
-                    let mut folded = vec![0.0_f32; out.len()];
-                    let consumed = folder.fold(&src[..], &mut folded);
-                    let _ = consumed;
-                    for (o, s) in out.iter_mut().zip(folded) {
-                        *o = shape(s);
+                    // Source channels → device channels, then source rate →
+                    // device rate, shape, write.
+                    chan_folded.resize(src.len() / channels.max(1) * device_channels, 0.0);
+                    fold_channels(&src, channels, &mut chan_folded, device_channels);
+                    folded.resize(out.len(), 0.0);
+                    let _ = folder.fold(&chan_folded, &mut folded);
+                    for (o, s) in out.iter_mut().zip(folded.iter()) {
+                        *o = shape(*s);
                     }
                 },
                 |err| eprintln!("audio stream error: {err}"),
@@ -313,6 +347,88 @@ mod tests {
             (measured - hz).abs() < 12.0,
             "measured {measured} Hz vs {hz}"
         );
+    }
+
+    // Given a 440 Hz sine at 48 kHz folded down to 44.1 kHz
+    // (the opus case that previously crackled: the fold ran dry
+    // partway through every callback and repeated its last frame).
+    // When 1 s is rendered at 1x.
+    // Then the fold never runs dry: consumption matches the needed
+    // source frames and the tone is preserved.
+    #[test]
+    fn rate_fold_48k_to_44k1_never_runs_dry() {
+        use std::f32::consts::TAU;
+        let src_rate = 48_000.0f32;
+        let device_rate = 44_100u32;
+        let hz = 440.0;
+        #[expect(clippy::cast_possible_truncation, reason = "fixture size")]
+        let src: Vec<f32> = (0..src_rate as usize)
+            .flat_map(|i| {
+                let v = (TAU * hz * i as f32 / src_rate).sin();
+                [v, v]
+            })
+            .collect();
+
+        let mut folder = RateFolder::new(2, 48_000, device_rate);
+        let mut out = vec![0.0_f32; device_rate as usize * 2];
+        let needed = out.len() / 2 * 48_000 / device_rate as usize;
+        let consumed = folder.fold(&src, &mut out);
+        assert!(
+            (consumed as i64 - needed as i64).abs() <= 2,
+            "consumed {consumed}, needed ~{needed} — dry fold repeats frames"
+        );
+
+        let mono: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let measured = dominant_hz_zero_crossings(&mono, device_rate as f32);
+        assert!(
+            (measured - hz).abs() < 12.0,
+            "measured {measured} Hz vs {hz} — staircase repeats show as noise"
+        );
+    }
+
+    // Given mono source audio on a stereo device.
+    // When channel-folded.
+    // Then every frame duplicates the mono sample to both channels.
+    #[test]
+    fn channel_fold_duplicates_mono_to_stereo() {
+        let src = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let mut out = vec![0.0_f32; src.len() * 2];
+        fold_channels(&src, 1, &mut out, 2);
+        assert_eq!(out, vec![0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4]);
+    }
+
+    // Given stereo source on a stereo device.
+    // When channel-folded.
+    // Then samples pass through unchanged.
+    #[test]
+    fn channel_fold_stereo_is_identity() {
+        let src = vec![0.1_f32, -0.1, 0.2, -0.2];
+        let mut out = vec![0.0_f32; src.len()];
+        fold_channels(&src, 2, &mut out, 2);
+        assert_eq!(out, src);
+    }
+
+    /// Average crossing-based frequency of a mono buffer.
+    fn dominant_hz_zero_crossings(mono: &[f32], rate: f32) -> f32 {
+        let mut crossings = 0usize;
+        let mut first = None;
+        let mut last = None;
+        for w in mono.windows(2) {
+            if w[0] < 0.0 && w[1] >= 0.0 {
+                crossings += 1;
+                if first.is_none() {
+                    first = Some(crossings);
+                }
+                last = Some(crossings);
+            }
+        }
+        let (Some(f), Some(l)) = (first, last) else {
+            return 0.0;
+        };
+        if l <= f {
+            return 0.0;
+        }
+        rate * (l - f) as f32 / mono.len() as f32
     }
 
     // Given samples beyond full scale.

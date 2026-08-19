@@ -13,6 +13,11 @@ fn click128() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../stratum-dsp/tests/fixtures/128bpm_4bar.wav")
 }
 
+/// 48 kHz resample of the 120 BPM click (first-track-defines-rate test).
+fn click120_48k() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/120bpm_4bar_48k.wav")
+}
+
 /// Real-music fixture (148 BPM, G minor) if present (gitignored).
 fn real_track() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,6 +80,30 @@ fn two_track_render_has_planned_duration_no_gaps_no_clip() {
         }
     }
     assert!(worst <= 44_100, "silent gap of {worst} samples");
+}
+
+// Given a 48 kHz click first and a 44.1 kHz click second.
+#[test]
+fn forty_eight_k_first_track_writes_forty_eight_k_wav() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("mix48k.wav");
+    let config = Config {
+        tracks: vec![click120_48k(), click128()],
+        out: out.clone(),
+        target_bpm: None,
+        tempo_strategy: TempoStrategyArg::Session,
+        automation: None,
+    };
+
+    // When running the pipeline.
+    let total = run(&config).expect("run");
+
+    // Then the WAV header reports the first track's 48 kHz and the
+    // sample count matches the returned session length at that rate.
+    let (rate, samples, channels) = read_wav(&out);
+    assert_eq!(rate, 48_000);
+    assert_eq!(channels, 2);
+    assert_eq!(samples.len() as u64, total.0 * 2);
 }
 
 #[test]

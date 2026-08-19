@@ -22,7 +22,8 @@ pub enum ScrubState {
 #[derive(Debug, Clone)]
 pub struct ScrubMachine {
     state: ScrubState,
-    /// Base speed at 1× (rate-folded source-frames per device-frame).
+    /// Base speed at 1×, in source-frames-per-source-frame (the engine
+    /// rate-folds to the device after scrubbing; unit is 1.0).
     unit_speed: f32,
     /// Low-pass on drag speed to keep small jitter from chirping.
     smoothed_drag: f32,

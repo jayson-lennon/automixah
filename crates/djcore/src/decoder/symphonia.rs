@@ -31,7 +31,33 @@ impl SymphoniaDecoder {
 }
 
 /// File extensions supported by the symphonia decoder (lowercase, without dot).
-const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac"];
+///
+/// `opus` requires the libopus adapter, which is native-only.
+#[cfg(not(target_arch = "wasm32"))]
+const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "opus", "m4a"];
+#[cfg(target_arch = "wasm32")]
+const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a"];
+
+/// Codec registry with every feature-enabled codec plus, on native
+/// targets, the libopus adapter (symphonia has no first-party Opus
+/// decoder). Built once; registry construction is not cheap.
+#[cfg(not(target_arch = "wasm32"))]
+fn codec_registry() -> &'static symphonia::core::codecs::CodecRegistry {
+    use symphonia::core::codecs::CodecRegistry;
+    static REGISTRY: std::sync::OnceLock<CodecRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        registry.register_all::<symphonia_adapter_libopus::OpusDecoder>();
+        registry
+    })
+}
+
+/// Wasm has no libopus; the feature-enabled default registry applies.
+#[cfg(target_arch = "wasm32")]
+fn codec_registry() -> &'static symphonia::core::codecs::CodecRegistry {
+    symphonia::default::get_codecs()
+}
 
 #[allow(clippy::cast_precision_loss)]
 /// Interleaves up to the first two channels (mono repeats channel 0;
@@ -109,7 +135,7 @@ impl AudioDecoder for SymphoniaDecoder {
         let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
 
         let decoder_opts = DecoderOptions::default();
-        let mut decoder = symphonia::default::get_codecs()
+        let mut decoder = codec_registry()
             .make(&codec_params, &decoder_opts)
             .change_context(DecodeError)
             .attach("failed to create audio decoder")?;

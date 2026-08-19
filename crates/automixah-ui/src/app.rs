@@ -311,7 +311,8 @@ impl AutomixahUiApp {
             0.0,
         ) {
             Ok(engine) => {
-                // unit_speed: 1× playback rate-folded to the device.
+                // unit_speed: 1× in source frames; RateFolder does the
+                // single rate conversion to the device inside the engine.
                 self.scrub = crate::audio::scrub_state::ScrubMachine::new(1.0);
                 Some(engine)
             }

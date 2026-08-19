@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use djcore::analyzer::{AudioAnalyzer, StratumAnalyzer};
+use djcore::decoder::meta::probe_metadata;
 use djcore::decoder::{AudioDecoder, DecoderRegistry, SymphoniaDecoder};
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -87,6 +88,85 @@ fn decodes_aac_fixture_to_approximate_length() {
     );
 }
 
+// Given a 1-second 440 Hz opus fixture (lossy, 48 kHz — libopus input rate).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn decodes_opus_fixture_at_48000() {
+    let audio = decode_tone_fixture("opus");
+
+    // Then the rate is 48 kHz and the length is within 5% of 1 s.
+    assert_eq!(audio.sample_rate, 48_000);
+    let expected = 48_000.0;
+    #[allow(clippy::cast_precision_loss)]
+    let actual = audio.samples.len() as f32;
+    assert!(
+        (actual - expected).abs() / expected < 0.05,
+        "decoded {} samples, expected ~{expected}",
+        audio.samples.len()
+    );
+}
+
+// Given a 1-second 440 Hz AAC m4a fixture (lossy).
+#[test]
+fn decodes_m4a_fixture_to_approximate_length() {
+    let audio = decode_tone_fixture("m4a");
+
+    // Then the decoded length is within 5% of 1 s at 44.1 kHz.
+    let expected = 44_100.0;
+    #[allow(clippy::cast_precision_loss)]
+    let actual = audio.samples.len() as f32;
+    assert!(
+        (actual - expected).abs() / expected < 0.05,
+        "decoded {} samples, expected ~{expected}",
+        audio.samples.len()
+    );
+}
+
+// Given a 1-second ALAC m4a fixture (lossless), decoded through the m4a extension.
+#[test]
+fn decodes_alac_m4a_fixture_exactly() {
+    let bytes = fixture("tone440.alac.m4a");
+    let registry = DecoderRegistry::with_symphonia();
+    let audio = registry
+        .decode(&bytes, "m4a")
+        .unwrap_or_else(|e| panic!("failed to decode alac m4a: {e:?}"));
+
+    // Then the decoded length matches the WAV decode exactly.
+    let wav = decode_tone_fixture("wav");
+    assert_eq!(audio.samples.len(), wav.samples.len());
+}
+
+// Given a tagged AAC m4a fixture (title/artist written by ffmpeg).
+#[test]
+fn probes_m4a_fixture_tags_and_duration() {
+    let bytes = fixture("tone440.m4a");
+
+    // When probing metadata without decoding audio.
+    let tags = probe_metadata(&bytes, "m4a").expect("probe");
+
+    // Then the written tags and the duration are present.
+    assert_eq!(tags.title.as_deref(), Some("Tone Four Forty"));
+    assert_eq!(tags.artist.as_deref(), Some("Test Artist"));
+    assert!(
+        tags.duration_seconds.is_some_and(|d| (d - 1.0).abs() < 0.1),
+        "duration near 1 s, got {:?}",
+        tags.duration_seconds
+    );
+}
+
+// Given garbage bytes tagged as opus.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn rejects_garbage_bytes_with_opus_extension() {
+    let registry = DecoderRegistry::with_symphonia();
+
+    // When decoding.
+    let result = registry.decode(b"not audio", "opus");
+
+    // Then the registry errors rather than panicking.
+    assert!(result.is_err());
+}
+
 #[test]
 fn symphonia_decoder_name_and_extensions() {
     // Given the symphonia decoder.
@@ -99,6 +179,10 @@ fn symphonia_decoder_name_and_extensions() {
     assert!(decoder.supported_extensions().contains(&"wav"));
     assert!(decoder.supported_extensions().contains(&"ogg"));
     assert!(decoder.supported_extensions().contains(&"aac"));
+    assert!(decoder.supported_extensions().contains(&"m4a"));
+    // Opus is native-only (libopus adapter).
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(decoder.supported_extensions().contains(&"opus"));
 }
 
 #[test]
