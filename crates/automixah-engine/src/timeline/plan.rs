@@ -394,7 +394,9 @@ fn out_window_for(a: &TrackAnalysis, inputs: OutWindowInputs) -> Option<Transiti
     a.cues
         .valid_positions(CueKind::Out, duration_frames)
         .filter_map(|(_, out_frames)| {
-            let source_delta = out_frames.checked_sub(inputs.cue_frames)?;
+            let source_delta = out_frames
+                .checked_sub(inputs.cue_frames)
+                .filter(|&delta| delta > 0)?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "source frame delta fits the audio timeline"
@@ -894,6 +896,30 @@ mod tests {
             window.end.0 - window.start.0,
             SessionTime::from_seconds(2.0, 44_100).0
         );
+    }
+
+    #[test]
+    fn equal_out_and_in_cues_use_fallback_placement() {
+        // Given an outgoing track whose out-cue is exactly its selected in-cue.
+        let mut a = synthetic_track("a", 120.0, 200.0, 800);
+        let cue = 44_100_u64 * 50;
+        a.cues = TestCuePoints {
+            ins: [Some(cue), None, None, None],
+            outs: [Some(cue), None, None, None],
+        };
+        let b = synthetic_track("b", 120.0, 200.0, 800);
+
+        // When planning the transition.
+        let plan = plan_session(&[a, b], Some(120.0));
+
+        // Then the in-cue remains active but the zero-length out cue is ignored.
+        assert_eq!(plan.segments[0].src_start, cue);
+        let window = &plan.segments[0]
+            .transition
+            .as_ref()
+            .expect("transition")
+            .window;
+        assert_ne!(window.start.0, 0);
     }
 
     #[test]

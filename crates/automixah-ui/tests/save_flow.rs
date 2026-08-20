@@ -39,7 +39,7 @@ fn load_outcome(hash: &str) -> LoadOutcome {
             sample_rate: 44_100,
             channels: 2,
         },
-        peaks: automixah_ui_lib::audio::peaks::Peaks::build(&[], 44_100),
+        peaks: automixah_ui_lib::audio::peaks::Peaks::build_with_channels(&[], 44_100, 2),
     }
 }
 

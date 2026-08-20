@@ -157,6 +157,27 @@ impl WaveformView {
         let visible = self.visible_frames(width_px);
         self.left_frame = frame - self.playhead_frac * visible;
     }
+
+    /// Returns the source frame currently represented by the pinned playhead.
+    ///
+    /// This is derived from the same transform used to paint the waveform and
+    /// markers, so callers do not need a separately latched cursor position.
+    #[must_use]
+    pub fn playhead_source_frame(&self, width_px: f32, total_frames: u64) -> u64 {
+        let frame = f64::from(self.left_frame)
+            + f64::from(self.playhead_frac) * f64::from(self.visible_frames(width_px));
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "source duration is a display-domain bound"
+        )]
+        let max_frame = total_frames as f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "clamped display frame becomes a source frame"
+        )]
+        let source_frame = frame.clamp(0.0, max_frame).round() as u64;
+        source_frame
+    }
 }
 
 /// Renders the waveform and returns `(response, rect, sample_rate)` — the
@@ -388,7 +409,7 @@ fn cue_button_tooltip(kind: CueKind, slot: usize, occupied: bool) -> String {
 }
 
 /// Renders the eight numbered cue buttons below the waveform.
-fn cue_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
+fn cue_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String, waveform_width: f32) {
     ui.separator();
     ui.label("Cue points");
     for (kind, label) in [(CueKind::In, "In"), (CueKind::Out, "Out")] {
@@ -402,10 +423,10 @@ fn cue_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
                 if !response.clicked() {
                     continue;
                 }
-                #[expect(clippy::cast_possible_truncation, reason = "cursor frame fits source")]
-                let cursor_frame = deck
-                    .cursor_time
-                    .map(|cursor| (cursor.max(0.0) * deck.sample_rate as f32).round() as u64);
+                let cursor_frame = (!occupied).then(|| {
+                    deck.view
+                        .playhead_source_frame(waveform_width, deck.source_frames)
+                });
                 let action = cue_button_action(
                     &deck.cues,
                     kind,
@@ -425,8 +446,7 @@ fn cue_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
                             *engine.playhead().seek.write() = Some(frame as f64);
                             *engine.playhead().position.write() = frame as f64;
                         }
-                        deck.view
-                            .pin_frame(frame as f32, ui.available_width().max(1.0));
+                        deck.view.pin_frame(frame as f32, waveform_width);
                         *status = format!("jumped to {label} cue {}", slot + 1);
                     }
                     CueButtonAction::Create => {
@@ -508,8 +528,9 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
     let pointer_time = response
         .hover_pos()
         .map(|p| time_at_left + (p.x - rect.left()) * seconds_per_pixel);
-    // Latch: keep the last valid cursor time so the cursor buttons stay
-    // visible when the pointer leaves the waveform.
+    // Keep the existing cursor target for grid controls. Cue creation does
+    // not use this optional value; it derives the pinned source frame below
+    // directly from the current waveform transform.
     if pointer_time.is_some() {
         deck.cursor_time = pointer_time;
     }
@@ -538,9 +559,13 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
         } else {
             deck.drag_mode = DragMode::Scrub;
             deck.scrub.drag_start();
-            // Seed the view accumulation from wherever the view is right
-            // now; pointer deltas drive it from here.
-            deck.drag_view_frame = Some(follow.unwrap_or(deck.view.left_frame));
+            // Seed the view accumulation from the current source position;
+            // using the view transform here keeps cue creation correct even
+            // when audio output is unavailable.
+            deck.drag_view_frame = Some(follow.unwrap_or_else(|| {
+                deck.view
+                    .playhead_source_frame(rect.width(), deck.source_frames) as f32
+            }));
         }
     }
 
@@ -583,6 +608,14 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
         }
         DragMode::None => {}
     }
+    // Keep the view transform synchronized with the current scrub position
+    // before cue actions are handled below. Cue creation derives its source
+    // frame from this transform in real time.
+    if deck.drag_mode == DragMode::Scrub
+        && let Some(frame) = deck.drag_view_frame
+    {
+        deck.view.pin_frame(frame, rect.width());
+    }
     // Plain click (no drag) seeks the playhead; grid untouched.
     // Position is written too so the pinned view re-centers on the very
     // next paint instead of waiting for an audio callback.
@@ -614,7 +647,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
             egui::Stroke::new(3.0, Color32::from_rgb(255, 210, 60)),
         );
     }
-    cue_panel(ui, deck, status);
+    cue_panel(ui, deck, status, rect.width());
 }
 
 #[cfg(test)]
@@ -855,7 +888,38 @@ mod tests {
         assert_eq!(view.left_frame, 1000.0 - 0.25 * 10.0 * 200.0);
     }
 
-    // Given a view scrolled past the track end.
+    // Given a pinned view at two different source positions.
+    // When the source frame under the playhead is read.
+    // Then it follows the existing view transform and clamps to the source.
+    #[test]
+    fn playhead_source_frame_uses_current_view_transform() {
+        let mut view = view_at(10.0, 100.0);
+        let frame = view.playhead_source_frame(200.0, 10_000);
+        assert_eq!(frame, 1_100);
+
+        view.pin_frame(7_000.0, 200.0);
+        assert_eq!(view.playhead_source_frame(200.0, 10_000), 7_000);
+
+        view.left_frame = -100_000.0;
+        assert_eq!(view.playhead_source_frame(200.0, 10_000), 0);
+    }
+
+    // Given a view whose pinned playhead is moved from one source position to
+    // another while the zoom and viewport stay fixed.
+    // When the source frame under the playhead is read.
+    // Then the derived positions stay ordered and match both source positions.
+    #[test]
+    fn playhead_source_frame_tracks_ordered_navigation() {
+        let mut view = view_at(10.0, 0.0);
+        view.pin_frame(7_000.0, 200.0);
+        let first = view.playhead_source_frame(200.0, 10_000);
+        view.pin_frame(9_000.0, 200.0);
+        let second = view.playhead_source_frame(200.0, 10_000);
+        assert_eq!(first, 7_000);
+        assert_eq!(second, 9_000);
+        assert!(second > first);
+    }
+
     // When clamped.
     // Then the last visible frame is the track end.
     #[test]

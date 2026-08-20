@@ -71,6 +71,14 @@ pub struct Peaks {
 impl Peaks {
     /// Builds the peak track from interleaved stereo PCM.
     ///
+    /// This compatibility helper retains the historical stereo default. New
+    /// decoded audio should use [`Self::build_with_channels`] so mono tracks
+    /// are represented at their full source duration.
+    #[must_use]
+    pub fn build(samples: &[f32], sample_rate: u32) -> Self {
+        Self::build_with_channels(samples, sample_rate, 2)
+    }
+
     /// Slot *k* covers source frames `[k·stride, (k+1)·stride)` exactly:
     /// the boundary accumulator is fractional (f64), so non-integer
     /// strides (48000/441 ≈ 108.84) advance on true boundaries instead
@@ -80,9 +88,10 @@ impl Peaks {
     /// The final partial slot is flushed when at least one frame of it
     /// is covered.
     #[must_use]
-    pub fn build(samples: &[f32], sample_rate: u32) -> Self {
+    pub fn build_with_channels(samples: &[f32], sample_rate: u32, channels: u16) -> Self {
+        let channels = usize::from(channels.max(1));
         let stride = f64::from(sample_rate) / f64::from(VISUAL_RATE);
-        let frames = samples.len() / 2;
+        let frames = samples.len() / channels;
         let visual_len = if frames == 0 {
             0
         } else {
@@ -102,8 +111,11 @@ impl Peaks {
         // 108.84 could only ever fire at 109).
         let mut next_boundary = stride;
 
-        for (frame_idx, frame) in samples.chunks_exact(2).enumerate() {
-            let (l, r) = (frame[0], frame[1]);
+        for (frame_idx, frame) in samples.chunks_exact(channels).enumerate() {
+            let (l, r) = match channels {
+                1 => (frame[0], frame[0]),
+                _ => (frame[0], frame[1]),
+            };
             let bands = splitter.process_frame(l, r);
             running.absorb(bands, l, r);
             let frame_end = f64::from(frame_idx as u32) + 1.0;
@@ -156,6 +168,23 @@ mod tests {
         assert_eq!(peaks.data[5].all, 255, "impulse in visual sample 5");
         assert_eq!(peaks.data[4].all, 0, "silence before");
         assert_eq!(peaks.data[6].all, 0, "silence after");
+    }
+
+    // Given one second of mono silence with a single full-scale impulse.
+    // When peaks are built with the decoded channel count.
+    // Then the entire mono duration is represented and the impulse is visible.
+    #[test]
+    fn mono_peaks_preserve_full_source_duration() {
+        let frames = RATE as usize;
+        let stride = RATE as f32 / VISUAL_RATE;
+        let impulse = (stride * 5.5) as usize;
+        let mut pcm = vec![0.0_f32; frames];
+        pcm[impulse] = 1.0;
+
+        let peaks = Peaks::build_with_channels(&pcm, RATE, 1);
+
+        assert_eq!(peaks.data.len(), (frames as f32 / stride).ceil() as usize);
+        assert_eq!(peaks.data[5].all, 255);
     }
 
     // Given PCM shorter than one stride.

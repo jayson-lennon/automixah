@@ -1249,7 +1249,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 1),
         });
 
         // When the older in-flight save reports success.
@@ -1313,7 +1313,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 1),
         });
         let deck = app.deck.as_mut().expect("deck");
         deck.pending_cue_save = Some((hash.clone(), cues));
@@ -1366,7 +1366,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 1),
         });
         let deck = app.deck.as_mut().expect("deck");
         deck.cue_save_in_flight = Some((hash.clone(), cues));
@@ -1419,7 +1419,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 1),
         });
 
         // Then the deck owns the loaded cue snapshot for editing.
@@ -1459,7 +1459,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 1,
             },
-            peaks: crate::audio::peaks::Peaks::build(&vec![0.0; 44_100], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&vec![0.0; 44_100], 44_100, 1),
         });
         let deck = app.deck.as_mut().expect("deck");
         deck.edit_grid.anchor_seconds = 0.1;
@@ -1637,7 +1637,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 2,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[], 44_100, 2),
         };
         app.apply_load_done(outcome(&first));
         assert_eq!(app.deck.as_ref().expect("deck").hash.0, "first");
@@ -1692,7 +1692,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 2,
             },
-            peaks: crate::audio::peaks::Peaks::build(&[], 44_100),
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[], 44_100, 2),
         });
 
         app.load_row(&hash);

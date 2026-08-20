@@ -16,7 +16,7 @@ fn main() {
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let registry = DecoderRegistry::with_symphonia();
     let audio = registry.decode(&bytes, &ext).expect("decode");
-    let peaks = Peaks::build(&audio.samples, audio.sample_rate);
+    let peaks = Peaks::build_with_channels(&audio.samples, audio.sample_rate, audio.channels);
 
     println!(
         "decoded: {:.1}s, {} frames, {} peak quartets ({:.1} per second)",

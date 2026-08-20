@@ -220,7 +220,11 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>, path:
             }
         };
 
-        let peaks = crate::audio::peaks::Peaks::build(&audio.samples, audio.sample_rate);
+        let peaks = crate::audio::peaks::Peaks::build_with_channels(
+            &audio.samples,
+            audio.sample_rate,
+            audio.channels,
+        );
         send(Event::AnalysisDone {
             hash: hash.clone(),
             analysis: analysis.clone(),
