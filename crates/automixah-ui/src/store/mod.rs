@@ -21,7 +21,7 @@ pub mod sqlite;
 /// Carries no variants — the failure detail lives in the
 /// `error_stack::Report` context attachments.
 #[derive(Debug, Error)]
-#[error("grid store error")]
+#[error(debug)]
 pub struct GridStoreError;
 
 /// A stored manual grid override.

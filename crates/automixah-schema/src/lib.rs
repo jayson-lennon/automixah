@@ -222,7 +222,7 @@ fn migrate_v3(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrat
 /// Carries no variants — the failure detail lives in the `error_stack::Report`
 /// context attachments (which migration failed, what SQL).
 #[derive(Debug, Error)]
-#[error("schema migration error")]
+#[error(debug)]
 pub struct SchemaMigrationError;
 
 #[cfg(test)]

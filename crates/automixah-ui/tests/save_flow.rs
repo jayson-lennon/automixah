@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use automixah_engine::timeline::types::TrackHash;
 use automixah_ui_lib::app::AutomixahUiApp;
+use automixah_ui_lib::bus::LoadOutcome;
 use automixah_ui_lib::playlist::store::PlaylistStoreService;
 use automixah_ui_lib::playlist::store::in_memory::InMemoryPlaylistStore;
 use automixah_ui_lib::services::{AppPaths, Services};
@@ -11,10 +12,38 @@ use automixah_ui_lib::store::CountingStore;
 use automixah_ui_lib::store::in_memory::InMemoryGridStore;
 use automixah_ui_lib::store::sqlite::SqliteGridStore;
 use automixah_ui_lib::store::{GridOverride, GridStoreService};
+use automixah_ui_lib::tracks::Analysis;
 
-// Given an app over a counting in-memory store with a loaded track.
+fn fake_analysis() -> Analysis {
+    Analysis {
+        grid: djcore::analyzer::BeatGrid::default(),
+        bpm: 128.0,
+        key: djcore::key::Key {
+            root: 9,
+            mode: djcore::key::KeyMode::Minor,
+        },
+        duration_seconds: 2.0,
+    }
+}
+
+/// A minimal load outcome (empty PCM) for deck construction.
+fn load_outcome(hash: &str) -> LoadOutcome {
+    LoadOutcome {
+        hash: TrackHash(hash.to_owned()),
+        path: "test.wav".into(),
+        analysis: fake_analysis(),
+        audio: djcore::decoder::DecodeAudio {
+            samples: Vec::new(),
+            sample_rate: 44_100,
+            channels: 2,
+        },
+        peaks: automixah_ui_lib::audio::peaks::Peaks::build(&[], 44_100),
+    }
+}
+
+// Given an app over a counting in-memory store with a loaded deck.
 // When the grid is mutated three times (shift, shift, downbeat).
-// Then exactly three puts flush and the last value round-trips.
+// Then exactly three puts flush.
 #[test]
 fn each_grid_mutation_flushes_one_put() {
     let dir = tempfile::tempdir().expect("temp");
@@ -50,7 +79,7 @@ fn each_grid_mutation_flushes_one_put() {
     };
 
     let mut app = AutomixahUiApp::new(services, automixah_ui_lib::bus::EventBus::without_repaint());
-    app.inject_track_for_test(TrackHash("deadbeef".to_owned()));
+    app.inject_deck_for_test(load_outcome("deadbeef"));
 
     // Mutation 1: shift.
     app.test_shift_grid(0.010);
@@ -78,9 +107,9 @@ async fn sqlite_row_lands_and_round_trips() {
     let hash = TrackHash("cafebabe".to_owned());
     let grid = GridOverride {
         grid_bpm: 140.0,
-        anchor_seconds: 0.123,
+        anchor_seconds: 0.25,
         downbeat_phase: 1,
-        updated_at: 42,
+        updated_at: 7,
         key: None,
     };
 

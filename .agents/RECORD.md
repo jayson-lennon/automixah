@@ -55,14 +55,17 @@ Entries are added or amended **only with human approval**.
 - (ui) automixah-ui is an egui desktop binary for manual beat-grid alignment: Mixxx-style 3-band Bessel waveform, grid editing (BPM/anchor/downbeat phase), and scrub-audition over cpal.
 - (ui) The waveform view pins the playhead at a definable x-position and scrolls the waveform around it; pan clamping allows one screen of over-scroll on each side so track extremes stay previewable.
 - (ui) Scrubbing is velocity-driven varispeed: drag speed sets playback speed (pitch follows, vinyl-style), and the audio thread advances position itself so there are no per-frame seek discontinuities.
-- (ui) Track loading runs off the UI thread (hash → decode → analyze) with progress stages surfaced in the UI; a re-analyze button drops cached analysis and the stored grid and reloads.
+- (ui) Track loading runs off the UI thread (hash → decode → analyze) with progress stages surfaced in the UI; the re-analyze button drops the record's analysis, deletes the stored grid before reloading, and playlist rows reflect the re-analysis automatically.
 - (ui) Grid edits save to the grid library keyed by content hash, with save status surfaced in the UI.
 - (ui) automixah-ui's playlist section (bottom panel) lists playlists and their tracks; rows show BPM, Camelot key colored by harmonic distance to the previous row, and duration.
 - (ui) Track loading enters through the playlist: clicking a ready row loads the track into the grid editor; the Open button is removed.
-- (ui) Playlist analysis runs on a single-worker FIFO queue that decodes, analyzes, persists, and drops PCM; rows show queued/analyzing/ready state.
+- (ui) Playlist analysis runs on a single-worker FIFO queue that decodes, analyzes, persists, and drops PCM; jobs are deduplicated by content hash.
 - (ui) All async and threaded work reports back through a single UI event bus; frontend state is mutated only when applying events.
 - (ui) UI repaints are scheduled by event-bus sends with a 50 ms debounce; each frame drains events under a 10 ms budget before rendering.
-- (ui) Playlist contents load on selection: the view clears and shows a spinner until the load event replaces them; playlist rows carry database-minted ids.
+- (ui) Playlist contents load on selection: the view clears and shows a spinner until the load event replaces them; contents are ordered content-hash lists and store rowids never reach the frontend.
+- (ui) Frontend track knowledge lives in a single track database (content hash → tags, analysis state); playlist rows are ordered hash references and all row display state derives from the database at render time.
+- (ui) Analysis lifecycle events address tracks by content hash; row ids are internal to playlist ordering and never address events.
+- (ui) The editor holds a single optional Deck (media, working grid, engine, scrub, view) for the loaded track; decoded PCM/peaks exist only inside the deck and are dropped on load or re-analyze.
 - (workflow) This repository uses git; commits go through `just commit '<message>'`, checks through `just check`, `just test`, and `just lint`.
 - (analysis) djcore decodes mp3, flac, wav, ogg, aac, opus, and m4a (AAC or ALAC) input via symphonia; opus uses a bundled libopus adapter available on native targets only.
 - (cli) The CLI writes the output WAV at the session sample rate (the first track's rate) rather than a fixed 44.1 kHz.

@@ -25,7 +25,7 @@ pub mod sqlite;
 /// Carries no variants — the failure detail lives in the `error_stack::Report`
 /// context attachments.
 #[derive(Debug, Error)]
-#[error("playlist store error")]
+#[error(debug)]
 pub struct PlaylistStoreError;
 
 /// A playlist row in the `playlists` list.

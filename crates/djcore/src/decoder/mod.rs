@@ -18,7 +18,7 @@ pub use symphonia::SymphoniaDecoder;
 
 /// Error returned when audio decoding fails.
 #[derive(Debug, Error)]
-#[error("audio decode error")]
+#[error(debug)]
 pub struct DecodeError;
 
 /// Decoded audio data: interleaved multi-channel normalized f32 samples.

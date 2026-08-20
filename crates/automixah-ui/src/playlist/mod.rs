@@ -1,73 +1,25 @@
 //! Playlist feature: ordered track lists with load-on-demand contents.
 //!
-//! The module owns the UI-facing row model ([`PlaylistRow`],
-//! [`PlaylistState`]) and its event appliers — the only code that
-//! mutates playlist frontend state. Background tasks send
-//! [`crate::bus::Event`]s; the app drains them each frame and applies
-//! them here. Contents load on selection (clear → spinner → one
-//! replace event); every mutation is a delta event. Row ids are
-//! database-minted (`playlist_tracks.rowid`), so events address rows
-//! stably across loads. Persistence lives in [`store`]; the analysis
+//! The module owns the playlist-ordering state ([`PlaylistState`],
+//! [`Contents`]) and its event appliers — the only code that mutates
+//! playlist ordering. Row identity is the content hash: contents are
+//! ordered hash lists, and store rowids never reach the frontend. All
+//! per-track display state lives in the track database
+//! ([`crate::tracks`]) and is derived at render time; the appliers here
+//! touch ordering only. Background tasks send [`crate::bus::Event`]s;
+//! the app drains them each frame and applies them here. Contents load
+//! on selection (clear → spinner → one replace event); every mutation
+//! is a delta event. Persistence lives in [`store`]; the analysis
 //! worker in [`queue`].
 
 pub mod queue;
 pub mod store;
 pub mod view;
 
-use std::path::PathBuf;
-
 use automixah_engine::timeline::types::TrackHash;
-use djcore::key::Key;
 
 use crate::bus::Event;
-use crate::playlist::queue::RowId;
 use crate::playlist::store::PlaylistSummary;
-
-/// Lifecycle of one playlist row.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RowStatus {
-    /// Waiting for the analysis worker (clock glyph).
-    Queued,
-    /// The worker is running this row's job (spinner).
-    Analyzing,
-    /// Full metadata available; the row is clickable and draggable.
-    Ready,
-    /// The job failed; the message shows in a tooltip.
-    Failed(String),
-}
-
-/// One playlist row in the UI model.
-#[derive(Debug, Clone)]
-pub struct PlaylistRow {
-    /// Database-minted identity (`playlist_tracks.rowid`).
-    pub row_id: RowId,
-    /// Playlist position (matches the store's gapless ordering).
-    pub position: i64,
-    /// Path recorded when the track was added.
-    pub path: PathBuf,
-    /// Content hash, known after analysis (or a store hit).
-    pub hash: Option<TrackHash>,
-    /// Display title.
-    pub title: String,
-    /// Display artist (empty when unknown).
-    pub artist: String,
-    /// BPM once known.
-    pub bpm: Option<f32>,
-    /// Detected key once known.
-    pub key: Option<Key>,
-    /// Duration in seconds once known.
-    pub duration: Option<f32>,
-    /// Lifecycle state.
-    pub status: RowStatus,
-}
-
-impl PlaylistRow {
-    /// `true` when this row can be clicked into the editor or dragged.
-    #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.status == RowStatus::Ready
-    }
-}
 
 /// Load state of the selected playlist's contents.
 ///
@@ -80,8 +32,8 @@ pub enum Contents {
     None,
     /// A contents fetch is in flight (spinner).
     Loading,
-    /// Rows of the selected playlist, position-ordered.
-    Loaded(Vec<PlaylistRow>),
+    /// Content hashes of the selected playlist, position-ordered.
+    Loaded(Vec<TrackHash>),
     /// The fetch failed; the message shows inline.
     Failed(String),
 }
@@ -95,9 +47,9 @@ pub struct PlaylistState {
     pub selected: Option<i64>,
     /// Load state of the selected playlist's contents.
     pub contents: Contents,
-    /// `true` while an add-track task is hashing/probing files (Add
-    /// busy indicator; rows appear on their insert events).
-    pub add_pending: bool,
+    /// Outstanding add-track tasks (Add busy indicator; each terminal
+    /// outcome — added, duplicate-skipped, failed — decrements).
+    pub adds_in_flight: usize,
     /// Inline rename editor (context menu).
     pub rename: RenameEditor,
 }
@@ -177,19 +129,24 @@ pub(crate) fn rename_outcome(
 }
 
 impl PlaylistState {
-    /// `true` while any shown row is queued or analyzing (drives repaint).
+    /// `true` while any shown content hash is queued or analyzing
+    /// (drives repaint).
     #[must_use]
-    pub fn any_pending(&self) -> bool {
-        matches!(&self.contents, Contents::Loaded(rows) if rows
+    pub fn any_pending(&self, tracks: &crate::tracks::Tracks) -> bool {
+        matches!(&self.contents, Contents::Loaded(hashes) if hashes
             .iter()
-            .any(|r| matches!(r.status, RowStatus::Queued | RowStatus::Analyzing)))
+            .any(|h| tracks
+                .get(h)
+                .is_none_or(|r| matches!(r.analysis, crate::tracks::AnalysisState::Queued
+                    | crate::tracks::AnalysisState::Analyzing))))
     }
 
-    /// Applies a bus event to the playlist state.
+    /// Applies a bus event to the playlist ordering state.
     ///
-    /// Stale events (rows or playlists that no longer apply to the
-    /// current selection) are dropped silently — the immediate-mode
-    /// model only ever renders confirmed state.
+    /// Track-record mutations (tags, analysis) belong to the track
+    /// database appliers, not here. Stale events (playlists that no
+    /// longer apply to the current selection) are dropped silently —
+    /// the immediate-mode model only ever renders confirmed state.
     pub fn apply(&mut self, event: &Event) {
         match event {
             Event::PlaylistsLoaded(playlists) => self.playlists = playlists.clone(),
@@ -208,9 +165,13 @@ impl PlaylistState {
                 }
                 self.playlists.retain(|p| p.id != *id);
             }
-            Event::RowsLoaded { playlist_id, rows } => {
+            Event::RowsLoaded {
+                playlist_id,
+                hashes,
+                ..
+            } => {
                 if self.selected == Some(*playlist_id) {
-                    self.contents = Contents::Loaded(rows.clone());
+                    self.contents = Contents::Loaded(hashes.clone());
                 }
             }
             Event::RowsLoadFailed { playlist_id, .. } => {
@@ -218,170 +179,114 @@ impl PlaylistState {
                     self.contents = Contents::Failed("load failed".to_owned());
                 }
             }
-            Event::RowAdded { playlist_id, row } => {
+            Event::RowAdded { playlist_id, hash } => {
                 if self.selected == Some(*playlist_id)
-                    && let Contents::Loaded(rows) = &mut self.contents
+                    && let Contents::Loaded(hashes) = &mut self.contents
+                    && !hashes.contains(hash)
                 {
-                    rows.push(row.clone());
+                    hashes.push(hash.clone());
                 }
+                self.adds_in_flight = self.adds_in_flight.saturating_sub(1);
             }
-            Event::RowRemoved {
-                playlist_id,
-                row_id,
-            } => {
+            Event::RowRemoved { playlist_id, hash } => {
                 if self.selected == Some(*playlist_id)
-                    && let Contents::Loaded(rows) = &mut self.contents
+                    && let Contents::Loaded(hashes) = &mut self.contents
                 {
-                    rows.retain(|r| r.row_id != *row_id);
-                    renumber(rows);
+                    hashes.retain(|h| h != hash);
                 }
             }
             Event::RowsReordered {
                 playlist_id,
-                row_ids,
+                hashes: order,
             } => {
                 if self.selected == Some(*playlist_id)
-                    && let Contents::Loaded(rows) = &mut self.contents
+                    && let Contents::Loaded(hashes) = &mut self.contents
                 {
-                    reorder_by_ids(rows, row_ids);
+                    reorder_by_hashes(hashes, order);
                 }
             }
-            Event::RowAnalyzing { row_id } => set_status(self, *row_id, RowStatus::Analyzing),
-            Event::RowReady { row_id, meta } => apply_ready(self, *row_id, meta),
-            Event::RowFailed { row_id, message } => {
-                set_status(self, *row_id, RowStatus::Failed(message.clone()));
+            Event::DuplicateSkipped { .. } => {
+                self.adds_in_flight = self.adds_in_flight.saturating_sub(1);
             }
-            Event::AddStarted { .. } => self.add_pending = true,
-            Event::DuplicateSkipped { .. } | Event::CommandFailed(_) => {
-                self.add_pending = false;
+            Event::AddStarted { count } => {
+                self.adds_in_flight = self.adds_in_flight.saturating_add(*count);
             }
-            Event::LoadStage(_) | Event::LoadDone(_) | Event::GridSaved(_) => {}
-            Event::GridSaveFailed(_) => {}
+            Event::AddFailed { .. } => {
+                self.adds_in_flight = self.adds_in_flight.saturating_sub(1);
+            }
+            // Track-record events and editor events are applied
+            // elsewhere; ordering has nothing to do with them.
+            Event::TagsResolved { .. }
+            | Event::AnalysisStarted { .. }
+            | Event::AnalysisDone { .. }
+            | Event::AnalysisFailed { .. }
+            | Event::LoadStage(_)
+            | Event::LoadDone(_)
+            | Event::GridSaved { .. }
+            | Event::GridSaveFailed(_)
+            | Event::CommandFailed(_) => {}
         }
     }
 }
 
-/// Marks the addressed row's status, if present.
-fn set_status(state: &mut PlaylistState, row_id: RowId, status: RowStatus) {
-    if let Contents::Loaded(rows) = &mut state.contents
-        && let Some(row) = rows.iter_mut().find(|r| r.row_id == row_id)
-    {
-        row.status = status;
-    }
-}
-
-/// Applies a ready event: metadata plus status.
-fn apply_ready(state: &mut PlaylistState, row_id: RowId, meta: &crate::playlist::queue::TrackMeta) {
-    let Contents::Loaded(rows) = &mut state.contents else {
-        return;
-    };
-    let Some(row) = rows.iter_mut().find(|r| r.row_id == row_id) else {
-        return;
-    };
-    row.hash = Some(meta.hash.clone());
-    row.bpm = Some(meta.bpm);
-    row.key = Some(meta.key.clone());
-    if meta.duration_seconds > 0.0 {
-        row.duration = Some(meta.duration_seconds);
-    }
-    row.status = RowStatus::Ready;
-}
-
-/// Rewrites `position` to the row's index (gapless 0-based).
-fn renumber(rows: &mut [PlaylistRow]) {
-    for (i, row) in rows.iter_mut().enumerate() {
-        row.position = i64::try_from(i).unwrap_or(i64::MAX);
-    }
-}
-
-/// Reorders rows into the given id order (the store's confirmed order).
-///
-/// Unknown ids (stale confirmations) are ignored; the row set is
+/// Reorders contents into the given hash order (the store's confirmed
+/// order). Unknown hashes (stale confirmations) are ignored; the set is
 /// unchanged.
-fn reorder_by_ids(rows: &mut Vec<PlaylistRow>, row_ids: &[RowId]) {
-    let mut next = Vec::with_capacity(rows.len());
-    for id in row_ids {
-        if let Some(row) = rows.iter().find(|r| r.row_id == *id) {
-            next.push(row.clone());
+fn reorder_by_hashes(hashes: &mut Vec<TrackHash>, order: &[TrackHash]) {
+    let mut next = Vec::with_capacity(hashes.len());
+    for hash in order {
+        if hashes.contains(hash) {
+            next.push(hash.clone());
         }
     }
-    if next.len() == rows.len() {
-        *rows = next;
-        renumber(rows);
+    if next.len() == hashes.len() {
+        *hashes = next;
     }
 }
 
-/// Splices a row to a new index and renumbers positions 0..n.
+/// Splices a hash to a new index in the contents.
 ///
-/// Returns the moved row's new position; `None` when either id is
+/// Returns the moved entry's new index; `None` when either hash is
 /// unknown (stale drag) or the indices coincide.
-pub fn move_row(state: &mut PlaylistState, from: RowId, to: RowId) -> Option<i64> {
-    let Contents::Loaded(rows) = &mut state.contents else {
+pub fn move_row(state: &mut PlaylistState, from: &TrackHash, to: &TrackHash) -> Option<usize> {
+    let Contents::Loaded(hashes) = &mut state.contents else {
         return None;
     };
-    let from_idx = rows.iter().position(|r| r.row_id == from)?;
-    let to_idx = rows.iter().position(|r| r.row_id == to)?;
+    let from_idx = hashes.iter().position(|h| h == from)?;
+    let to_idx = hashes.iter().position(|h| h == to)?;
     if from_idx == to_idx {
-        return Some(rows[from_idx].position);
+        return Some(from_idx);
     }
-    let row = rows.remove(from_idx);
-    rows.insert(to_idx, row);
-    renumber(rows);
-    Some(rows[to_idx].position)
+    let hash = hashes.remove(from_idx);
+    hashes.insert(to_idx, hash);
+    Some(to_idx)
 }
 
-/// Removes a row by id, renumbering the survivors.
+/// Removes a hash from the contents.
 ///
-/// Returns `(position, path)` needed for the store's position-addressed
-/// remove; `None` when the id is unknown.
-pub fn remove_row(state: &mut PlaylistState, row: RowId) -> Option<(i64, PathBuf)> {
-    let Contents::Loaded(rows) = &mut state.contents else {
+/// Returns the removed hash's index for the store's position-addressed
+/// remove; `None` when the hash is unknown.
+pub fn remove_row(state: &mut PlaylistState, hash: &TrackHash) -> Option<usize> {
+    let Contents::Loaded(hashes) = &mut state.contents else {
         return None;
     };
-    let idx = rows.iter().position(|r| r.row_id == row)?;
-    let removed = rows.remove(idx);
-    renumber(rows);
-    Some((removed.position, removed.path))
+    let idx = hashes.iter().position(|h| h == hash)?;
+    hashes.remove(idx);
+    Some(idx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Ready row with predictable path `/row-<id>`, gapless position.
-    fn row(id: i64) -> PlaylistRow {
-        PlaylistRow {
-            row_id: RowId(id),
-            position: id - 1,
-            path: PathBuf::from(format!("/row-{id}")),
-            hash: None,
-            title: format!("T{id}"),
-            artist: String::new(),
-            bpm: None,
-            key: None,
-            duration: None,
-            status: RowStatus::Ready,
-        }
+    fn hash(id: u32) -> TrackHash {
+        TrackHash(format!("h{id}"))
     }
 
-    fn meta(id: u32) -> crate::playlist::queue::TrackMeta {
-        crate::playlist::queue::TrackMeta {
-            hash: TrackHash(format!("h{id}")),
-            bpm: 128.0,
-            key: djcore::key::Key {
-                root: 9,
-                mode: djcore::key::KeyMode::Minor,
-            },
-            duration_seconds: 61.5,
-            title: format!("T{id}"),
-            artist: String::new(),
-        }
-    }
-
-    fn loaded(rows: Vec<PlaylistRow>) -> PlaylistState {
+    fn loaded(hashes: Vec<TrackHash>) -> PlaylistState {
         PlaylistState {
             selected: Some(7),
-            contents: Contents::Loaded(rows),
+            contents: Contents::Loaded(hashes),
             ..Default::default()
         }
     }
@@ -399,10 +304,11 @@ mod tests {
 
         state.apply(&Event::RowsLoaded {
             playlist_id: 3,
-            rows: vec![row(11)],
+            hashes: vec![hash(1)],
+            records: Vec::new(),
         });
 
-        assert!(matches!(state.contents, Contents::Loaded(ref r) if r.len() == 1));
+        assert!(matches!(&state.contents, Contents::Loaded(h) if h.len() == 1));
     }
 
     // Given a selected playlist.
@@ -418,86 +324,33 @@ mod tests {
 
         state.apply(&Event::RowsLoaded {
             playlist_id: 4,
-            rows: vec![row(11)],
+            hashes: vec![hash(1)],
+            records: Vec::new(),
         });
 
         assert!(matches!(state.contents, Contents::Loading));
     }
 
-    // Given rows with database ids 1 and 2.
-    // When a row-added event carries id 3.
-    // Then the new id is disjoint from the loaded ones (no collision).
+    // Given a loaded playlist.
+    // When a row-added event carries a new hash.
+    // Then the hash appends exactly once.
     #[test]
-    fn rows_loaded_carries_db_rowids_disjoint_from_added() {
-        let mut state = loaded(vec![row(1), row(2)]);
+    fn row_added_appends_hash_once() {
+        let mut state = loaded(vec![hash(1), hash(2)]);
 
         state.apply(&Event::RowAdded {
             playlist_id: 7,
-            row: row(3),
+            hash: hash(3),
+        });
+        state.apply(&Event::RowAdded {
+            playlist_id: 7,
+            hash: hash(3),
         });
 
-        let Contents::Loaded(rows) = state.contents else {
+        let Contents::Loaded(hashes) = state.contents else {
             panic!("loaded");
         };
-        let ids: Vec<i64> = rows.iter().map(|r| r.row_id.0).collect();
-        assert_eq!(ids, vec![1, 2, 3], "appended, disjoint");
-    }
-
-    // Given a loaded playlist.
-    // When a ready event addresses the second row.
-    // Then only that row changes.
-    #[test]
-    fn add_track_leaves_other_rows_untouched() {
-        let mut state = loaded(vec![row(1), row(2)]);
-
-        state.apply(&Event::RowReady {
-            row_id: RowId(2),
-            meta: meta(2),
-        });
-
-        let Contents::Loaded(rows) = state.contents else {
-            panic!("loaded");
-        };
-        assert_eq!(rows[0].title, "T1", "first row untouched");
-        assert!(rows[0].duration.is_none(), "first row metadata untouched");
-        assert_eq!(rows[1].title, "T2");
-        assert!(rows[1].duration.is_some(), "second row hydrated");
-    }
-
-    // Given no playlists.
-    // When one created event arrives.
-    // Then exactly one entry exists.
-    #[test]
-    fn create_playlist_appends_exactly_once() {
-        let mut state = PlaylistState::default();
-
-        state.apply(&Event::PlaylistCreated(PlaylistSummary {
-            id: 1,
-            name: "p".to_owned(),
-        }));
-
-        assert_eq!(state.playlists.len(), 1);
-    }
-
-    // Given a rename event.
-    // When applied.
-    // Then the list reflects the new name.
-    #[test]
-    fn playlist_renamed_updates_list() {
-        let mut state = PlaylistState {
-            playlists: vec![PlaylistSummary {
-                id: 5,
-                name: String::from("old"),
-            }],
-            ..Default::default()
-        };
-
-        state.apply(&Event::PlaylistRenamed {
-            id: 5,
-            name: "new".to_owned(),
-        });
-
-        assert_eq!(state.playlists[0].name, "new");
+        assert_eq!(hashes.len(), 3, "duplicate add is a no-op on contents");
     }
 
     fn rename_editor(id: i64, buffer: &str) -> RenameEditor {
@@ -598,7 +451,7 @@ mod tests {
     // Then selection clears and contents reset.
     #[test]
     fn playlist_deleted_clears_selection_when_selected() {
-        let mut state = loaded(vec![row(1)]);
+        let mut state = loaded(vec![hash(1)]);
         state.playlists = vec![PlaylistSummary {
             id: 7,
             name: "p".to_owned(),
@@ -612,139 +465,119 @@ mod tests {
 
     // Given three rows.
     // When the first is moved onto the third.
-    // Then order becomes 2,3,1 and positions renumber 0..2.
+    // Then order becomes 2,3,1.
     #[test]
-    fn move_row_splices_and_renumbers() {
-        let mut state = loaded(vec![row(1), row(2), row(3)]);
+    fn move_row_splices_by_hash() {
+        let mut state = loaded(vec![hash(1), hash(2), hash(3)]);
 
-        let _ = move_row(&mut state, RowId(1), RowId(3));
+        let _ = move_row(&mut state, &hash(1), &hash(3));
 
-        let Contents::Loaded(rows) = state.contents else {
+        let Contents::Loaded(hashes) = state.contents else {
             panic!("loaded");
         };
-        let ids: Vec<i64> = rows.iter().map(|r| r.row_id.0).collect();
-        assert_eq!(ids, vec![2, 3, 1], "spliced order");
-        let positions: Vec<i64> = rows.iter().map(|r| r.position).collect();
-        assert_eq!(positions, vec![0, 1, 2], "gapless renumber");
+        assert_eq!(hashes, vec![hash(2), hash(3), hash(1)], "spliced order");
     }
 
     // Given rows and an unknown drag source.
     // When moved.
     // Then nothing changes and None returns.
     #[test]
-    fn move_row_with_unknown_id_is_ignored() {
-        let mut state = loaded(vec![row(1), row(2)]);
+    fn move_row_with_unknown_hash_is_ignored() {
+        let mut state = loaded(vec![hash(1), hash(2)]);
 
-        let result = move_row(&mut state, RowId(99), RowId(1));
+        let result = move_row(&mut state, &hash(99), &hash(1));
 
         assert!(result.is_none());
-        let Contents::Loaded(rows) = state.contents else {
+        let Contents::Loaded(hashes) = state.contents else {
             panic!("loaded");
         };
-        assert_eq!(rows.len(), 2, "untouched");
+        assert_eq!(hashes.len(), 2, "untouched");
     }
 
     // Given three rows.
     // When the middle one is removed.
-    // Then survivors renumber gaplessly and the store tuple returns.
+    // Then the store tuple (index) returns and the hash is gone.
     #[test]
-    fn remove_row_renumbers_survivors() {
-        let mut state = loaded(vec![row(1), row(2), row(3)]);
+    fn remove_row_returns_index_and_splices() {
+        let mut state = loaded(vec![hash(1), hash(2), hash(3)]);
 
-        let (position, path) = remove_row(&mut state, RowId(2)).expect("remove");
+        let idx = remove_row(&mut state, &hash(2)).expect("remove");
 
-        assert_eq!(position, 1, "stored position of the removed row");
-        assert_eq!(path, PathBuf::from("/row-2"));
-        let Contents::Loaded(rows) = state.contents else {
+        assert_eq!(idx, 1, "stored position of the removed row");
+        let Contents::Loaded(hashes) = state.contents else {
             panic!("loaded");
         };
-        let ids: Vec<i64> = rows.iter().map(|r| r.row_id.0).collect();
-        assert_eq!(ids, vec![1, 3]);
-        let positions: Vec<i64> = rows.iter().map(|r| r.position).collect();
-        assert_eq!(positions, vec![0, 1], "gapless");
+        assert_eq!(hashes, vec![hash(1), hash(3)]);
     }
 
-    // Given a reorder confirmation carrying the new id order.
+    // Given a reorder confirmation carrying the new hash order.
     // When applied.
-    // Then rows follow it exactly.
+    // Then contents follow it exactly.
     #[test]
     fn rows_reordered_follows_confirmed_order() {
-        let mut state = loaded(vec![row(1), row(2), row(3)]);
+        let mut state = loaded(vec![hash(1), hash(2), hash(3)]);
 
         state.apply(&Event::RowsReordered {
             playlist_id: 7,
-            row_ids: vec![RowId(3), RowId(1), RowId(2)],
+            hashes: vec![hash(3), hash(1), hash(2)],
         });
 
-        let Contents::Loaded(rows) = state.contents else {
+        let Contents::Loaded(hashes) = state.contents else {
             panic!("loaded");
         };
-        let ids: Vec<i64> = rows.iter().map(|r| r.row_id.0).collect();
-        assert_eq!(ids, vec![3, 1, 2]);
+        assert_eq!(hashes, vec![hash(3), hash(1), hash(2)]);
     }
 
-    // Given no playlist selected.
-    // When selection begins and its load completes.
-    // Then contents transition None → Loading → Loaded in order.
+    // Given a batch of adds where every task succeeds.
+    // When the last row-added applies.
+    // Then the in-flight count reaches zero (spinner cleared).
     #[test]
-    fn select_then_load_transitions_contents() {
-        let mut state = PlaylistState {
-            selected: Some(2),
-            contents: Contents::Loading,
-            ..PlaylistState::default()
-        };
+    fn successful_add_batch_reaches_zero_in_flight() {
+        let mut state = PlaylistState::default();
+        state.apply(&Event::AddStarted { count: 3 });
 
-        state.apply(&Event::RowsLoaded {
-            playlist_id: 2,
-            rows: vec![row(1)],
+        for id in 1..=3 {
+            state.apply(&Event::RowAdded {
+                playlist_id: 1,
+                hash: hash(id),
+            });
+        }
+
+        assert_eq!(state.adds_in_flight, 0, "spinner cleared");
+    }
+
+    // Given a batch with one failure and one duplicate skip.
+    // When the terminal events apply.
+    // Then the count still reaches zero.
+    #[test]
+    fn mixed_add_outcomes_reach_zero_in_flight() {
+        let mut state = PlaylistState::default();
+        state.apply(&Event::AddStarted { count: 3 });
+        state.apply(&Event::RowAdded {
+            playlist_id: 1,
+            hash: hash(1),
+        });
+        state.apply(&Event::DuplicateSkipped {
+            playlist_id: 1,
+            path: "/x".to_owned(),
+        });
+        state.apply(&Event::AddFailed {
+            message: "read failed".to_owned(),
         });
 
-        assert!(matches!(state.contents, Contents::Loaded(rows) if rows.len() == 1));
+        assert_eq!(state.adds_in_flight, 0, "every terminal decremented");
     }
 
-    // Given rows from a contents load where some are incomplete.
-    // When they are converted from persisted form.
-    // Then each incomplete row carries a re-enqueue job (app-level
-    // derivation is driven by this contract; see `rows_from_persisted`).
+    // Given an unrelated command failure while adds are in flight.
+    // When it applies.
+    // Then the in-flight count is untouched.
     #[test]
-    fn rows_from_persisted_marks_incomplete_for_reenqueue() {
-        use crate::playlist::store::PersistedTrack;
-        let complete = PersistedTrack {
-            id: 1,
-            position: 0,
-            track_hash: TrackHash("done".to_owned()),
-            title: "T".to_owned(),
-            artist: "A".to_owned(),
-            added_path: "/done".to_owned(),
-            duration: Some(60.0),
-            grid: Some(crate::store::GridOverride {
-                grid_bpm: 128.0,
-                anchor_seconds: 0.0,
-                downbeat_phase: 0,
-                updated_at: 0,
-                key: Some(djcore::key::Key {
-                    root: 9,
-                    mode: djcore::key::KeyMode::Minor,
-                }),
-            }),
-        };
-        let incomplete = PersistedTrack {
-            id: 2,
-            position: 1,
-            track_hash: TrackHash("todo".to_owned()),
-            title: "T2".to_owned(),
-            artist: "A2".to_owned(),
-            added_path: "/todo".to_owned(),
-            duration: None,
-            grid: None,
-        };
+    fn command_failed_never_touches_add_count() {
+        let mut state = PlaylistState::default();
+        state.apply(&Event::AddStarted { count: 2 });
 
-        let (rows, reenqueue) =
-            crate::app::rows_from_persisted_for_test(vec![complete, incomplete]);
+        state.apply(&Event::CommandFailed("create playlist: boom".to_owned()));
 
-        assert_eq!(rows.len(), 2);
-        assert_eq!(reenqueue.len(), 1, "only the incomplete row re-enqueues");
-        assert_eq!(reenqueue[0].0, RowId(2));
-        assert!(matches!(rows[1].status, RowStatus::Queued));
+        assert_eq!(state.adds_in_flight, 2, "unrelated failure ignored");
     }
 }

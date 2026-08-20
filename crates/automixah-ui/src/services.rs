@@ -56,7 +56,7 @@ impl AppPaths {
 
 /// Error when application paths cannot be resolved.
 #[derive(Debug, wherror::Error)]
-#[error("app paths error")]
+#[error(debug)]
 pub struct AppPathsError;
 
 /// The application-wide service container.

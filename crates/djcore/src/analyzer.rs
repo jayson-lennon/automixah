@@ -17,7 +17,7 @@ use stratum_dsp::{AnalysisConfig, Key as StratumKey};
 
 /// Errors that can occur during audio analysis.
 #[derive(Debug, Error)]
-#[error("audio analysis error")]
+#[error(debug)]
 pub struct AnalyzerError;
 
 /// Beat grid extracted from a track.

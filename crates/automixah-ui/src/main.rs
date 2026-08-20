@@ -12,12 +12,12 @@ use automixah_ui_lib::store::sqlite::SqliteGridStore;
 use error_stack::{Report, ResultExt as _};
 
 #[derive(Debug, wherror::Error)]
-#[error("automixah ui error")]
+#[error(debug)]
 pub struct UiError;
 
 fn main() {
     if let Err(report) = run() {
-        eprintln!("error: {report:#}");
+        eprintln!("error: {report:#?}");
         std::process::exit(1);
     }
 }
@@ -28,7 +28,9 @@ fn main() {
 /// final `Services` is immutable and the tokio runtime never escapes.
 fn run() -> Result<(), Report<UiError>> {
     let services = {
-        let paths = AppPaths::resolve().change_context(UiError)?;
+        let paths = AppPaths::resolve()
+            .change_context(UiError)
+            .attach("failed to resolve application paths")?;
 
         // Arc'd so the runtime outlives this block: the app spawns
         // load/save tasks for the whole session via `Services::runtime`.

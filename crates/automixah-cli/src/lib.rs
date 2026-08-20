@@ -19,7 +19,7 @@ use djcore::decoder::{DecodeAudio, DecoderRegistry};
 
 /// Errors surfaced by the CLI pipeline.
 #[derive(Debug, Error)]
-#[error("automixah cli error")]
+#[error(debug)]
 pub struct CliError;
 
 /// How the session maps track tempos.

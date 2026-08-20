@@ -7,6 +7,13 @@
 //! event; waiting is expressed in the frontend's state enums, rendered
 //! as spinners.
 //!
+//! Event dialects: **track events** (`TagsResolved`, `AnalysisStarted`,
+//! `AnalysisDone`, `AnalysisFailed`) address tracks by content hash and
+//! mutate records in the track database. **Playlist events** mutate
+//! ordering only — store rowids never cross this bus. Analysis events
+//! serve every playlist row referencing the hash, so one analysis pass
+//! covers all references.
+//!
 //! Timing contract: a send schedules a repaint no later than
 //! [`DEBOUNCE`] later (bursts coalesce into one window), and each frame
 //! drains for at most [`DRAIN_BUDGET`] before rendering with whatever
@@ -19,10 +26,11 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::audio::peaks::Peaks;
-use crate::playlist::PlaylistRow;
-use crate::playlist::queue::{RowId, TrackMeta};
 use crate::playlist::store::PlaylistSummary;
-use crate::track::{LoadStage, LoadedTrack};
+use crate::track::LoadStage;
+use crate::tracks::{Analysis, TrackRecord, TrackTags};
+use automixah_engine::timeline::types::TrackHash;
+use djcore::decoder::DecodeAudio;
 
 /// Repaint debounce window after a send.
 pub const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -30,18 +38,45 @@ pub const DEBOUNCE: Duration = Duration::from_millis(50);
 /// Per-frame drain budget before rendering continues.
 pub const DRAIN_BUDGET: Duration = Duration::from_millis(10);
 
+/// Terminal outcome of an editor load: everything a fresh [`Deck`] needs.
+#[derive(Debug)]
+pub struct LoadOutcome {
+    /// Identity of the loaded content.
+    pub hash: TrackHash,
+    /// Source file path (the re-analyze reload source).
+    pub path: std::path::PathBuf,
+    /// The analysis package as persisted/loaded for this content.
+    pub analysis: Analysis,
+    /// Decoded interleaved PCM.
+    pub audio: DecodeAudio,
+    /// Visual peaks for the waveform.
+    pub peaks: Peaks,
+}
+
 /// One confirmed outcome from a background task or worker thread.
 pub enum Event {
     // Editor load pipeline (hash → decode → analyze → peaks).
     /// A load stage transition (drives the status line / editor spinner).
     LoadStage(LoadStage),
-    /// Terminal load outcome; the boxed pair keeps the event small.
-    LoadDone(Box<Result<(LoadedTrack, Peaks), String>>),
+    /// Terminal load outcome; the boxed payload keeps the event small.
+    LoadDone(Box<Result<LoadOutcome, String>>),
     // Grid saves (debounced flush outcomes).
-    /// A manual grid edit was persisted; the string names the hash.
-    GridSaved(String),
+    /// A manual grid edit was persisted; the grid refreshes the record.
+    GridSaved {
+        hash: TrackHash,
+        grid: crate::grid::EditableGrid,
+    },
     /// A grid save failed; the string carries the rendered report.
     GridSaveFailed(String),
+    // Track events (address tracks by content hash; mutate records).
+    /// Tags resolved for a hash (add-task or hydration).
+    TagsResolved { hash: TrackHash, tags: TrackTags },
+    /// Analysis started for a hash (never sent on a store fast path).
+    AnalysisStarted { hash: TrackHash },
+    /// Analysis known for a hash (freshly detected or a store fast path).
+    AnalysisDone { hash: TrackHash, analysis: Analysis },
+    /// Analysis failed for a hash; the message shows in the row tooltip.
+    AnalysisFailed { hash: TrackHash, message: String },
     // Playlist list (one load at startup; deltas afterwards).
     /// The full playlist list, sent once at startup.
     PlaylistsLoaded(Vec<PlaylistSummary>),
@@ -52,12 +87,15 @@ pub enum Event {
     /// A playlist was deleted.
     PlaylistDeleted(i64),
     // Playlist contents (fetched on selection).
-    /// The selected playlist's rows, ready to replace the view.
+    /// The selected playlist's contents: ordered hashes plus hydrated
+    /// track records for any hash the stores know about.
     RowsLoaded {
         /// Which playlist the rows belong to.
         playlist_id: i64,
-        /// Rows in position order, ids minted by the store.
-        rows: Vec<PlaylistRow>,
+        /// Content hashes in position order.
+        hashes: Vec<TrackHash>,
+        /// Hydrated records (tags + store-known analysis).
+        records: Vec<TrackRecord>,
     },
     /// A contents fetch failed.
     RowsLoadFailed {
@@ -66,27 +104,15 @@ pub enum Event {
         /// Rendered error report.
         message: String,
     },
-    // Row deltas.
-    /// A track was inserted into a playlist (id minted by the store).
-    RowAdded {
-        /// Which playlist gained the row.
-        playlist_id: i64,
-        /// The inserted row, queued or ready.
-        row: PlaylistRow,
-    },
+    // Ordering deltas (row identity is the content hash).
+    /// A track was inserted into a playlist.
+    RowAdded { playlist_id: i64, hash: TrackHash },
     /// A row was removed from a playlist.
-    RowRemoved {
-        /// Which playlist lost the row.
-        playlist_id: i64,
-        /// Store id of the removed row.
-        row_id: RowId,
-    },
-    /// Rows were reordered; the slice is the new id order.
+    RowRemoved { playlist_id: i64, hash: TrackHash },
+    /// Rows were reordered; the slice is the new order.
     RowsReordered {
-        /// Which playlist was reordered.
         playlist_id: i64,
-        /// New id order, position 0 first.
-        row_ids: Vec<RowId>,
+        hashes: Vec<TrackHash>,
     },
     /// An add was skipped because the content is already in the playlist.
     DuplicateSkipped {
@@ -95,35 +121,15 @@ pub enum Event {
         /// The file that was skipped.
         path: String,
     },
-    /// An add-track task batch started (drives the Add busy indicator;
-    /// clears on the batch's last RowAdded/DuplicateSkipped/CommandFailed).
+    /// An add-track task batch started (opens the in-flight count window).
     AddStarted {
-        /// Which playlist the add targets.
-        playlist_id: i64,
         /// Files picked in the batch.
         count: usize,
     },
-    // Analysis queue (addressed by store rowid).
-    /// The worker started this row's job (spinner state).
-    RowAnalyzing {
-        /// Row that moved to analyzing.
-        row_id: RowId,
-    },
-    /// The row is ready: analysis (or a library hit) produced metadata.
-    RowReady {
-        /// Row that became ready.
-        row_id: RowId,
-        /// Full metadata for the row.
-        meta: TrackMeta,
-    },
-    /// The row's analysis failed; the message shows in a tooltip.
-    RowFailed {
-        /// Row that failed.
-        row_id: RowId,
-        /// Rendered error report.
-        message: String,
-    },
-    /// A fire-and-forget command failed (former silent `let _ =` writes).
+    /// An add-track task failed (its terminal event; distinct from
+    /// `CommandFailed` so the in-flight count is never corrupted).
+    AddFailed { message: String },
+    /// A fire-and-forget command failed.
     CommandFailed(String),
 }
 
@@ -137,10 +143,30 @@ impl std::fmt::Debug for Event {
                 .field("ok", &boxed.is_ok())
                 .finish_non_exhaustive(),
             Self::LoadStage(stage) => f.debug_tuple("LoadStage").field(stage).finish(),
-            Self::GridSaved(hash) => f.debug_tuple("GridSaved").field(hash).finish(),
+            Self::GridSaved { hash, .. } => f
+                .debug_struct("GridSaved")
+                .field("hash", &hash)
+                .finish_non_exhaustive(),
             Self::GridSaveFailed(message) => {
                 f.debug_tuple("GridSaveFailed").field(message).finish()
             }
+            Self::TagsResolved { hash, .. } => f
+                .debug_struct("TagsResolved")
+                .field("hash", hash)
+                .finish_non_exhaustive(),
+            Self::AnalysisStarted { hash } => f
+                .debug_struct("AnalysisStarted")
+                .field("hash", hash)
+                .finish(),
+            Self::AnalysisDone { hash, .. } => f
+                .debug_struct("AnalysisDone")
+                .field("hash", hash)
+                .finish_non_exhaustive(),
+            Self::AnalysisFailed { hash, message } => f
+                .debug_struct("AnalysisFailed")
+                .field("hash", hash)
+                .field("message", message)
+                .finish(),
             Self::PlaylistsLoaded(playlists) => {
                 f.debug_tuple("PlaylistsLoaded").field(playlists).finish()
             }
@@ -153,10 +179,15 @@ impl std::fmt::Debug for Event {
                 .field("name", name)
                 .finish(),
             Self::PlaylistDeleted(id) => f.debug_tuple("PlaylistDeleted").field(id).finish(),
-            Self::RowsLoaded { playlist_id, rows } => f
+            Self::RowsLoaded {
+                playlist_id,
+                hashes,
+                records,
+            } => f
                 .debug_struct("RowsLoaded")
                 .field("playlist_id", playlist_id)
-                .field("rows", rows)
+                .field("hashes", hashes)
+                .field("records", records)
                 .finish(),
             Self::RowsLoadFailed {
                 playlist_id,
@@ -166,50 +197,33 @@ impl std::fmt::Debug for Event {
                 .field("playlist_id", playlist_id)
                 .field("message", message)
                 .finish(),
-            Self::RowAdded { playlist_id, row } => f
+            Self::RowAdded { playlist_id, hash } => f
                 .debug_struct("RowAdded")
                 .field("playlist_id", playlist_id)
-                .field("row", row)
+                .field("hash", hash)
                 .finish(),
-            Self::RowRemoved {
-                playlist_id,
-                row_id,
-            } => f
+            Self::RowRemoved { playlist_id, hash } => f
                 .debug_struct("RowRemoved")
                 .field("playlist_id", playlist_id)
-                .field("row_id", row_id)
+                .field("hash", hash)
                 .finish(),
             Self::RowsReordered {
                 playlist_id,
-                row_ids,
+                hashes,
             } => f
                 .debug_struct("RowsReordered")
                 .field("playlist_id", playlist_id)
-                .field("row_ids", row_ids)
+                .field("hashes", hashes)
                 .finish(),
             Self::DuplicateSkipped { playlist_id, path } => f
                 .debug_struct("DuplicateSkipped")
                 .field("playlist_id", playlist_id)
                 .field("path", path)
                 .finish(),
-            Self::AddStarted { playlist_id, count } => f
-                .debug_struct("AddStarted")
-                .field("playlist_id", playlist_id)
-                .field("count", count)
-                .finish(),
-            Self::RowAnalyzing { row_id } => f
-                .debug_struct("RowAnalyzing")
-                .field("row_id", row_id)
-                .finish(),
-            Self::RowReady { row_id, .. } => f
-                .debug_struct("RowReady")
-                .field("row_id", row_id)
-                .finish_non_exhaustive(),
-            Self::RowFailed { row_id, message } => f
-                .debug_struct("RowFailed")
-                .field("row_id", row_id)
-                .field("message", message)
-                .finish(),
+            Self::AddStarted { count } => {
+                f.debug_struct("AddStarted").field("count", count).finish()
+            }
+            Self::AddFailed { message } => f.debug_tuple("AddFailed").field(message).finish(),
             Self::CommandFailed(message) => f.debug_tuple("CommandFailed").field(message).finish(),
         }
     }

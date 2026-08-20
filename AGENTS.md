@@ -93,9 +93,33 @@ let services = {
 
 ### Threading Boundaries
 
-- **Never block the UI thread.** File I/O, hashing, decoding, and analysis run on `spawn_blocking`; the UI polls a channel for progress stages.
+- **Never block the UI thread.** File I/O, hashing, decoding, and analysis run on `spawn_blocking`; results land on the bus.
 - **The audio callback is a real-time boundary.** It reads shared state via `parking_lot` locks kept tiny; treat allocation and long work there as bugs to fix when touched.
-- Cross-thread results are plain messages (`LoadEvent`, `SaveOutcome`), not callbacks.
+- Cross-thread results are plain bus events (the single `Event` enum), never callbacks — see “Frontend State & Messaging” below.
+
+### Frontend State & Messaging
+
+The egui frontend is immediate-mode — what renders is a function of state, every frame. Each rule below was learned from a shipped bug; follow them when touching `automixah-ui`.
+
+- **Messages address stable identities, never structural indexes.** The content hash is a track's identity everywhere — store key, playlist reference, and event target. Rowids, positions, and `Vec` indexes are implementation details of the structure that owns them; no other task can know them, so they never appear in events or cross-module signatures.
+- **Each fact lives in exactly one place; everything else derives.** Track facts (tags, analysis state) live only in the track database keyed by hash; playlist contents are ordered hash lists. Display state (glyph, metadata, interactivity) is computed at render time from the record. If two structures can disagree, one of them is wrong.
+- **Compute display state at render time.** The view reads `(row, record)` and derives what to paint. A status field copied onto rows or poked by event handlers is a cache that drifts.
+- **One event dialect, one mutation path.** Every async outcome reports through the single bus as an `Event`; frontend state mutates only in the event applier. Two pipelines speaking two dialects for the same data is the bug — unify the dialect rather than bridging it.
+- **The session is authoritative over the store.** Store reads fill absent records only; they never overwrite live or in-flight state. A user action that discards data discards it in memory first — the display follows automatically because it derives.
+- **Count outstanding async work (`usize`), clear on every terminal outcome.** A task counter increments when work starts and decrements on every way it can end — success, skip, and failure alike.
+- **One analysis pass per hash.** Analysis is CPU-heavy and serialized on a single worker; workers drop PCM and only the loaded deck holds decoded audio. Route one user action through one pipeline, never two.
+
+### Frontend Anti-Patterns
+
+Do not do these. Each one has shipped as a bug.
+
+- **Do not address events by rowid, position, or index.** Tasks outside the owning structure cannot know them; use the content hash.
+- **Do not cache display state on rows** (status enums, copied BPM/key/duration fields). Derive it at render from the track record.
+- **Do not mutate frontend state outside the event applier.** Not from spawned tasks, not from render code, not from gesture handlers — emit an event or an action.
+- **Do not let store reads overwrite session state.** Session truth wins; reads fill gaps only.
+- **Do not duplicate a helper across files.** Hashing, tag resolution, and path extension live in `track::identity`; every call site consumes it.
+- **Do not construct `StratumAnalyzer` directly.** Analysis runs through `services.analyzer` so the whole app is fake-analyzer testable (the sole construction site is the DI assembly in `main`).
+- **Do not keep a second copy of a pipeline.** One load path, one analysis path; a "convenience" synchronous duplicate rots.
 
 ### Numeric & Time Conventions
 
@@ -154,7 +178,7 @@ Locate concerns by convention, not hardcoded paths — `grep`/`rg` for the curre
 2. **Decode/analyze change** → `djcore/src` (`decoder/`, `analyzer.rs`).
 3. **Transition/placement change** → `automixah-engine/src/timeline` (planning) and `render` (mixdown).
 4. **New persisted data** → add a store trait method + SQLite migration (`_migrations` versioning) + in-memory impl, then wire through `Services`.
-5. **UI change** → `automixah-ui/src`: `view/` (waveform, grid overlay), `audio/` (output, scrub), `app.rs` (wiring/gestures).
+5. **UI change** → `automixah-ui/src`: `tracks.rs` (track database), `playlist/` (ordering, queue, panel view), `deck.rs` (loaded media/playback), `bus.rs` (event dialect), `view/` (waveform, grid overlay), `audio/` (output, scrub), `app.rs` (wiring + event applier).
 6. **Write tests** per §4 — a unit test next to the module, an integration test for cross-crate behavior.
 7. **Update `.agents/RECORD.md`** only via the Record Updates mechanism (human-approved, at end of implementation).
 

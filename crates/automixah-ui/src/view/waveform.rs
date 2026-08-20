@@ -1,9 +1,12 @@
-//! The scrollable, zoomable 3-band waveform view (Mixxx-style).
+//! The scrollable, zoomable 3-band waveform view (Mixxx-style), plus
+//! the deck panel: the full waveform + grid + gesture surface for the
+//! loaded [`crate::deck::Deck`].
 
 use eframe::egui;
 use eframe::egui::{Color32, Painter, Pos2, Rect, Response, Sense, Vec2};
 
 use crate::audio::peaks::{PeakQuartet, Peaks};
+use crate::deck::{Deck, DragMode};
 
 /// Zoom range in frames per pixel: near-sample level (4) to overview.
 pub const FRAMES_PER_PIXEL_MIN: f32 = 4.0;
@@ -222,6 +225,185 @@ fn band_heights(q: &PeakQuartet, half_h: f32) -> [f32; 3] {
         if q.all > 0 { h.max(1.0) } else { h }
     };
     [v(q.low), v(q.mid), v(q.high)]
+}
+
+/// Ends the drag gesture and releases the confined cursor.
+fn end_drag_gesture(ui: &egui::Ui, deck: &mut Deck) {
+    deck.drag_mode = DragMode::None;
+    deck.drag_last_x = None;
+    deck.drag_view_frame = None;
+    ui.ctx()
+        .send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
+}
+
+/// One frame's drag-view accumulation: the raw pointer delta in pixels
+/// applied at the current zoom, unclamped. Extracted so the zoom-out
+/// guarantee (view tracks the cursor 1:1 regardless of the ±8 scrub
+/// speed clamp) is testable without egui.
+#[must_use]
+pub fn drag_view_step(current: f32, drag_dx: f32, frames_per_pixel: f32) -> f32 {
+    current - drag_dx * frames_per_pixel
+}
+
+/// Renders the full deck surface: zoom control, waveform, grid overlay,
+/// and the gesture machine (scrub / grid-move / click-seek). All
+/// interaction state lives on the deck; this function only drives it.
+pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
+    let end = deck.duration_seconds();
+
+    let mut zoom = deck.view.frames_per_pixel;
+    ui.horizontal(|ui| {
+        ui.label("zoom");
+        ui.add(
+            egui::Slider::new(&mut zoom, FRAMES_PER_PIXEL_MIN..=FRAMES_PER_PIXEL_MAX)
+                .logarithmic(true),
+        );
+    });
+    deck.view.frames_per_pixel = zoom;
+
+    // Follow the playhead whenever the audio engine exists. Position
+    // changes only at audio-callback rate (~ms bursts); extrapolate
+    // with the callback-reported speed so the view scrolls smoothly at
+    // display frame rate. During a scrub drag the view follows the
+    // pointer accumulation instead: the audio speed is ±8-clamped, so
+    // at high zoom-out following the audio thread would lag the cursor.
+    let follow = if deck.drag_mode == DragMode::Scrub && deck.drag_view_frame.is_some() {
+        deck.drag_view_frame.map(f64::from)
+    } else {
+        deck.engine.as_ref().map(|e| {
+            let ph = e.playhead();
+            let raw = *ph.position.read();
+            if raw != deck.position_at_update {
+                deck.position_at_update = raw;
+                deck.position_updated = Some(std::time::Instant::now());
+                raw
+            } else {
+                let speed = *ph.speed.read();
+                let elapsed = deck
+                    .position_updated
+                    .map_or(0.0, |t| f64::from(t.elapsed().as_secs_f32()));
+                raw + f64::from(speed) * elapsed
+            }
+        })
+    };
+    // The display view is pixel-grained; f32 pinning is fine there and
+    // keeps `WaveformView` in its f32 domain.
+    let follow = follow.map(|frame| frame as f32);
+    #[expect(clippy::cast_precision_loss, reason = "u32 rate to f32 display math")]
+    let sample_rate = deck.sample_rate as f32;
+    let (response, rect, _rate) = show(ui, &deck.peaks, &mut deck.view, follow);
+    let seconds_per_pixel = deck.view.frames_per_pixel / sample_rate;
+    let time_at_left = deck.view.left_frame / sample_rate;
+    let pointer_time = response
+        .hover_pos()
+        .map(|p| time_at_left + (p.x - rect.left()) * seconds_per_pixel);
+    // Latch: keep the last valid cursor time so the cursor buttons stay
+    // visible when the pointer leaves the waveform.
+    if pointer_time.is_some() {
+        deck.cursor_time = pointer_time;
+    }
+
+    // Pointer x movement since the previous drag frame, in points.
+    // Measured per frame against the last pointer position, so the
+    // dragged quantity tracks the cursor exactly.
+    let drag_dx = response
+        .interact_pointer_pos()
+        .map_or(0.0, |pos| deck.drag_last_x.map_or(0.0, |last| pos.x - last));
+    if let Some(pos) = response.interact_pointer_pos() {
+        deck.drag_last_x = Some(pos.x);
+    }
+
+    // Drag mode locks at drag start: SHIFT → grid move, else scrub.
+    let shift_now = ui.input(|i| i.modifiers.shift);
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        // Confine the cursor to the window so rapid drags keep working
+        // at the edge (wayland-safe; no warp needed).
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                egui::viewport::CursorGrab::Confined,
+            ));
+        if shift_now {
+            deck.drag_mode = DragMode::MoveGrid;
+        } else {
+            deck.drag_mode = DragMode::Scrub;
+            deck.scrub.drag_start();
+            // Seed the view accumulation from wherever the view is right
+            // now; pointer deltas drive it from here.
+            deck.drag_view_frame = Some(follow.unwrap_or(deck.view.left_frame));
+        }
+    }
+
+    match deck.drag_mode {
+        DragMode::MoveGrid => {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                deck.edit_grid.shift_by(drag_dx * seconds_per_pixel);
+                deck.grid_dirty = true;
+                *status = format!(
+                    "grid shifted: anchor {:.3} s",
+                    deck.edit_grid.anchor_seconds
+                );
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                end_drag_gesture(ui, deck);
+            }
+        }
+        DragMode::Scrub => {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                // Audio: velocity-driven varispeed from the smoothed drag
+                // speed — the audio thread advances the position itself
+                // (continuous output, no per-frame seek rebuilds).
+                let frame_dt = ui.input(|i| i.unstable_dt);
+                deck.scrub.drag_move(-drag_dx * seconds_per_pixel, frame_dt);
+                // View: raw pointer accumulation, 1:1 at any zoom.
+                if let Some(view_frame) = deck.drag_view_frame.as_mut() {
+                    *view_frame = drag_view_step(*view_frame, drag_dx, deck.view.frames_per_pixel);
+                }
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                deck.scrub.drag_end();
+                // Snap audio to the pointer so following resumes without
+                // jumping back to the lagged audio position.
+                if let (Some(frame), Some(engine)) = (deck.drag_view_frame, deck.engine.as_ref()) {
+                    *engine.playhead().seek.write() = Some(f64::from(frame));
+                    *engine.playhead().position.write() = f64::from(frame);
+                }
+                end_drag_gesture(ui, deck);
+            }
+        }
+        DragMode::None => {}
+    }
+    // Plain click (no drag) seeks the playhead; grid untouched.
+    // Position is written too so the pinned view re-centers on the very
+    // next paint instead of waiting for an audio callback.
+    if response.clicked()
+        && !shift_now
+        && let (Some(t), Some(engine)) = (pointer_time, deck.engine.as_ref())
+    {
+        *engine.playhead().seek.write() = Some(f64::from(t) * f64::from(sample_rate));
+        *engine.playhead().position.write() = f64::from(t) * f64::from(sample_rate);
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter_at(rect);
+    crate::view::grid::paint(
+        &painter,
+        &deck.edit_grid,
+        rect,
+        seconds_per_pixel,
+        time_at_left,
+        end,
+    );
+
+    if deck.engine.is_some() {
+        // Pinned playhead: fixed x at `playhead_frac` of the viewport.
+        let x = rect.left() + deck.view.playhead_frac * rect.width();
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(3.0, Color32::from_rgb(255, 210, 60)),
+        );
+    }
 }
 
 #[cfg(test)]

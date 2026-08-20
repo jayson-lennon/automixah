@@ -3,17 +3,23 @@
 //! The panel is a full-width, user-resizable strip below the waveform:
 //! the left column lists playlists (select / ＋ new / right-click
 //! rename-delete; rename swaps the row for an in-place editor), the
-//! right column shows the selected playlist's tracks. Row rendering
+//! right column shows the selected playlist's contents. All display
+//! state is **derived**: contents are ordered content hashes, and
+//! every visible fact (glyph, metadata, clickability) is a pure
+//! function of the track database record for that hash — there is no
+//! per-row state to mutate. The key text is colored by
+//! [`harmonic_color`] against the previous ready row's key (the
+//! DJ-adjacency view — reordering instantly recolors).
 //!
-//! All state lives on [`crate::playlist::PlaylistState`]; this module
-//! only paints and emits user intents back through [`PanelActions`].
+//! All state lives on [`crate::playlist::PlaylistState`] and
+//! [`crate::tracks::Tracks`]; this module only paints and emits user
+//! intents back through [`PanelActions`].
 
 use egui::Color32;
 
-use crate::playlist::queue::RowId;
-use crate::playlist::{
-    Contents, PlaylistRow, PlaylistState, RenameOutcome, RowStatus, rename_outcome,
-};
+use crate::playlist::{Contents, PlaylistState, RenameOutcome, rename_outcome};
+use crate::tracks::{AnalysisState, Tracks};
+use automixah_engine::timeline::types::TrackHash;
 
 /// User intents emitted by the panel (the app wires them to stores).
 #[derive(Debug, PartialEq, Eq)]
@@ -34,20 +40,18 @@ pub enum PanelAction {
     /// The Add… button was clicked (the app opens the file dialog).
     AddTracks,
     /// A ready row was clicked (load into the grid editor).
-    LoadRow(RowId),
+    LoadRow(TrackHash),
     /// A row was dragged onto another row's slot (reorder).
     MoveRow {
         /// Row being dragged.
-        from: RowId,
+        from: TrackHash,
         /// Slot the drag ended on.
-        to: RowId,
+        to: TrackHash,
     },
     /// Remove was chosen in a row's context menu.
     RemoveRow {
         /// Row to remove.
-        row: RowId,
-        /// Its position (store remove is position-addressed).
-        position: i64,
+        hash: TrackHash,
     },
 }
 
@@ -59,7 +63,7 @@ pub struct PanelActions {
 }
 
 /// Draws the whole playlist panel. Returns the collected intents.
-pub fn panel(ctx: &egui::Context, state: &mut PlaylistState) -> PanelActions {
+pub fn panel(ctx: &egui::Context, state: &mut PlaylistState, tracks: &Tracks) -> PanelActions {
     let mut actions = PanelActions::default();
     egui::TopBottomPanel::bottom("playlist_panel")
         .resizable(true)
@@ -73,7 +77,7 @@ pub fn panel(ctx: &egui::Context, state: &mut PlaylistState) -> PanelActions {
                 ui.separator();
                 if state.selected.is_some() {
                     let add = ui.button("Add…");
-                    if state.add_pending {
+                    if state.adds_in_flight > 0 {
                         ui.spinner();
                     }
                     if add.clicked() {
@@ -98,7 +102,7 @@ pub fn panel(ctx: &egui::Context, state: &mut PlaylistState) -> PanelActions {
                     playlist_list(ui, state, &mut actions);
                 });
             egui::CentralPanel::default().show_inside(ui, |ui| {
-                rows(ui, state, &mut actions);
+                rows(ui, state, tracks, &mut actions);
             });
         });
     actions
@@ -219,7 +223,7 @@ fn seed_select_all(ctx: &egui::Context, id: egui::Id, buffer: &str) {
 
 /// The right column: track rows with status icons, drag-reorder,
 /// click-to-load, and per-row context menus.
-fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions) {
+fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: &mut PanelActions) {
     match &state.contents {
         Contents::None => {
             ui.centered_and_justified(|ui| ui.weak("no playlist selected"));
@@ -236,32 +240,43 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions
             ui.centered_and_justified(|ui| ui.weak(format!("\u{26a0} {message}")));
             return;
         }
-        Contents::Loaded(rows) if rows.is_empty() => {
+        Contents::Loaded(hashes) if hashes.is_empty() => {
             ui.centered_and_justified(|ui| ui.weak("empty playlist. Add… to browse"));
             return;
         }
         Contents::Loaded(_) => {}
     }
-    let Contents::Loaded(rows) = &mut state.contents else {
+    let Contents::Loaded(hashes) = &state.contents else {
         return;
     };
-    let rows = &*rows;
+    let hashes = hashes.as_slice();
     let row_height = ui.text_style_height(&egui::TextStyle::Body) * 1.4;
-    let mut drag_source: Option<RowId> = None;
-    let mut drop_target: Option<RowId> = None;
+    let mut drag_source: Option<TrackHash> = None;
+    let mut drop_target: Option<TrackHash> = None;
     let mut prev_key: Option<djcore::key::Key> = None;
-    egui::ScrollArea::vertical().show_rows(ui, row_height, rows.len(), |ui, range| {
+    egui::ScrollArea::vertical().show_rows(ui, row_height, hashes.len(), |ui, range| {
         for i in range {
-            let row = &rows[i];
-            let interactive = row.is_ready();
-            let dragging_row = drag_source.is_some();
-            let response = row_ui(ui, row, prev_key.clone(), interactive, row_height);
+            let hash = &hashes[i];
+            let record = tracks.get(hash);
+            let analysis = record.map(|r| &r.analysis);
+            // Clickable whenever a record exists: ready rows load
+            // immediately; pending rows arm the deck (loads when the
+            // analysis lands). Failed and unknown rows stay inert.
+            let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
+            let response = row_ui(
+                ui,
+                record,
+                analysis,
+                prev_key.clone(),
+                interactive,
+                row_height,
+            );
             // Insertion-line preview: while a drag is live, the hovered
             // row shows the insertion line above or below its slot,
             // decided by the pointer's half of the slot.
-            if dragging_row
+            if drag_source.is_some()
                 && response.hovered()
-                && Some(row.row_id) != drag_source
+                && Some(hash) != drag_source.as_ref()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let offset = insertion_offset_in_slot(
@@ -285,26 +300,25 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions
             }
             if interactive {
                 if response.clicked() {
-                    actions.actions.push(PanelAction::LoadRow(row.row_id));
+                    actions.actions.push(PanelAction::LoadRow(hash.clone()));
                 }
                 if response.drag_started() {
-                    drag_source = Some(row.row_id);
+                    drag_source = Some(hash.clone());
                 }
                 if response.drag_stopped() {
-                    drop_target = Some(row.row_id);
+                    drop_target = Some(hash.clone());
                 }
             }
             response.context_menu(|ui| {
                 if ui.button("Remove").clicked() {
-                    actions.actions.push(PanelAction::RemoveRow {
-                        row: row.row_id,
-                        position: row.position,
-                    });
+                    actions
+                        .actions
+                        .push(PanelAction::RemoveRow { hash: hash.clone() });
                     ui.close();
                 }
             });
-            if let Some(key) = row.key.clone() {
-                prev_key = Some(key);
+            if let Some(AnalysisState::Ready(a)) = analysis {
+                prev_key = Some(a.key.clone());
             }
         }
     });
@@ -321,7 +335,8 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions
 /// the response carries click/drag/context-menu sense.
 fn row_ui(
     ui: &mut egui::Ui,
-    row: &PlaylistRow,
+    record: Option<&crate::tracks::TrackRecord>,
+    analysis: Option<&AnalysisState>,
     prev_key: Option<djcore::key::Key>,
     interactive: bool,
     row_height: f32,
@@ -338,8 +353,9 @@ fn row_ui(
         base_row_color(ui)
     };
     painter.rect_filled(rect.shrink(1.0), 2.0, bg);
-    paint_row_content(ui, &painter, rect, row, prev_key, interactive);
-    response.on_hover_text(format!("{}", row.path.display()))
+    paint_row_content(ui, &painter, rect, record, analysis, prev_key, interactive);
+    let path = record.map_or(String::new(), |r| r.tags.path.display().to_string());
+    response.on_hover_text(path)
 }
 
 /// Row background by state (non-ready rows dim, hover lightens).
@@ -370,11 +386,15 @@ fn dimmed_row_color(ui: &egui::Ui) -> Color32 {
 }
 
 /// Paints status icon, artist–title, and right-aligned metadata.
+///
+/// Every visible fact derives from the record: tags for the title,
+/// analysis state for glyph/metadata/interactivity.
 fn paint_row_content(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     rect: egui::Rect,
-    row: &PlaylistRow,
+    record: Option<&crate::tracks::TrackRecord>,
+    analysis: Option<&AnalysisState>,
     prev_key: Option<djcore::key::Key>,
     interactive: bool,
 ) {
@@ -397,15 +417,15 @@ fn paint_row_content(
     let center_y = rect.center().y;
     let mut x = rect.left() + 8.0;
 
-    // Status / affordance glyph.
-    let (glyph, color) = match &row.status {
-        RowStatus::Ready => (" ", strong_color),
-        RowStatus::Queued => ("🕓", weak_color),
-        RowStatus::Analyzing => ("⭕", weak_color),
-        RowStatus::Failed(_) => ("!", Color32::RED),
+    // Status / affordance glyph — derived from the analysis state.
+    let (glyph, color) = match analysis {
+        Some(AnalysisState::Ready(_)) => (" ", strong_color),
+        Some(AnalysisState::Queued) | None => ("🕓", weak_color),
+        Some(AnalysisState::Analyzing) => ("⭕", weak_color),
+        Some(AnalysisState::Failed(_)) => ("!", Color32::RED),
     };
     let icon_size = ui.text_style_height(&egui::TextStyle::Body).min(16.0);
-    if row.status == RowStatus::Analyzing {
+    if matches!(analysis, Some(AnalysisState::Analyzing)) {
         // Animated spinner at the glyph slot; repaint comes from the
         // spinner itself.
         let icon_rect = egui::Rect::from_center_size(
@@ -422,12 +442,14 @@ fn paint_row_content(
         x += g.size().x + 8.0;
     }
 
-    // Artist – title (dimmed while pending).
-    let title = if row.artist.is_empty() {
-        row.title.clone()
-    } else {
-        format!("{} – {}", row.artist, row.title)
-    };
+    // Artist – title from tags (dimmed while pending).
+    let title = record.map_or_else(String::new, |r| {
+        if r.tags.artist.is_empty() {
+            r.tags.title.clone()
+        } else {
+            format!("{} – {}", r.tags.artist, r.tags.title)
+        }
+    });
     let title_color = if interactive {
         strong_color
     } else {
@@ -440,19 +462,28 @@ fn paint_row_content(
         title_color,
     );
 
-    // Right-aligned metadata: duration, key (colored), BPM.
-    let bpm = row
-        .bpm
-        .map_or_else(|| "--".to_owned(), |b| format!("{b:.0}"));
-    let duration = row.duration.map_or_else(
+    // Right-aligned metadata: duration, key (colored), BPM — all from
+    // the analysis package when ready.
+    let ready = analysis.and_then(|a| match a {
+        AnalysisState::Ready(a) => Some(a),
+        _ => None,
+    });
+    let bpm = ready.map_or_else(|| "--".to_owned(), |a| format!("{:.0}", a.bpm));
+    let duration = ready.map_or_else(
         || "---".to_owned(),
-        |d| format!("{}:{:02}", (d / 60.0) as u32, (d % 60.0) as u32),
+        |a| {
+            format!(
+                "{}:{:02}",
+                (a.duration_seconds / 60.0) as u32,
+                (a.duration_seconds % 60.0) as u32
+            )
+        },
     );
-    let key_text = row.key.as_ref().map_or_else(
+    let key_text = ready.map_or_else(
         || "--".to_owned(),
-        |k| k.format_with(djcore::key::KeyFormat::Camelot),
+        |a| a.key.format_with(djcore::key::KeyFormat::Camelot),
     );
-    let key_color = key_display_color(row.key.clone(), prev_key, strong_color);
+    let key_color = key_display_color(ready.map(|a| a.key.clone()), prev_key, strong_color);
     let d_galley = galley(&duration, weak_color);
     let k_galley = galley(&key_text, key_color);
     let b_galley = galley(&bpm, weak_color);
@@ -584,8 +615,9 @@ mod tests {
     fn inline_editor_enter_commits() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state);
+            let _ = panel(ctx, &mut state, &tracks);
         });
         state.rename.buffer = "  new  ".to_owned();
         let input = egui::RawInput {
@@ -599,8 +631,9 @@ mod tests {
             ..Default::default()
         };
         let mut actions = PanelActions::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state);
+            actions = panel(ctx, &mut state, &tracks);
         });
 
         assert_eq!(
@@ -621,8 +654,9 @@ mod tests {
     fn inline_editor_escape_cancels() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state);
+            let _ = panel(ctx, &mut state, &tracks);
         });
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -635,8 +669,9 @@ mod tests {
             ..Default::default()
         };
         let mut actions = PanelActions::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state);
+            actions = panel(ctx, &mut state, &tracks);
         });
 
         assert!(actions.actions.is_empty(), "nothing submitted");
@@ -651,19 +686,21 @@ mod tests {
     fn inline_editor_focus_loss_commits() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state);
+            let _ = panel(ctx, &mut state, &tracks);
         });
         state.rename.buffer = "new".to_owned();
         // Click-away is another widget grabbing focus during a frame.
         let mut actions = PanelActions::default();
+        let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.ctx()
                     .memory_mut(|m| m.request_focus(egui::Id::new("click_away_target")));
                 let _ = ui.allocate_space(egui::vec2(1.0, 1.0));
             });
-            actions = panel(ctx, &mut state);
+            actions = panel(ctx, &mut state, &tracks);
         });
 
         assert_eq!(
@@ -690,7 +727,7 @@ mod tests {
     }
 
     // Given a row with no key after a keyed row.
-    // When computing its display color.
+    // When computing the row color.
     // Then the fallback color is used unmodified.
     #[test]
     fn missing_key_uses_fallback_color() {

@@ -13,6 +13,7 @@ use automixah_engine::timeline::types::TrackHash;
 
 use super::{PersistedTrack, PlaylistStore, PlaylistStoreError, PlaylistSummary};
 use crate::store::GridOverride;
+use crate::track::identity::now_unix;
 
 /// SQLite-backed playlist store over the shared library pool.
 #[derive(Clone)]
@@ -559,13 +560,6 @@ impl FromRow for EntryRow {
             added_path: row.get("added_path")?,
         })
     }
-}
-
-/// Current unix time in seconds (0 on clock failure).
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[cfg(test)]
