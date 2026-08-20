@@ -42,6 +42,9 @@ pub struct Deck {
     pub peaks: crate::audio::peaks::Peaks,
     /// Source sample rate (frames per second).
     pub sample_rate: u32,
+    /// Number of decoded source frames; source-frame cues are clamped to
+    /// `[0, source_frames]` by the editor.
+    pub source_frames: u64,
     /// Duration in seconds (source time).
     duration: f32,
 
@@ -50,6 +53,11 @@ pub struct Deck {
     pub edit_grid: EditableGrid,
     /// Dirty grid + hash to flush on the next frame (immediate save).
     pub pending_save: Option<(automixah_engine::timeline::types::TrackHash, EditableGrid)>,
+    /// Complete cue snapshot + hash to flush on the next frame.
+    pub pending_cue_save: Option<(automixah_engine::timeline::types::TrackHash, CuePoints)>,
+    /// Cue snapshot currently being persisted; edits made while it is in
+    /// flight remain in `pending_cue_save` and are flushed afterward.
+    pub cue_save_in_flight: Option<(automixah_engine::timeline::types::TrackHash, CuePoints)>,
     /// `true` for one frame after a grid gesture (the app schedules the
     /// save; the deck stays borrow-friendly).
     pub grid_dirty: bool,
@@ -95,6 +103,7 @@ impl Deck {
     pub fn new(outcome: LoadOutcome) -> Result<Self, String> {
         #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
         let duration = outcome.audio.frames() as f32 / outcome.audio.sample_rate as f32;
+        let source_frames = outcome.audio.frames() as u64;
         let pcm = Arc::new(outcome.audio.samples.clone());
         let engine = match OutputEngine::start(
             Arc::clone(&pcm),
@@ -115,9 +124,12 @@ impl Deck {
             pcm,
             peaks: outcome.peaks,
             sample_rate: outcome.audio.sample_rate,
+            source_frames,
             duration,
             edit_grid: EditableGrid::from_grid(&outcome.analysis.grid),
             pending_save: None,
+            pending_cue_save: None,
+            cue_save_in_flight: None,
             grid_dirty: false,
             cues: outcome.analysis.cues,
             cues_dirty: false,

@@ -307,11 +307,27 @@ impl GridStore for CountingStore {
 mod tests {
     use super::*;
 
-    // Given a grid store service wrapping an in-memory backend.
-    // When an override is saved and loaded.
-    // Then the round-trip preserves every field.
+    #[tokio::test]
+    async fn service_round_trips_cues() {
+        // Given a cue store service wrapping an in-memory backend.
+        let service = CueStoreService::new(Arc::new(in_memory::InMemoryCueStore::new()));
+        let hash = TrackHash("cue-service".to_owned());
+        let cues = CuePoints {
+            ins: [Some(1), None, Some(3), None],
+            outs: [None, Some(8), None, Some(13)],
+        };
+
+        // When the complete cue set is saved and loaded through the service.
+        service.put(&hash, &cues).await.expect("save cues");
+        let loaded = service.get(&hash).await.expect("load cues");
+
+        // Then all slots are preserved at the trait-backed boundary.
+        assert_eq!(loaded, cues);
+        assert_eq!(service.name(), "in-memory-cues");
+    }
     #[tokio::test]
     async fn service_round_trips_override() {
+        // Given a grid store service wrapping an in-memory backend.
         let service = GridStoreService::new(Arc::new(in_memory::InMemoryGridStore::new()));
         let hash = TrackHash("deadbeef".to_owned());
         let grid = GridOverride {
@@ -322,9 +338,11 @@ mod tests {
             key: None,
         };
 
+        // When an override is saved and loaded.
         service.put(&hash, &grid).await.expect("save");
         let loaded = service.get(&hash).await.expect("load");
 
+        // Then the round-trip preserves every field.
         assert_eq!(loaded, Some(grid));
     }
 }

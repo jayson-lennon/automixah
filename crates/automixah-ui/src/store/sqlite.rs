@@ -423,6 +423,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_cue_store_overflow_rolls_back_replacement() {
+        // Given a saved cue set and a replacement containing a frame outside
+        // SQLite's signed integer range.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let hash = TrackHash("cue-overflow".to_owned());
+        let original = CuePoints {
+            ins: [Some(10), None, None, None],
+            outs: [None, Some(20), None, None],
+        };
+        <SqliteGridStore as CueStore>::put(&store, &hash, &original)
+            .await
+            .expect("save original cues");
+        let too_large = CuePoints {
+            ins: [
+                Some(u64::try_from(i64::MAX).expect("positive max") + 1),
+                None,
+                None,
+                None,
+            ],
+            ..CuePoints::default()
+        };
+
+        // When the overflowing replacement is saved.
+        let result = <SqliteGridStore as CueStore>::put(&store, &hash, &too_large).await;
+
+        // Then the conversion fails and the transaction preserves the old set.
+        assert!(result.is_err(), "overflow must be rejected");
+        assert_eq!(
+            <SqliteGridStore as CueStore>::get(&store, &hash)
+                .await
+                .expect("load cues after failed replacement"),
+            original
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_cue_store_rejects_negative_frame_rows() {
         // Given a migrated library containing a malformed legacy cue row.
         let dir = tempfile::tempdir().expect("temp dir");

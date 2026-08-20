@@ -28,9 +28,7 @@ use crate::render::renderer::{Renderer, TrackFetchError, TrackProvider};
 use crate::render::resample::Resampler;
 use crate::render::wsola::Wsola;
 use crate::timeline::plan::{PlanOptions, plan_with};
-use crate::timeline::types::{
-    CuePoints, SessionPlan, SessionTime, TrackAnalysis, TrackHash,
-};
+use crate::timeline::types::{CuePoints, SessionPlan, SessionTime, TrackAnalysis, TrackHash};
 
 /// Beats per bar assumed when projecting a canonical grid (4/4).
 pub const BEATS_PER_BAR: u8 = 4;
@@ -177,7 +175,7 @@ fn analysis_from(track: &MixdownTrack, decoded: &DecodeAudio) -> TrackAnalysis {
         sample_rate: decoded.sample_rate,
         channels: decoded.channels.max(1),
         format: String::new(),
-        cues: track.cues.clone(),
+        cues: track.cues,
     }
 }
 
@@ -555,10 +553,40 @@ mod tests {
         assert!((grid.downbeats[0] - (-0.3 + 4.0 * 0.5)).abs() < 1e-4);
     }
 
+    #[test]
+    fn provider_slice_starts_at_planned_source_frame() {
+        // Given stretched stereo PCM with distinct values per source frame and
+        // a plan selecting source frame 2.
+        let stretched = vec![
+            0.0, 0.1, // frame 0
+            1.0, 1.1, // frame 1
+            2.0, 2.1, // frame 2
+            3.0, 3.1, // frame 3
+        ];
+        let segment = crate::timeline::types::Segment {
+            track_hash: TrackHash("slice".to_owned()),
+            src_start: 2,
+            session_start: SessionTime::ZERO,
+            len_samples: 2,
+            stretch: crate::timeline::types::StretchDecision::constant(
+                crate::timeline::types::StretchMode::Resample,
+                1.0,
+                false,
+            ),
+            transition: None,
+        };
+
+        // When the provider slices the already-stretched track.
+        let sliced = cue_slice_and_stereo(&stretched, 2, &segment);
+
+        // Then it begins at the planned frame and does not reselect cues.
+        assert_eq!(sliced, vec![2.0, 2.1, 3.0, 3.1]);
+    }
+
     // Given a mixdown track snapshot and a decoded audio frame.
     // When the analysis is built.
     // Then the planner's confidence gate passes (vetted-grid
-    // contract).
+    // contract) and the cue snapshot is carried through.
     #[test]
     fn analysis_from_builds_a_confident_grid() {
         let snapshot = MixdownTrack {
@@ -572,7 +600,10 @@ mod tests {
                 mode: djcore::key::KeyMode::Minor,
             },
             duration: 10.0,
-            cues: CuePoints::default(),
+            cues: CuePoints {
+                ins: [Some(123), None, None, None],
+                outs: [None, None, Some(4_567), None],
+            },
         };
         let decoded = DecodeAudio {
             samples: vec![0.0; 44_100],
@@ -588,5 +619,9 @@ mod tests {
         );
         assert_eq!(analysis.hash.0, "deadbeef");
         assert!((analysis.bpm - 128.0).abs() < f32::EPSILON, "bpm from grid");
+        assert_eq!(
+            analysis.cues, snapshot.cues,
+            "cue snapshot reaches planning"
+        );
     }
 }

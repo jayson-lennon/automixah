@@ -7,8 +7,98 @@ use eframe::egui::{Color32, Painter, Pos2, Rect, Response, Sense, Vec2};
 
 use crate::audio::peaks::{PeakQuartet, Peaks};
 use crate::deck::{Deck, DragMode};
+use automixah_engine::timeline::types::{CUE_SLOTS, CueKind, CuePoints};
 
-/// Zoom range in frames per pixel: near-sample level (4) to overview.
+const CUE_BOX_SIZE: Vec2 = Vec2::new(24.0, 20.0);
+const IN_CUE_COLOR: Color32 = Color32::from_rgb(40, 190, 80);
+const OUT_CUE_COLOR: Color32 = Color32::from_rgb(230, 145, 35);
+const INVALID_CUE_COLOR: Color32 = Color32::from_gray(125);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CueMarker {
+    kind: CueKind,
+    slot: usize,
+    frame: u64,
+    valid: bool,
+}
+
+fn cue_marker_valid(cues: &CuePoints, kind: CueKind, slot: usize, total_frames: u64) -> bool {
+    let Some(frame) = cues.get(kind, slot) else {
+        return false;
+    };
+    if frame > total_frames {
+        return false;
+    }
+    match kind {
+        CueKind::In => true,
+        CueKind::Out => cues
+            .earliest_valid(CueKind::In, total_frames)
+            .is_none_or(|in_frame| frame > in_frame),
+    }
+}
+
+fn cue_markers(cues: &CuePoints, total_frames: u64) -> Vec<CueMarker> {
+    [CueKind::In, CueKind::Out]
+        .into_iter()
+        .flat_map(|kind| {
+            (0..CUE_SLOTS).filter_map(move |slot| {
+                cues.get(kind, slot).map(|frame| CueMarker {
+                    kind,
+                    slot,
+                    frame,
+                    valid: cue_marker_valid(cues, kind, slot, total_frames),
+                })
+            })
+        })
+        .collect()
+}
+
+fn cue_marker_color(marker: CueMarker) -> Color32 {
+    if !marker.valid {
+        return INVALID_CUE_COLOR;
+    }
+    match marker.kind {
+        CueKind::In => IN_CUE_COLOR,
+        CueKind::Out => OUT_CUE_COLOR,
+    }
+}
+
+fn cue_x(frame: u64, left_frame: f32, frames_per_pixel: f32, rect: Rect) -> f32 {
+    rect.left() + (frame as f32 - left_frame) / frames_per_pixel
+}
+
+fn paint_cue_markers(
+    painter: &Painter,
+    rect: Rect,
+    cues: &CuePoints,
+    total_frames: u64,
+    view: &WaveformView,
+) {
+    for marker in cue_markers(cues, total_frames) {
+        let x = cue_x(marker.frame, view.left_frame, view.frames_per_pixel, rect);
+        if x < rect.left() - CUE_BOX_SIZE.x || x > rect.right() + CUE_BOX_SIZE.x {
+            continue;
+        }
+        let color = cue_marker_color(marker);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            egui::Stroke::new(1.0, color),
+        );
+        let box_rect = Rect::from_center_size(
+            Pos2::new(x, rect.top() + CUE_BOX_SIZE.y / 2.0),
+            CUE_BOX_SIZE,
+        );
+        painter.rect_filled(box_rect, 2.0, color);
+        painter.text(
+            box_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            (marker.slot + 1).to_string(),
+            egui::FontId::proportional(12.0),
+            Color32::BLACK,
+        );
+    }
+}
+
 pub const FRAMES_PER_PIXEL_MIN: f32 = 4.0;
 pub const FRAMES_PER_PIXEL_MAX: f32 = 20_000.0;
 
@@ -247,9 +337,109 @@ pub fn drag_view_step(current: f32, drag_dx: f32, frames_per_pixel: f32) -> f32 
     current - drag_dx * frames_per_pixel
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CueButtonAction {
+    Create,
+    Jump(u64),
+    Delete,
+    Noop,
+}
+
+fn cue_button_action(
+    cues: &automixah_engine::timeline::types::CuePoints,
+    kind: CueKind,
+    slot: usize,
+    cursor_frame: Option<u64>,
+    ctrl: bool,
+) -> CueButtonAction {
+    let occupied = cues.get(kind, slot);
+    if ctrl {
+        return occupied.map_or(CueButtonAction::Noop, |_| CueButtonAction::Delete);
+    }
+    match (occupied, cursor_frame) {
+        (Some(frame), _) => CueButtonAction::Jump(frame),
+        (None, Some(_)) => CueButtonAction::Create,
+        (None, None) => CueButtonAction::Noop,
+    }
+}
+fn cue_button_tooltip(kind: CueKind, slot: usize, occupied: bool) -> String {
+    let label = match kind {
+        CueKind::In => "in",
+        CueKind::Out => "out",
+    };
+    let number = slot + 1;
+    if occupied {
+        format!("{label} cue {number}: click jumps to it; Ctrl-click deletes it")
+    } else {
+        format!("{label} cue {number}: click creates at the cursor; Ctrl-click does nothing")
+    }
+}
+
+/// Renders the eight numbered cue buttons below the waveform.
+fn cue_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
+    ui.separator();
+    ui.label("Cue points");
+    for (kind, label) in [(CueKind::In, "In"), (CueKind::Out, "Out")] {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            for slot in 0..CUE_SLOTS {
+                let occupied = deck.cues.get(kind, slot).is_some();
+                let response = ui
+                    .button(format!("{}{}", label, slot + 1))
+                    .on_hover_text(cue_button_tooltip(kind, slot, occupied));
+                if !response.clicked() {
+                    continue;
+                }
+                #[expect(clippy::cast_possible_truncation, reason = "cursor frame fits source")]
+                let cursor_frame = deck
+                    .cursor_time
+                    .map(|cursor| (cursor.max(0.0) * deck.sample_rate as f32).round() as u64);
+                let action = cue_button_action(
+                    &deck.cues,
+                    kind,
+                    slot,
+                    cursor_frame,
+                    ui.input(|input| input.modifiers.ctrl),
+                );
+                match action {
+                    CueButtonAction::Delete => {
+                        deck.cues.delete(kind, slot);
+                        deck.cues_dirty = true;
+                        deck.pending_cue_save = Some((deck.hash.clone(), deck.cues));
+                        *status = format!("deleted {label} cue {}", slot + 1);
+                    }
+                    CueButtonAction::Jump(frame) => {
+                        if let Some(engine) = deck.engine.as_ref() {
+                            *engine.playhead().seek.write() = Some(frame as f64);
+                            *engine.playhead().position.write() = frame as f64;
+                        }
+                        deck.view
+                            .pin_frame(frame as f32, ui.available_width().max(1.0));
+                        *status = format!("jumped to {label} cue {}", slot + 1);
+                    }
+                    CueButtonAction::Create => {
+                        let frame = cursor_frame.expect("create requires cursor frame");
+                        let snapped = crate::grid::snap_source_frame_to_beat(
+                            frame,
+                            deck.sample_rate,
+                            deck.source_frames,
+                            &deck.edit_grid,
+                        );
+                        deck.cues.set(kind, slot, snapped);
+                        deck.cues_dirty = true;
+                        deck.pending_cue_save = Some((deck.hash.clone(), deck.cues));
+                        *status = format!("created {label} cue {}", slot + 1);
+                    }
+                    CueButtonAction::Noop => {}
+                }
+            }
+        });
+    }
+}
+
 /// Renders the full deck surface: zoom control, waveform, grid overlay,
-/// and the gesture machine (scrub / grid-move / click-seek). All
-/// interaction state lives on the deck; this function only drives it.
+/// cue controls, and the gesture machine (scrub / grid-move / click-seek).
+/// All interaction state lives on the deck; this function only drives it.
 pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
     let end = deck.duration_seconds();
 
@@ -395,6 +585,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
         time_at_left,
         end,
     );
+    paint_cue_markers(&painter, rect, &deck.cues, deck.source_frames, &deck.view);
 
     if deck.engine.is_some() {
         // Pinned playhead: fixed x at `playhead_frac` of the viewport.
@@ -404,6 +595,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
             egui::Stroke::new(3.0, Color32::from_rgb(255, 210, 60)),
         );
     }
+    cue_panel(ui, deck, status);
 }
 
 #[cfg(test)]
@@ -442,6 +634,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cue_marker_coordinates_follow_waveform_frame_transform() {
+        // Given a view whose left edge is frame 100 and whose zoom is 10 frames/pixel.
+        let rect = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(400.0, 200.0));
+
+        // When a cue at frame 300 is projected.
+        let x = cue_x(300, 100.0, 10.0, rect);
+
+        // Then it is 20 pixels from the waveform's left edge.
+        assert_eq!(x, rect.left() + 20.0);
+    }
+
+    #[test]
+    fn cue_marker_box_and_line_geometry_are_zoom_independent() {
+        // Given two zoom levels and the same fixed cue-box design.
+        // When marker geometry is inspected.
+        // Then the box remains fixed-size while only its x coordinate changes.
+        assert_eq!(CUE_BOX_SIZE, Vec2::new(24.0, 20.0));
+        assert_eq!(
+            cue_x(
+                1_000,
+                0.0,
+                10.0,
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 50.0))
+            ),
+            100.0
+        );
+        assert_eq!(
+            cue_x(
+                1_000,
+                0.0,
+                100.0,
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 50.0))
+            ),
+            10.0
+        );
+    }
+
+    #[test]
+    fn cue_marker_styles_distinguish_kind_and_invalid_relationships() {
+        // Given valid in/out cues and an out cue before the earliest valid in.
+        let mut cues = CuePoints::with_in(0, 500);
+        cues.set(CueKind::Out, 0, 700);
+        cues.set(CueKind::Out, 1, 400);
+        let markers = cue_markers(&cues, 1_000);
+
+        // When marker styles are selected.
+        let in_marker = markers
+            .iter()
+            .find(|m| m.kind == CueKind::In)
+            .copied()
+            .expect("in");
+        let valid_out = markers
+            .iter()
+            .find(|m| m.kind == CueKind::Out && m.slot == 0)
+            .copied()
+            .expect("valid out");
+        let invalid_out = markers
+            .iter()
+            .find(|m| m.kind == CueKind::Out && m.slot == 1)
+            .copied()
+            .expect("invalid out");
+
+        // Then valid in/out cues use their colors and invalid cues are gray.
+        assert_eq!(cue_marker_color(in_marker), IN_CUE_COLOR);
+        assert_eq!(cue_marker_color(valid_out), OUT_CUE_COLOR);
+        assert!(!invalid_out.valid);
+        assert_eq!(cue_marker_color(invalid_out), INVALID_CUE_COLOR);
+    }
+
+    #[test]
+    fn cue_marker_labels_preserve_slot_numbers() {
+        // Given an occupied fourth slot.
+        let cues = CuePoints::with_out(3, 800);
+
+        // When markers are projected.
+        let marker = cue_markers(&cues, 1_000)
+            .into_iter()
+            .next()
+            .expect("marker");
+
+        // Then the marker retains slot index three, rendered by the UI as 4.
+        assert_eq!(marker.slot + 1, 4);
+    }
+    #[test]
+    fn cue_button_state_machine_preserves_slot_semantics() {
+        // Given one occupied in slot 1 and an empty in slot 2.
+        let cues = CuePoints::with_in(0, 123);
+
+        // When normal and Ctrl-click actions are derived.
+        // Then occupied buttons jump, empty buttons create, and Ctrl-click
+        // only deletes occupied slots.
+        assert_eq!(
+            cue_button_action(&cues, CueKind::In, 0, Some(456), false),
+            CueButtonAction::Jump(123)
+        );
+        assert_eq!(
+            cue_button_action(&cues, CueKind::In, 1, Some(456), false),
+            CueButtonAction::Create
+        );
+        assert_eq!(
+            cue_button_action(&cues, CueKind::In, 0, Some(456), true),
+            CueButtonAction::Delete
+        );
+        assert_eq!(
+            cue_button_action(&cues, CueKind::In, 1, Some(456), true),
+            CueButtonAction::Noop
+        );
+    }
+
+    #[test]
+    fn cue_tooltip_explains_click_and_ctrl_click_for_both_states() {
+        // Given empty and occupied numbered cue slots.
+        let empty = cue_button_tooltip(CueKind::Out, 3, false);
+        let occupied = cue_button_tooltip(CueKind::In, 0, true);
+
+        // Then each tooltip explains the normal action and Ctrl-click delete.
+        assert!(empty.contains("creates at the cursor"));
+        assert!(empty.contains("Ctrl-click"));
+        assert!(occupied.contains("jumps to it"));
+        assert!(occupied.contains("deletes it"));
+    }
     // Given a low-only quartet at half amplitude.
     // When band heights are computed for half-height 100 px.
     // Then the low band is ~50 px and the others are the 1 px floor.

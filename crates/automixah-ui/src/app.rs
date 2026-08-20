@@ -179,10 +179,7 @@ fn hydrate_records(
                 key,
                 #[expect(clippy::cast_possible_truncation, reason = "f64 tag to f32 display")]
                 duration_seconds: duration as f32,
-                cues: cues
-                    .get(&track.track_hash)
-                    .copied()
-                    .unwrap_or_default(),
+                cues: cues.get(&track.track_hash).copied().unwrap_or_default(),
             }),
         });
     }
@@ -217,41 +214,81 @@ async fn join_grids(
 }
 
 impl AutomixahUiApp {
-    /// Flushes a pending grid save from the deck; the spawned task
-    /// reports back through the bus.
+    /// Flushes pending grid and cue saves from the deck; spawned tasks
+    /// report back through the bus.
     fn flush_save_if_due(&mut self) {
         let Some(deck) = self.deck.as_mut() else {
             return;
         };
-        let Some((hash, grid)) = deck.pending_save.take() else {
-            return;
-        };
-        deck.edit_grid = grid;
-        let store = self.services.grid_store.clone();
-        let grid_override = crate::store::GridOverride {
-            grid_bpm: grid.grid_bpm,
-            anchor_seconds: grid.anchor_seconds,
-            downbeat_phase: grid.downbeat_phase,
-            updated_at: crate::track::identity::now_unix(),
-            // Manual edits carry no key — the COALESCE upsert preserves
-            // whatever analysis stored.
-            key: None,
-        };
-        let tx = self.bus.sender();
-        self.services.runtime.handle().spawn(async move {
-            let event = match store.put(&hash, &grid_override).await {
-                Ok(()) => Event::GridSaved { hash, grid },
-                Err(report) => Event::GridSaveFailed(format!("{report:#}")),
+        if let Some((hash, grid)) = deck.pending_save.take() {
+            deck.edit_grid = grid;
+            let store = self.services.grid_store.clone();
+            let grid_override = crate::store::GridOverride {
+                grid_bpm: grid.grid_bpm,
+                anchor_seconds: grid.anchor_seconds,
+                downbeat_phase: grid.downbeat_phase,
+                updated_at: crate::track::identity::now_unix(),
+                // Manual edits carry no key — the COALESCE upsert preserves
+                // whatever analysis stored.
+                key: None,
             };
-            let _ = tx.send(event);
-        });
+            let tx = self.bus.sender();
+            self.services.runtime.handle().spawn(async move {
+                let event = match store.put(&hash, &grid_override).await {
+                    Ok(()) => Event::GridSaved { hash, grid },
+                    Err(report) => Event::GridSaveFailed(format!("{report:#}")),
+                };
+                let _ = tx.send(event);
+            });
+        }
+        if deck.cue_save_in_flight.is_none()
+            && let Some((hash, cues)) = deck.pending_cue_save.take()
+        {
+            deck.cue_save_in_flight = Some((hash.clone(), cues));
+            let store = self.services.cue_store.clone();
+            let tx = self.bus.sender();
+            self.services.runtime.handle().spawn(async move {
+                let event = match store.put(&hash, &cues).await {
+                    Ok(()) => Event::CuesSaved { hash, cues },
+                    Err(report) => Event::CuesSaveFailed {
+                        hash,
+                        cues,
+                        message: format!("{report:#}"),
+                    },
+                };
+                let _ = tx.send(event);
+            });
+        }
     }
 
     /// Marks the deck's grid dirty; flushed on the next frame.
     fn schedule_save(&mut self) {
         if let Some(deck) = self.deck.as_mut() {
-            let grid = deck.edit_grid;
-            deck.pending_save = Some((deck.hash.clone(), grid));
+            deck.pending_save = Some((deck.hash.clone(), deck.edit_grid));
+        }
+    }
+
+    /// Marks the current cue set for an off-thread complete replacement save.
+    fn schedule_cue_save(&mut self) {
+        if let Some(deck) = self.deck.as_mut() {
+            deck.pending_cue_save = Some((deck.hash.clone(), deck.cues));
+        }
+    }
+
+    /// Re-snaps every occupied cue after a grid edit and marks both data sets
+    /// for persistence when positions changed.
+    fn resnap_deck_cues_after_grid_change(&mut self) {
+        let Some(deck) = self.deck.as_mut() else {
+            return;
+        };
+        if crate::grid::resnap_cues(
+            &mut deck.cues,
+            deck.sample_rate,
+            deck.source_frames,
+            &deck.edit_grid,
+        ) {
+            deck.cues_dirty = true;
+            self.schedule_cue_save();
         }
     }
 
@@ -353,10 +390,47 @@ impl AutomixahUiApp {
                 self.status = format!("\u{26a0} save failed: {message}");
             }
             Event::CuesSaved { hash, cues } => {
-                self.tracks.refresh_cues(&hash, &cues);
-                self.status = format!("cues saved ({:.8})", hash.0);
+                let is_current_snapshot = self
+                    .deck
+                    .as_ref()
+                    .is_none_or(|deck| deck.hash != hash || deck.cues == cues);
+                if let Some(deck) = self.deck.as_mut()
+                    && deck.hash == hash
+                    && deck
+                        .cue_save_in_flight
+                        .as_ref()
+                        .is_some_and(|(_, saved)| *saved == cues)
+                {
+                    deck.cue_save_in_flight = None;
+                }
+                if is_current_snapshot {
+                    if let Some(deck) = self.deck.as_mut()
+                        && deck.hash == hash
+                        && deck.cues == cues
+                    {
+                        deck.cues_dirty = false;
+                    }
+                    self.tracks.refresh_cues(&hash, &cues);
+                    self.status = format!("cues saved ({:.8})", hash.0);
+                }
+                // A different cue snapshot is an older save completion. The
+                // working deck remains authoritative until its newer save
+                // reports success.
             }
-            Event::CuesSaveFailed(message) => {
+            Event::CuesSaveFailed {
+                hash,
+                cues,
+                message,
+            } => {
+                if let Some(deck) = self.deck.as_mut()
+                    && deck.hash == hash
+                    && deck
+                        .cue_save_in_flight
+                        .as_ref()
+                        .is_some_and(|(_, saved)| *saved == cues)
+                {
+                    deck.cue_save_in_flight = None;
+                }
                 self.status = format!("\u{26a0} cue save failed: {message}");
             }
             Event::RowsLoaded { hashes, .. } => {
@@ -794,6 +868,7 @@ impl eframe::App for AutomixahUiApp {
         if let Some(deck) = self.deck.as_mut() {
             if deck.grid_dirty {
                 deck.grid_dirty = false;
+                self.resnap_deck_cues_after_grid_change();
                 self.schedule_save();
             }
             self.flush_save_if_due();
@@ -850,7 +925,7 @@ impl AutomixahUiApp {
                     downbeat_phase: grid.downbeat_phase,
                     key: analysis.key.clone(),
                     duration: analysis.duration_seconds,
-                    cues: analysis.cues.clone(),
+                    cues: analysis.cues,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1100,6 +1175,309 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cue_hydration_reads_incomplete_tracks_without_grid_data() {
+        // Given a playlist row with no grid yet and independently persisted cues.
+        let hash = TrackHash("pending-cues".to_owned());
+        let persisted = vec![crate::playlist::store::PersistedTrack {
+            id: 1,
+            position: 0,
+            track_hash: hash.clone(),
+            title: "T".to_owned(),
+            artist: "A".to_owned(),
+            added_path: "/pending.wav".to_owned(),
+            duration: None,
+            grid: None,
+        }];
+        let cues = automixah_engine::timeline::types::CuePoints::with_out(1, 900);
+        let cue_store = crate::store::CueStoreService::new(std::sync::Arc::new(
+            crate::store::in_memory::InMemoryCueStore::new(),
+        ));
+        cue_store.put(&hash, &cues).await.expect("seed cues");
+
+        // When the playlist hydration reads cue data before analysis completes.
+        let loaded = load_cues(cue_store, &persisted).await;
+
+        // Then the pending row's source cues remain available for later work.
+        assert_eq!(loaded.get(&hash), Some(&cues));
+    }
+    #[test]
+    fn stale_cue_save_event_does_not_replace_newer_working_state() {
+        // Given a loaded deck and track record with a newer cue edit.
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("cue-race".to_owned());
+        let old = automixah_engine::timeline::types::CuePoints::with_in(0, 100);
+        let newer = automixah_engine::timeline::types::CuePoints::with_in(0, 300);
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "T".to_owned(),
+                artist: "A".to_owned(),
+                path: "/cue-race.wav".into(),
+            },
+            analysis: AnalysisState::Ready(crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 1.0,
+                cues: newer,
+            }),
+        });
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/cue-race.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 1.0,
+                cues: newer,
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+        });
+
+        // When the older in-flight save reports success.
+        app.apply(Event::CuesSaved {
+            hash: hash.clone(),
+            cues: old,
+        });
+
+        // Then the newer working/session cue set remains authoritative.
+        assert_eq!(app.deck.as_ref().expect("deck").cues, newer);
+        let AnalysisState::Ready(analysis) = &app.tracks.get(&hash).expect("record").analysis
+        else {
+            panic!("ready record");
+        };
+        assert_eq!(analysis.cues, newer);
+    }
+    #[test]
+    fn current_cue_save_event_clears_in_flight_state_and_refreshes_record() {
+        // Given a ready track with one cue snapshot being persisted.
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("cue-save".to_owned());
+        let cues = automixah_engine::timeline::types::CuePoints::with_in(0, 400);
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "T".to_owned(),
+                artist: "A".to_owned(),
+                path: "/cue-save.wav".into(),
+            },
+            analysis: AnalysisState::Ready(crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 0,
+                    mode: djcore::key::KeyMode::Major,
+                },
+                duration_seconds: 1.0,
+                cues,
+            }),
+        });
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/cue-save.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 0,
+                    mode: djcore::key::KeyMode::Major,
+                },
+                duration_seconds: 1.0,
+                cues,
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+        });
+        let deck = app.deck.as_mut().expect("deck");
+        deck.pending_cue_save = Some((hash.clone(), cues));
+        deck.cue_save_in_flight = Some((hash.clone(), cues));
+        deck.cues_dirty = true;
+
+        // When the matching save success arrives.
+        app.apply(Event::CuesSaved {
+            hash: hash.clone(),
+            cues,
+        });
+
+        // Then persistence state clears and the track record stays current.
+        let deck = app.deck.as_ref().expect("deck");
+        assert!(deck.cue_save_in_flight.is_none());
+        assert!(!deck.cues_dirty);
+        let AnalysisState::Ready(analysis) = &app.tracks.get(&hash).expect("record").analysis
+        else {
+            panic!("ready record");
+        };
+        assert_eq!(analysis.cues, cues);
+    }
+
+    #[test]
+    fn failed_cue_save_keeps_working_cues_dirty() {
+        // Given a cue snapshot whose asynchronous save is in flight.
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("cue-fail".to_owned());
+        let cues = automixah_engine::timeline::types::CuePoints::with_out(1, 500);
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/cue-fail.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 0,
+                    mode: djcore::key::KeyMode::Major,
+                },
+                duration_seconds: 1.0,
+                cues,
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+        });
+        let deck = app.deck.as_mut().expect("deck");
+        deck.cue_save_in_flight = Some((hash.clone(), cues));
+        deck.cues_dirty = true;
+
+        // When the save fails.
+        app.apply(Event::CuesSaveFailed {
+            hash,
+            cues,
+            message: "write failed".to_owned(),
+        });
+
+        // Then working data remains dirty for a later retry.
+        let deck = app.deck.as_ref().expect("deck");
+        assert!(deck.cue_save_in_flight.is_none());
+        assert!(deck.cues_dirty);
+        assert!(app.status.contains("write failed"));
+    }
+    // Given a load outcome carrying persisted cues.
+    // When the outcome is applied to the editor.
+    // Then the loaded deck starts with the same working cue set.
+    #[test]
+    fn loading_initializes_deck_working_cues() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let cues = automixah_engine::timeline::types::CuePoints {
+            ins: [Some(100), None, None, None],
+            outs: [None, None, Some(300), None],
+        };
+
+        app.apply_load_done(crate::bus::LoadOutcome {
+            hash: TrackHash("deck-cues".to_owned()),
+            path: "/deck-cues.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 1.0,
+                cues,
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build(&[0.0; 4], 44_100),
+        });
+
+        // Then the deck owns the loaded cue snapshot for editing.
+        assert_eq!(app.deck.as_ref().expect("deck").cues, cues);
+        assert!(!app.deck.as_ref().expect("deck").cues_dirty);
+    }
+    #[test]
+    fn grid_change_resnaps_working_cues_and_queues_complete_save() {
+        // Given a loaded deck with an off-beat cue and a changed grid.
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("resnap".to_owned());
+        let cues = automixah_engine::timeline::types::CuePoints::with_in(0, 10_000);
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/resnap.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid {
+                    grid_bpm: 120.0,
+                    anchor_seconds: 0.0,
+                    ..Default::default()
+                },
+                bpm: 120.0,
+                key: djcore::key::Key {
+                    root: 0,
+                    mode: djcore::key::KeyMode::Major,
+                },
+                duration_seconds: 1.0,
+                cues,
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 44_100],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build(&vec![0.0; 44_100], 44_100),
+        });
+        let deck = app.deck.as_mut().expect("deck");
+        deck.edit_grid.anchor_seconds = 0.1;
+        deck.grid_dirty = true;
+
+        // When the changed grid is processed.
+        app.resnap_deck_cues_after_grid_change();
+
+        // Then the cue is re-snapped and a complete cue-set save is pending.
+        let deck = app.deck.as_ref().expect("deck");
+        assert_eq!(
+            deck.cues
+                .get(automixah_engine::timeline::types::CueKind::In, 0),
+            Some(4_410)
+        );
+        assert!(deck.cues_dirty);
+        assert_eq!(deck.pending_cue_save, Some((hash, deck.cues)));
+    }
     // Given a loaded record with a ready analysis.
     // When re-analysis runs (record cleared, started/done events applied).
     // Then the record derives queued → analyzing → ready with no
@@ -1546,6 +1924,23 @@ mod render_tests {
         app.render_out = " /out/mix.wav ".to_owned();
 
         let job = app.build_mixdown_job().expect("job");
+        let snapshotted = job.tracks[0].cues;
+
+        // When the live record changes after the job is built.
+        app.tracks.refresh_cues(
+            &TrackHash("r0".to_owned()),
+            &automixah_engine::timeline::types::CuePoints::with_in(0, 44_100 * 16),
+        );
+
+        // Then the in-flight job retains its click-time cue snapshot.
+        assert_eq!(job.tracks[0].cues, snapshotted);
+        assert_eq!(
+            job.tracks[0]
+                .cues
+                .get(automixah_engine::timeline::types::CueKind::In, 0),
+            Some(44_100 * 8),
+            "later session edits cannot mutate the job"
+        );
 
         assert_eq!(job.out, std::path::PathBuf::from("/out/mix.wav"));
         assert_eq!(job.tracks.len(), 2);
@@ -1553,7 +1948,9 @@ mod render_tests {
         assert_eq!(job.tracks[1].hash.0, "r1");
         // r0's seeded in-cue snapshots into the job.
         assert_eq!(
-            job.tracks[0].cues.get(automixah_engine::timeline::types::CueKind::In, 0),
+            job.tracks[0]
+                .cues
+                .get(automixah_engine::timeline::types::CueKind::In, 0),
             Some(44_100 * 8),
             "job carries the click-time in-cue snapshot"
         );

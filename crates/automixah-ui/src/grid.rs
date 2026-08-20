@@ -1,6 +1,8 @@
 //! The editable grid model: the canonical subset a human edits plus the
 //! projection back to full `BeatGrid` arrays.
 
+use automixah_engine::timeline::types::{CUE_SLOTS, CueKind, CuePoints};
+
 /// Manual-editable subset of a beat grid.
 ///
 /// `grid_bpm` + `anchor_seconds` + `downbeat_phase` fully determine the
@@ -17,6 +19,58 @@ pub struct EditableGrid {
 
 /// Beats per bar (4/4 assumed throughout).
 pub const BEATS_PER_BAR: usize = 4;
+
+/// Converts source frames to the nearest beat in `grid`, then clamps the
+/// result to the decoded source frame range.
+///
+/// The returned frame is the canonical persisted value. Reapplying this
+/// function with the same grid is stable because the candidate is rounded
+/// once to a source frame after nearest-beat selection.
+#[must_use]
+pub fn snap_source_frame_to_beat(
+    source_frame: u64,
+    sample_rate: u32,
+    total_frames: u64,
+    grid: &EditableGrid,
+) -> u64 {
+    if sample_rate == 0 {
+        return source_frame.min(total_frames);
+    }
+    #[expect(clippy::cast_precision_loss, reason = "source-frame editor math")]
+    let source_seconds = source_frame as f32 / sample_rate as f32;
+    let beat = grid.beat_seconds();
+    let nearest =
+        grid.anchor_seconds + ((source_seconds - grid.anchor_seconds) / beat).round() * beat;
+    #[expect(clippy::cast_possible_truncation, reason = "clamped source frame")]
+    let snapped = (nearest.max(0.0) * sample_rate as f32).round() as u64;
+    snapped.min(total_frames)
+}
+
+/// Re-snaps every occupied cue slot to the nearest beat in `grid`.
+///
+/// Slot order and empty slots are retained. Returns whether any source-frame
+/// position changed.
+pub fn resnap_cues(
+    cues: &mut CuePoints,
+    sample_rate: u32,
+    total_frames: u64,
+    grid: &EditableGrid,
+) -> bool {
+    let mut changed = false;
+    for kind in [CueKind::In, CueKind::Out] {
+        for slot in 0..CUE_SLOTS {
+            let Some(frame) = cues.get(kind, slot) else {
+                continue;
+            };
+            let snapped = snap_source_frame_to_beat(frame, sample_rate, total_frames, grid);
+            if snapped != frame {
+                cues.set(kind, slot, snapped);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
 
 impl EditableGrid {
     /// Beat period in seconds.
@@ -156,6 +210,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snap_source_frame_to_nearest_beat_is_stable_and_clamped() {
+        // Given a 120 BPM grid at 44.1 kHz and a source cue between beats.
+        let grid = grid(120.0, 0.25, 0);
+        let source = 44_100_u64 + 10_000;
+
+        // When snapping and snapping the result again.
+        let once = snap_source_frame_to_beat(source, 44_100, 100_000, &grid);
+        let twice = snap_source_frame_to_beat(once, 44_100, 100_000, &grid);
+
+        // Then nearest-beat storage is stable and remains in the source range.
+        assert_eq!(once, twice);
+        assert!(once <= 100_000);
+        assert_eq!(
+            snap_source_frame_to_beat(200_000, 44_100, 100_000, &grid),
+            100_000
+        );
+    }
+
+    #[test]
+    fn resnap_cues_moves_all_occupied_slots_without_reordering() {
+        // Given occupied in/out slots and one empty slot.
+        let mut cues = CuePoints {
+            ins: [Some(44_100 + 10_000), None, Some(90_000), None],
+            outs: [None, Some(120_000), None, None],
+        };
+        let original_slot_two = cues.get(CueKind::In, 2);
+        let grid = grid(120.0, 0.0, 0);
+
+        // When the working grid changes and all cues are re-snapped.
+        let changed = resnap_cues(&mut cues, 44_100, 150_000, &grid);
+
+        // Then every occupied slot is considered, while slot identity remains.
+        assert!(changed);
+        assert_eq!(cues.get(CueKind::In, 1), None);
+        assert_ne!(cues.get(CueKind::In, 2), original_slot_two);
+        assert!(cues.get(CueKind::Out, 1).is_some());
+    }
     // Given a 140 BPM grid anchored at 0.
     // When projected over 10 seconds.
     // Then beats land every 3/7 s starting at 0.

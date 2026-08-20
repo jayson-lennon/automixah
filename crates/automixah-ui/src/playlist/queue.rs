@@ -220,13 +220,13 @@ pub fn queued_state() -> AnalysisState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use automixah_engine::timeline::types::CueKind;
     use crate::bus::EventBus;
     use crate::playlist::store::PlaylistStoreService;
     use crate::playlist::store::in_memory::InMemoryPlaylistStore;
     use crate::services::{AppPaths, Services};
     use crate::store::GridStoreService;
     use crate::store::in_memory::InMemoryGridStore;
+    use automixah_engine::timeline::types::CueKind;
     use djcore::analyzer::{AnalyzerOutput, FakeAnalyzer};
 
     pub(crate) fn fake_services(analyzer_output: AnalyzerOutput) -> Services {

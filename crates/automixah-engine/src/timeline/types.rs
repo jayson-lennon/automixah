@@ -125,12 +125,39 @@ impl CuePoints {
     /// as out-after-in and transition-tail availability belong to the planner.
     #[must_use]
     pub fn earliest_valid(&self, kind: CueKind, duration_frames: u64) -> Option<u64> {
+        self.valid_positions(kind, duration_frames)
+            .map(|(_, frames)| frames)
+            .min()
+    }
+
+    /// Iterates valid `(slot, source_frames)` pairs without changing slot
+    /// identity or array order.
+    ///
+    /// A source position is valid when it is set and lies in the inclusive
+    /// source range `[0, duration_frames]`. Planner-level relationships, such
+    /// as requiring an out-cue after an in-cue, are intentionally not checked
+    /// here.
+    pub fn valid_positions(
+        &self,
+        kind: CueKind,
+        duration_frames: u64,
+    ) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.array(kind)
             .iter()
-            .flatten()
-            .copied()
-            .filter(|&frames| frames <= duration_frames)
-            .min()
+            .enumerate()
+            .filter_map(move |(slot, position)| {
+                position
+                    .filter(|&frames| frames <= duration_frames)
+                    .map(|frames| (slot, frames))
+            })
+    }
+
+    /// Whether one slot contains a source position in the inclusive range
+    /// `[0, duration_frames]`.
+    #[must_use]
+    pub fn slot_is_valid(&self, kind: CueKind, slot: usize, duration_frames: u64) -> bool {
+        self.get(kind, slot)
+            .is_some_and(|frames| frames <= duration_frames)
     }
 
     /// Whether any slot of `kind` is set.
@@ -470,6 +497,36 @@ mod tests {
         // Then source position, not slot number, determines precedence.
         assert_eq!(selected_in, Some(300));
         assert_eq!(selected_out, Some(100));
+    }
+
+    #[test]
+    fn cue_points_iterate_valid_positions_with_original_slots() {
+        // Given one out-of-range slot between two valid in-cues.
+        let cues = CuePoints {
+            ins: [Some(100), Some(1_001), Some(300), None],
+            ..CuePoints::default()
+        };
+
+        // When iterating positions within the source duration.
+        let positions: Vec<_> = cues.valid_positions(CueKind::In, 1_000).collect();
+
+        // Then only valid positions are returned with their stable slot IDs.
+        assert_eq!(positions, vec![(0, 100), (2, 300)]);
+    }
+
+    #[test]
+    fn cue_points_validate_slots_at_inclusive_source_end() {
+        // Given a cue exactly at the final source frame and one beyond it.
+        let cues = CuePoints {
+            outs: [Some(1_000), Some(1_001), None, None],
+            ..CuePoints::default()
+        };
+
+        // When checking each slot against a 1000-frame source.
+        // Then the inclusive endpoint is valid and the later cue is not.
+        assert!(cues.slot_is_valid(CueKind::Out, 0, 1_000));
+        assert!(!cues.slot_is_valid(CueKind::Out, 1, 1_000));
+        assert!(!cues.slot_is_valid(CueKind::Out, CUE_SLOTS, 1_000));
     }
 
     #[test]

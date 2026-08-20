@@ -477,6 +477,88 @@ mod tests {
         );
     }
 
+    // Given a cache-hit grid and independently persisted cue points.
+    // When the editor loads the file.
+    // Then the cache-hit outcome carries the cue snapshot.
+    #[test]
+    fn cache_hit_load_hydrates_persisted_cues() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("cached.wav");
+        let bytes = wav_bytes(2.0);
+        std::fs::write(&path, &bytes).expect("write wav");
+        let hash = TrackHash(identity::hex_sha256(&bytes));
+        let cues = CuePoints::with_in(3, 44_100 * 12);
+
+        services.runtime.block_on(async {
+            services
+                .grid_store
+                .put(
+                    &hash,
+                    &GridOverride {
+                        grid_bpm: 128.0,
+                        anchor_seconds: 0.0,
+                        downbeat_phase: 0,
+                        updated_at: 1,
+                        key: None,
+                    },
+                )
+                .await
+                .expect("seed grid");
+            services
+                .cue_store
+                .put(&hash, &cues)
+                .await
+                .expect("seed cues");
+        });
+
+        let bus = EventBus::without_repaint();
+        spawn_load(&services, bus.sender(), path);
+        let (events, outcome) = drain_done(&bus);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::LoadStage(LoadStage::CacheHit))),
+            "stored grid takes the cache-hit path"
+        );
+        assert_eq!(outcome.expect("load").analysis.cues, cues);
+    }
+
+    // Given independently persisted cue points but no stored grid.
+    // When the editor performs fresh analysis.
+    // Then the fresh outcome retains the existing cue snapshot.
+    #[test]
+    fn fresh_load_hydrates_persisted_cues() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("fresh.wav");
+        let bytes = wav_bytes(2.0);
+        std::fs::write(&path, &bytes).expect("write wav");
+        let hash = TrackHash(identity::hex_sha256(&bytes));
+        let cues = CuePoints {
+            outs: [None, Some(44_100 * 20), None, None],
+            ..CuePoints::default()
+        };
+        services.runtime.block_on(async {
+            services
+                .cue_store
+                .put(&hash, &cues)
+                .await
+                .expect("seed cues");
+        });
+
+        let bus = EventBus::without_repaint();
+        spawn_load(&services, bus.sender(), path);
+        let (events, outcome) = drain_done(&bus);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::LoadStage(LoadStage::Analyzing))),
+            "missing grid takes the fresh-analysis path"
+        );
+        assert_eq!(outcome.expect("load").analysis.cues, cues);
+    }
+
     // Given a nonexistent path.
     // When spawned.
     // Then LoadDone carries the rendered error, no panic.

@@ -447,23 +447,86 @@ mod tests {
     // When v4 completes.
     // Then the legacy playlist and grid data remains intact.
     #[test]
-    fn v4_migration_keeps_legacy_rows() {
+    fn v4_migration_from_legacy_v3_preserves_rows() {
+        // Given a database that has completed v3 with existing grid and
+        // playlist rows but does not yet have the cue-point table.
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        run_migrations(&mut conn).expect("migrations apply");
-        conn.execute(
-            "INSERT INTO tracks VALUES ('legacy', 'T', 'A', 12.0, 0)",
-            [],
+        bootstrap_tracking_table(&mut conn).expect("bootstrap");
+        conn.execute_batch(
+            "CREATE TABLE beat_grids (\
+             track_hash TEXT PRIMARY KEY,\
+             grid_bpm REAL NOT NULL,\
+             anchor_seconds REAL NOT NULL,\
+             downbeat_phase INTEGER NOT NULL CHECK (downbeat_phase BETWEEN 0 AND 3),\
+             updated_at INTEGER NOT NULL,\
+             key_root INTEGER,\
+             key_mode INTEGER);\
+             CREATE TABLE tracks (\
+             track_hash TEXT PRIMARY KEY,\
+             title TEXT NOT NULL,\
+             artist TEXT NOT NULL,\
+             duration_seconds REAL,\
+             updated_at INTEGER NOT NULL);\
+             CREATE TABLE playlists (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT,\
+             name TEXT NOT NULL UNIQUE,\
+             created_at INTEGER NOT NULL);\
+             CREATE TABLE playlist_tracks (\
+             playlist_id INTEGER NOT NULL,\
+             position INTEGER NOT NULL,\
+             track_hash TEXT NOT NULL,\
+             added_path TEXT NOT NULL,\
+             PRIMARY KEY (playlist_id, position),\
+             UNIQUE (playlist_id, track_hash));\
+             INSERT INTO beat_grids VALUES ('legacy-grid', 128.0, 0.5, 2, 7, 9, 1);\
+             INSERT INTO tracks VALUES ('legacy-track', 'Title', 'Artist', 12.0, 8);\
+             INSERT INTO playlists VALUES (1, 'Legacy playlist', 9);\
+             INSERT INTO playlist_tracks VALUES (1, 0, 'legacy-track', '/music/legacy.ogg');\
+             INSERT INTO _migrations (version, name) VALUES (1, 'create_beat_grids');\
+             INSERT INTO _migrations (version, name) VALUES (2, 'add_beat_grids_key_columns');\
+             INSERT INTO _migrations (version, name) VALUES (3, 'create_playlist_tables');",
         )
-        .expect("insert legacy track");
+        .expect("seed v3");
 
-        let title: String = conn
+        // When the pending v4 migration runs.
+        run_migrations(&mut conn).expect("migrate v3 to v4");
+
+        // Then the existing v3 data remains intact and cue storage is added.
+        let grid: (f64, i64, i64) = conn
             .query_row(
-                "SELECT title FROM tracks WHERE track_hash = 'legacy'",
+                "SELECT grid_bpm, key_root, key_mode FROM beat_grids WHERE track_hash = 'legacy-grid'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy grid");
+        assert_eq!(grid, (128.0, 9, 1));
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT title FROM tracks WHERE track_hash = 'legacy-track'",
                 [],
                 |row| row.get(0),
             )
-            .expect("legacy track");
-        assert_eq!(title, "T");
+            .expect("legacy track"),
+            "Title"
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT added_path FROM playlist_tracks WHERE playlist_id = 1 AND position = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy playlist row"),
+            "/music/legacy.ogg"
+        );
+        assert!(
+            conn.query_row::<String, _, _>(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cue_points'",
+                [],
+                |row| row.get(0),
+            )
+            .is_ok()
+        );
+        assert_eq!(current_version(&mut conn).expect("version"), 4);
     }
 
     #[test]

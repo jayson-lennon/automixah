@@ -74,8 +74,13 @@ pub enum Event {
         hash: TrackHash,
         cues: automixah_engine::timeline::types::CuePoints,
     },
-    /// A cue save failed; the string carries the rendered report.
-    CuesSaveFailed(String),
+    /// A cue save failed; the string carries the rendered report and the
+    /// failed snapshot identifies which in-flight write completed.
+    CuesSaveFailed {
+        hash: TrackHash,
+        cues: automixah_engine::timeline::types::CuePoints,
+        message: String,
+    },
     // Track events (address tracks by content hash; mutate records).
     /// Tags resolved for a hash (add-task or hydration).
     TagsResolved { hash: TrackHash, tags: TrackTags },
@@ -184,7 +189,7 @@ impl std::fmt::Debug for Event {
                 .debug_struct("CuesSaved")
                 .field("hash", hash)
                 .finish_non_exhaustive(),
-            Self::CuesSaveFailed(message) => {
+            Self::CuesSaveFailed { message, .. } => {
                 f.debug_tuple("CuesSaveFailed").field(message).finish()
             }
             Self::TagsResolved { hash, .. } => f

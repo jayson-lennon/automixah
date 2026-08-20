@@ -174,7 +174,7 @@ impl Tracks {
         if let Some(record) = self.by_hash.get_mut(hash)
             && let AnalysisState::Ready(analysis) = &mut record.analysis
         {
-            analysis.cues = cues.clone();
+            analysis.cues = *cues;
         }
     }
 
