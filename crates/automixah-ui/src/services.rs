@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use error_stack::Report;
 
-use crate::store::GridStoreService;
+use crate::store::{CueStoreService, GridStoreService};
 
 /// Application filesystem paths, resolved once at startup.
 #[derive(Debug, Clone)]
@@ -69,6 +69,8 @@ pub struct Services {
     pub paths: AppPaths,
     /// Grid override persistence (SQLite behind a trait).
     pub grid_store: GridStoreService,
+    /// Cue point persistence (SQLite behind a trait).
+    pub cue_store: CueStoreService,
     /// Playlist + track-tag persistence (SQLite behind a trait).
     pub playlist_store: crate::playlist::store::PlaylistStoreService,
     /// Analysis backend used by the playlist queue (injected so tests

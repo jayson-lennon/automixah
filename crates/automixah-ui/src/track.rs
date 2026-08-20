@@ -283,6 +283,9 @@ mod tests {
         let services = Services {
             paths: AppPaths::for_test(dir.path()),
             grid_store: GridStoreService::new(std::sync::Arc::new(InMemoryGridStore::new())),
+            cue_store: crate::store::CueStoreService::new(std::sync::Arc::new(
+                crate::store::in_memory::InMemoryCueStore::new(),
+            )),
             playlist_store: crate::playlist::store::PlaylistStoreService::new(std::sync::Arc::new(
                 crate::playlist::store::in_memory::InMemoryPlaylistStore::new(),
             )),

@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use daow::{FromRow, Pool};
 use error_stack::{Report, ResultExt as _};
 
-use automixah_engine::timeline::types::TrackHash;
+use automixah_engine::timeline::types::{CUE_SLOTS, CueKind, CuePoints, TrackHash};
 
-use super::{GridOverride, GridStore, GridStoreError};
+use super::{CueStore, CueStoreError, GridOverride, GridStore, GridStoreError};
 
 /// Number of pooled connections. Store IO is tiny; 4 matches jinn's
 /// default and comfortably covers UI-frame-sized bursts.
@@ -60,7 +60,61 @@ impl From<GridRow> for GridOverride {
     }
 }
 
-/// Decodes the nullable key columns into a [`djcore::key::Key`].
+#[derive(Debug, Clone)]
+struct CueRow {
+    kind: String,
+    slot: i64,
+    position_frames: i64,
+}
+
+impl FromRow for CueRow {
+    fn from_row(row: &daow::Row) -> daow::Result<Self> {
+        Ok(Self {
+            kind: row.get("kind")?,
+            slot: row.get("slot")?,
+            position_frames: row.get("position_frames")?,
+        })
+    }
+}
+
+/// Converts a persisted SQLite frame into the unsigned source-frame domain.
+fn source_frames(value: i64) -> Result<u64, Report<CueStoreError>> {
+    u64::try_from(value)
+        .change_context(CueStoreError)
+        .attach("cue position_frames must be non-negative")
+}
+
+/// Converts a source-frame position into SQLite's signed integer domain.
+fn sqlite_frames(value: u64) -> Result<i64, Report<CueStoreError>> {
+    i64::try_from(value)
+        .change_context(CueStoreError)
+        .attach("cue source frames exceed SQLite integer range")
+}
+
+/// Builds the in-memory cue arrays from validated database rows.
+fn cues_from_rows(rows: Vec<CueRow>) -> Result<CuePoints, Report<CueStoreError>> {
+    rows.into_iter()
+        .try_fold(CuePoints::default(), |mut cues, row| {
+            let kind = match row.kind.as_str() {
+                "in" => CueKind::In,
+                "out" => CueKind::Out,
+                _ => {
+                    return Err(Report::new(CueStoreError).attach("cue row has unknown kind"));
+                }
+            };
+            let slot = usize::try_from(row.slot)
+                .change_context(CueStoreError)
+                .attach("cue slot is negative")?;
+            if slot >= CUE_SLOTS {
+                return Err(
+                    Report::new(CueStoreError).attach("cue slot is outside four-slot range")
+                );
+            }
+            cues.set(kind, slot, source_frames(row.position_frames)?);
+            Ok(cues)
+        })
+}
+
 ///
 /// `key_root` is validated to 0..=11 and `key_mode` to 0 (major) / 1
 /// (minor); anything else reads as `None` rather than erroring — a
@@ -138,6 +192,82 @@ impl SqliteGridStore {
 }
 
 #[async_trait]
+impl CueStore for SqliteGridStore {
+    async fn get(&self, hash: &TrackHash) -> Result<CuePoints, Report<CueStoreError>> {
+        let rows: Vec<CueRow> = self
+            .pool
+            .query_all(
+                "SELECT kind, slot, position_frames FROM cue_points WHERE track_hash = ? ORDER BY kind, slot",
+                vec![Box::new(hash.0.clone())],
+            )
+            .await
+            .change_context(CueStoreError)
+            .attach("failed to load cue points")?;
+        cues_from_rows(rows)
+    }
+
+    async fn put(&self, hash: &TrackHash, cues: &CuePoints) -> Result<(), Report<CueStoreError>> {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .change_context(CueStoreError)
+            .attach("begin cue-point replacement")?;
+        tx.execute(
+            "DELETE FROM cue_points WHERE track_hash = ?",
+            vec![Box::new(hash.0.clone())],
+        )
+        .await
+        .change_context(CueStoreError)
+        .attach("delete previous cue points")?;
+
+        let updated_at = crate::track::identity::now_unix();
+        for (kind, slots) in [("in", &cues.ins), ("out", &cues.outs)] {
+            for (slot, position) in slots.iter().enumerate() {
+                let Some(position) = position else {
+                    continue;
+                };
+                let position = sqlite_frames(*position)?;
+                tx.execute(
+                    "INSERT INTO cue_points (track_hash, kind, slot, position_frames, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    vec![
+                        Box::new(hash.0.clone()),
+                        Box::new(kind.to_owned()),
+                        Box::new(i64::try_from(slot).unwrap_or(i64::MAX)),
+                        Box::new(position),
+                        Box::new(updated_at),
+                    ],
+                )
+                .await
+                .change_context(CueStoreError)
+                .attach("insert cue point")?;
+            }
+        }
+        tx.commit()
+            .await
+            .change_context(CueStoreError)
+            .attach("commit cue-point replacement")?;
+        Ok(())
+    }
+
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<CueStoreError>> {
+        self.pool
+            .execute(
+                "DELETE FROM cue_points WHERE track_hash = ?",
+                vec![Box::new(hash.0.clone())],
+            )
+            .await
+            .change_context(CueStoreError)
+            .attach("failed to delete cue points")?;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "sqlite-cues"
+    }
+}
+
+#[async_trait]
 impl GridStore for SqliteGridStore {
     async fn get(&self, hash: &TrackHash) -> Result<Option<GridOverride>, Report<GridStoreError>> {
         let row: Option<GridRow> = self
@@ -211,6 +341,112 @@ impl GridStore for SqliteGridStore {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn sqlite_cue_store_round_trips_all_slots() {
+        // Given a SQLite library and all eight cue slots.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let hash = TrackHash("cue-all".to_owned());
+        let cues = CuePoints {
+            ins: [Some(10), Some(20), Some(30), Some(40)],
+            outs: [Some(50), Some(60), Some(70), Some(80)],
+        };
+
+        // When saving and loading the cue set.
+        <SqliteGridStore as CueStore>::put(&store, &hash, &cues)
+            .await
+            .expect("save cues");
+        let loaded = <SqliteGridStore as CueStore>::get(&store, &hash)
+            .await
+            .expect("load cues");
+
+        // Then every slot and kind round-trips.
+        assert_eq!(loaded, cues);
+    }
+
+    #[tokio::test]
+    async fn sqlite_cue_store_replacing_with_empty_clears_rows() {
+        // Given a saved cue set.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let hash = TrackHash("cue-empty".to_owned());
+        let cues = CuePoints {
+            ins: [Some(10), None, None, None],
+            ..CuePoints::default()
+        };
+        <SqliteGridStore as CueStore>::put(&store, &hash, &cues)
+            .await
+            .expect("save cues");
+
+        // When replacing it with an empty set.
+        <SqliteGridStore as CueStore>::put(&store, &hash, &CuePoints::default())
+            .await
+            .expect("clear cues");
+
+        // Then loading returns an empty set.
+        let loaded = <SqliteGridStore as CueStore>::get(&store, &hash)
+            .await
+            .expect("load cues");
+        assert_eq!(loaded, CuePoints::default());
+    }
+
+    #[tokio::test]
+    async fn sqlite_cue_store_delete_removes_rows() {
+        // Given a saved cue set.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let hash = TrackHash("cue-delete".to_owned());
+        let cues = CuePoints {
+            outs: [Some(25), None, None, None],
+            ..CuePoints::default()
+        };
+        <SqliteGridStore as CueStore>::put(&store, &hash, &cues)
+            .await
+            .expect("save cues");
+
+        // When deleting the hash's cues.
+        <SqliteGridStore as CueStore>::delete(&store, &hash)
+            .await
+            .expect("delete cues");
+
+        // Then loading returns an empty set.
+        let loaded = <SqliteGridStore as CueStore>::get(&store, &hash)
+            .await
+            .expect("load cues");
+        assert_eq!(loaded, CuePoints::default());
+    }
+
+    #[tokio::test]
+    async fn sqlite_cue_store_rejects_negative_frame_rows() {
+        // Given a migrated library containing a malformed legacy cue row.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        store
+            .pool()
+            .execute(
+                "INSERT INTO cue_points (track_hash, kind, slot, position_frames, updated_at) VALUES ('bad', 'in', 0, -1, 0)",
+                vec![],
+            )
+            .await
+            .expect_err("schema rejects negative frames");
+
+        // When loading a hash without valid rows.
+        let loaded = <SqliteGridStore as CueStore>::get(&store, &TrackHash("bad".to_owned()))
+            .await
+            .expect("load empty cues");
+
+        // Then the result is the empty cue set.
+        assert_eq!(loaded, CuePoints::default());
+    }
+
     fn grid_override() -> GridOverride {
         GridOverride {
             grid_bpm: 139.984,
@@ -237,8 +473,15 @@ mod tests {
         let hash = TrackHash("cafe01".to_owned());
         let grid = grid_override();
 
-        store.put(&hash, &grid).await.expect("save");
-        assert_eq!(store.get(&hash).await.expect("load"), Some(grid));
+        <SqliteGridStore as GridStore>::put(&store, &hash, &grid)
+            .await
+            .expect("save");
+        assert_eq!(
+            <SqliteGridStore as GridStore>::get(&store, &hash)
+                .await
+                .expect("load"),
+            Some(grid)
+        );
     }
 
     // Given a saved override.
@@ -267,8 +510,12 @@ mod tests {
             key: None,
         };
 
-        store.put(&hash, &first).await.expect("first save");
-        store.put(&hash, &second).await.expect("upsert");
+        <SqliteGridStore as GridStore>::put(&store, &hash, &first)
+            .await
+            .expect("first save");
+        <SqliteGridStore as GridStore>::put(&store, &hash, &second)
+            .await
+            .expect("upsert");
 
         let rows = store
             .pool
@@ -277,7 +524,12 @@ mod tests {
             .expect("count rows")
             .expect("row present");
         assert_eq!(rows, 1, "upsert keeps a single row");
-        assert_eq!(store.get(&hash).await.expect("load"), Some(second));
+        assert_eq!(
+            <SqliteGridStore as GridStore>::get(&store, &hash)
+                .await
+                .expect("load"),
+            Some(second)
+        );
     }
 
     // Given a stored key.
@@ -292,7 +544,9 @@ mod tests {
 
         let hash = TrackHash("cafe0k".to_owned());
         let analyzed = grid_override();
-        store.put(&hash, &analyzed).await.expect("save analyzed");
+        <SqliteGridStore as GridStore>::put(&store, &hash, &analyzed)
+            .await
+            .expect("save analyzed");
 
         let manual_edit = GridOverride {
             grid_bpm: 140.0,
@@ -301,9 +555,14 @@ mod tests {
             updated_at: analyzed.updated_at + 1,
             key: None,
         };
-        store.put(&hash, &manual_edit).await.expect("save edit");
+        <SqliteGridStore as GridStore>::put(&store, &hash, &manual_edit)
+            .await
+            .expect("save edit");
 
-        let reloaded = store.get(&hash).await.expect("load").expect("row");
+        let reloaded = <SqliteGridStore as GridStore>::get(&store, &hash)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(reloaded.grid_bpm, 140.0, "grid values replaced");
         assert_eq!(reloaded.key, analyzed.key, "key preserved through edit");
     }
@@ -328,11 +587,18 @@ mod tests {
         let first = SqliteGridStore::open_or_create(&path)
             .await
             .expect("open 1");
-        first.put(&hash, &grid).await.expect("save");
+        <SqliteGridStore as GridStore>::put(&first, &hash, &grid)
+            .await
+            .expect("save");
 
         let second = SqliteGridStore::open_or_create(&path)
             .await
             .expect("open 2");
-        assert_eq!(second.get(&hash).await.expect("reload"), Some(grid));
+        assert_eq!(
+            <SqliteGridStore as GridStore>::get(&second, &hash)
+                .await
+                .expect("reload"),
+            Some(grid)
+        );
     }
 }

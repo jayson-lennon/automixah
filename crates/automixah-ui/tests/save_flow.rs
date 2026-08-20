@@ -9,9 +9,10 @@ use automixah_ui_lib::playlist::store::PlaylistStoreService;
 use automixah_ui_lib::playlist::store::in_memory::InMemoryPlaylistStore;
 use automixah_ui_lib::services::{AppPaths, Services};
 use automixah_ui_lib::store::CountingStore;
+use automixah_ui_lib::store::in_memory::InMemoryCueStore;
 use automixah_ui_lib::store::in_memory::InMemoryGridStore;
 use automixah_ui_lib::store::sqlite::SqliteGridStore;
-use automixah_ui_lib::store::{GridOverride, GridStoreService};
+use automixah_ui_lib::store::{CueStoreService, GridOverride, GridStoreService};
 use automixah_ui_lib::tracks::Analysis;
 
 fn fake_analysis() -> Analysis {
@@ -54,6 +55,7 @@ fn each_grid_mutation_flushes_one_put() {
             library_db: dir.path().join("library.sqlite"),
         },
         grid_store: GridStoreService::new(counting.clone()),
+        cue_store: CueStoreService::new(Arc::new(InMemoryCueStore::new())),
         playlist_store: PlaylistStoreService::new(Arc::new(InMemoryPlaylistStore::new())),
         analyzer: std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
             djcore::analyzer::AnalyzerOutput {

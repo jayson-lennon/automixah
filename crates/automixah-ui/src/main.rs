@@ -6,8 +6,8 @@
 
 use automixah_ui_lib::app::AutomixahUiApp;
 use automixah_ui_lib::services::{AppPaths, Services};
-use automixah_ui_lib::store::GridStoreService;
 use automixah_ui_lib::store::sqlite::SqliteGridStore;
+use automixah_ui_lib::store::{CueStoreService, GridStoreService};
 
 use error_stack::{Report, ResultExt as _};
 
@@ -54,7 +54,8 @@ fn run() -> Result<(), Report<UiError>> {
         );
 
         Services {
-            grid_store: GridStoreService::new(std::sync::Arc::new(store)),
+            grid_store: GridStoreService::new(std::sync::Arc::new(store.clone())),
+            cue_store: CueStoreService::new(std::sync::Arc::new(store.clone())),
             playlist_store: automixah_ui_lib::playlist::store::PlaylistStoreService::new(
                 std::sync::Arc::new(playlist_store),
             ),

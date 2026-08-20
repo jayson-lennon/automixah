@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use error_stack::Report;
 use parking_lot::Mutex;
 
-use automixah_engine::timeline::types::TrackHash;
+use automixah_engine::timeline::types::{CuePoints, TrackHash};
 
-use super::{GridOverride, GridStore, GridStoreError};
+use super::{CueStore, CueStoreError, GridOverride, GridStore, GridStoreError};
 
 /// HashMap-backed store. Last write wins per hash.
 #[derive(Debug, Default)]
@@ -16,11 +16,48 @@ pub struct InMemoryGridStore {
     grids: Mutex<HashMap<String, GridOverride>>,
 }
 
+/// HashMap-backed cue store. Replaces the full cue set per hash.
+#[derive(Debug, Default)]
+pub struct InMemoryCueStore {
+    cues: Mutex<HashMap<String, CuePoints>>,
+}
+
 impl InMemoryGridStore {
     /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// HashMap-backed cue store.
+impl InMemoryCueStore {
+    /// Creates an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl CueStore for InMemoryCueStore {
+    async fn get(&self, hash: &TrackHash) -> Result<CuePoints, Report<CueStoreError>> {
+        let cues = self.cues.lock();
+        Ok(cues.get(&hash.0).copied().unwrap_or_default())
+    }
+
+    async fn put(&self, hash: &TrackHash, cues: &CuePoints) -> Result<(), Report<CueStoreError>> {
+        self.cues.lock().insert(hash.0.clone(), *cues);
+        Ok(())
+    }
+
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<CueStoreError>> {
+        self.cues.lock().remove(&hash.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "in-memory-cues"
     }
 }
 
@@ -118,4 +155,67 @@ async fn missing_hash_is_none_not_error() {
     let result = store.get(&hash).await;
     let value = result.expect("lookup succeeds");
     assert!(value.is_none());
+}
+
+/// Given an in-memory cue store.
+/// When a full cue set is saved and loaded.
+/// Then every slot round-trips.
+#[tokio::test]
+async fn in_memory_cues_round_trip() {
+    use super::CueStore as _;
+
+    let store = InMemoryCueStore::new();
+    let hash = TrackHash("cues".to_owned());
+    let cues = CuePoints {
+        ins: [Some(100), Some(200), None, None],
+        outs: [None, None, Some(900), Some(950)],
+    };
+
+    store.put(&hash, &cues).await.expect("save");
+    assert_eq!(store.get(&hash).await.expect("load"), cues);
+}
+
+/// Given a saved cue set.
+/// When it is replaced with an empty set and then deleted.
+/// Then loading returns an empty set each time.
+#[tokio::test]
+async fn in_memory_cues_clear_and_delete() {
+    use super::CueStore as _;
+
+    let store = InMemoryCueStore::new();
+    let hash = TrackHash("cues".to_owned());
+    let cues = CuePoints {
+        outs: [Some(5), None, None, None],
+        ..CuePoints::default()
+    };
+    store.put(&hash, &cues).await.expect("save");
+
+    store
+        .put(&hash, &CuePoints::default())
+        .await
+        .expect("clear");
+    assert_eq!(store.get(&hash).await.expect("load"), CuePoints::default());
+
+    store.delete(&hash).await.expect("delete");
+    assert_eq!(store.get(&hash).await.expect("load"), CuePoints::default());
+}
+
+/// Given two hashes.
+/// When one has cues and the other does not.
+/// Then each returns only its own set.
+#[tokio::test]
+async fn in_memory_cues_are_per_hash() {
+    use super::CueStore as _;
+
+    let store = InMemoryCueStore::new();
+    let a = TrackHash("a".to_owned());
+    let b = TrackHash("b".to_owned());
+    let cues = CuePoints {
+        ins: [Some(42), None, None, None],
+        ..CuePoints::default()
+    };
+    store.put(&a, &cues).await.expect("save");
+
+    assert_eq!(store.get(&a).await.expect("load a"), cues);
+    assert_eq!(store.get(&b).await.expect("load b"), CuePoints::default());
 }

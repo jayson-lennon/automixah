@@ -10,8 +10,7 @@
 //! call the same [`run_migrations`] before reading grids.
 //!
 //! Versions today: v1 (`beat_grids`), v2 (musical-key columns on
-//! `beat_grids`), v3 (playlist tables). The runner structure mirrors the
-//! schema-crate pattern used by jinn's session store so additional versions slot in mechanically.
+//! `beat_grids`), v3 (playlist tables), and v4 (`cue_points`). The runner structure mirrors the schema-crate pattern used by jinn's session store so additional versions slot in mechanically.
 
 use error_stack::{Report, ResultExt as _};
 use wherror::Error;
@@ -20,7 +19,7 @@ use wherror::Error;
 ///
 /// `run_pending` skips `BEGIN` when the DB is already at this version, so an
 /// up-to-date database pays no transaction cost on startup.
-const LATEST_VERSION: i32 = 3;
+const LATEST_VERSION: i32 = 4;
 
 /// Runs all pending schema migrations on the given connection.
 ///
@@ -146,6 +145,10 @@ fn apply_migration_chain(
         migrate_v3(conn)?;
         record_version(conn, 3, "create_playlist_tables")?;
     }
+    if current < 4 {
+        migrate_v4(conn)?;
+        record_version(conn, 4, "create_cue_points")?;
+    }
     Ok(())
 }
 
@@ -217,6 +220,25 @@ fn migrate_v3(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrat
     Ok(())
 }
 
+/// v4: Four numbered in-cue and four numbered out-cue slots per track.
+///
+/// Cue positions are source frames and are kept separate from beat grids so
+/// forced grid re-analysis does not delete user-authored source positions.
+fn migrate_v4(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrationError>> {
+    conn.execute_batch(
+        "CREATE TABLE cue_points (\
+         track_hash TEXT NOT NULL,\
+         kind TEXT NOT NULL CHECK (kind IN ('in', 'out')),\
+         slot INTEGER NOT NULL CHECK (slot BETWEEN 0 AND 3),\
+         position_frames INTEGER NOT NULL CHECK (position_frames >= 0),\
+         updated_at INTEGER NOT NULL,\
+         PRIMARY KEY (track_hash, kind, slot));",
+    )
+    .change_context(SchemaMigrationError)
+    .attach("failed to create cue_points table")?;
+    Ok(())
+}
+
 /// Error type for schema migration failures.
 ///
 /// Carries no variants — the failure detail lives in the `error_stack::Report`
@@ -250,7 +272,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .expect("count versions");
-        assert_eq!(count, 3, "one version row per applied migration");
+        assert_eq!(count, 4, "one version row per applied migration");
     }
 
     // Given a migrated database.
@@ -311,12 +333,12 @@ mod tests {
 
         let tables: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tracks', 'playlists', 'playlist_tracks')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tracks', 'playlists', 'playlist_tracks', 'cue_points')",
                 [],
                 |row| row.get(0),
             )
             .expect("count tables");
-        assert_eq!(tables, 3, "v3 tables created");
+        assert_eq!(tables, 4, "v3 and v4 tables exist");
     }
 
     // Given a fresh database.
@@ -354,9 +376,96 @@ mod tests {
         assert!(result.is_err(), "CHECK constraint rejects phase 7");
     }
 
-    // Given a migrated database.
-    // When the same track_hash is inserted twice.
-    // Then the PRIMARY KEY rejects the duplicate.
+    #[test]
+    fn cue_points_schema_rejects_invalid_kind_and_slot() {
+        // Given a fully migrated database.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+
+        // When invalid cue rows are inserted.
+        let bad_kind = conn.execute(
+            "INSERT INTO cue_points (track_hash, kind, slot, position_frames, updated_at) VALUES ('h', 'middle', 0, 1, 0)",
+            [],
+        );
+        let bad_slot = conn.execute(
+            "INSERT INTO cue_points (track_hash, kind, slot, position_frames, updated_at) VALUES ('h', 'in', 4, 1, 0)",
+            [],
+        );
+
+        // Then both rows are rejected by the schema checks.
+        assert!(bad_kind.is_err(), "kind check rejects unknown kinds");
+        assert!(bad_slot.is_err(), "slot check rejects slot 4");
+    }
+
+    #[test]
+    fn cue_points_schema_preserves_all_slots_and_kinds() {
+        // Given a fully migrated database.
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+
+        // When all eight numbered slots are inserted.
+        for kind in ["in", "out"] {
+            for slot in 0..4 {
+                conn.execute(
+                    "INSERT INTO cue_points (track_hash, kind, slot, position_frames, updated_at) VALUES (?, ?, ?, ?, 0)",
+                    rusqlite::params!["h", kind, slot, slot + 1],
+                )
+                .expect("insert cue slot");
+            }
+        }
+
+        // Then both cue kinds retain all four slots.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cue_points WHERE track_hash = 'h'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cue slots");
+        assert_eq!(count, 8);
+    }
+
+    // Given a fresh database.
+    // When migrations run.
+    // Then the cue table exists alongside the earlier schema.
+    #[test]
+    fn v4_creates_cue_points_table() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+
+        let table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cue_points'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cue_points table");
+        assert_eq!(table, "cue_points");
+    }
+
+    // Given the existing v3 migration test above.
+    // When v4 completes.
+    // Then the legacy playlist and grid data remains intact.
+    #[test]
+    fn v4_migration_keeps_legacy_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+        conn.execute(
+            "INSERT INTO tracks VALUES ('legacy', 'T', 'A', 12.0, 0)",
+            [],
+        )
+        .expect("insert legacy track");
+
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM tracks WHERE track_hash = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy track");
+        assert_eq!(title, "T");
+    }
+
     #[test]
     fn track_hash_is_primary_key() {
         let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");

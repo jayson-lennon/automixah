@@ -52,6 +52,98 @@ impl std::fmt::Display for TrackHash {
     }
 }
 
+/// Number of cue slots per kind.
+pub const CUE_SLOTS: usize = 4;
+
+/// Which kind of cue a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CueKind {
+    /// Where the track begins (the segment's source start).
+    In,
+    /// Where the transition automation begins (the window start).
+    Out,
+}
+
+/// User-authored cue points for one track, as source-frame positions.
+///
+/// Slots are identifiers only — the UI numbers them 1..=4 — and never
+/// determine precedence. The renderer selects the earliest valid position
+/// of each kind; a slot number can therefore win even when a lower-numbered
+/// slot holds a later position.
+///
+/// Positions are source frames at the track's own sample rate; they are
+/// snapped to the nearest grid beat in the UI before persistence and
+/// consumed verbatim by the planner (no plan-time snapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CuePoints {
+    /// In-cue source frames per slot (`None` = unset).
+    pub ins: [Option<u64>; CUE_SLOTS],
+    /// Out-cue source frames per slot (`None` = unset).
+    pub outs: [Option<u64>; CUE_SLOTS],
+}
+
+impl CuePoints {
+    /// The position in `kind` slot `slot`, if set.
+    #[must_use]
+    pub fn get(&self, kind: CueKind, slot: usize) -> Option<u64> {
+        self.array(kind).get(slot).copied().flatten()
+    }
+
+    /// Sets `kind` slot `slot` to `frames`. Out-of-range slots are ignored.
+    pub fn set(&mut self, kind: CueKind, slot: usize, frames: u64) {
+        if let Some(entry) = self.array_mut(kind).get_mut(slot) {
+            *entry = Some(frames);
+        }
+    }
+
+    /// Clears `kind` slot `slot`. Out-of-range slots are ignored.
+    pub fn delete(&mut self, kind: CueKind, slot: usize) {
+        if let Some(entry) = self.array_mut(kind).get_mut(slot) {
+            *entry = None;
+        }
+    }
+
+    /// The earliest set position of `kind` at or before `duration_frames`.
+    ///
+    /// Positions past the track's end are ignored. Relationship checks such
+    /// as out-after-in and transition-tail availability belong to the planner.
+    #[must_use]
+    pub fn earliest_valid(&self, kind: CueKind, duration_frames: u64) -> Option<u64> {
+        self.array(kind)
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&frames| frames <= duration_frames)
+            .min()
+    }
+
+    /// Whether any slot of `kind` is set.
+    #[must_use]
+    pub fn has_any(&self, kind: CueKind) -> bool {
+        self.array(kind).iter().any(Option::is_some)
+    }
+
+    /// Whether no slot of either kind is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.has_any(CueKind::In) && !self.has_any(CueKind::Out)
+    }
+
+    fn array(&self, kind: CueKind) -> &[Option<u64>; CUE_SLOTS] {
+        match kind {
+            CueKind::In => &self.ins,
+            CueKind::Out => &self.outs,
+        }
+    }
+
+    fn array_mut(&mut self, kind: CueKind) -> &mut [Option<u64>; CUE_SLOTS] {
+        match kind {
+            CueKind::In => &mut self.ins,
+            CueKind::Out => &mut self.outs,
+        }
+    }
+}
+
 /// The persisted analysis of one track (the OPFS `/analysis/<hash>.json`
 /// shape). Wraps the djcore analyzer output plus library metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +435,79 @@ mod tests {
         // Then the length is 300 samples.
         assert_eq!(w.len_samples(), 300);
         assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn cue_points_select_earliest_source_position_without_reordering_slots() {
+        // Given cues whose earliest in-cue is stored in slot 4.
+        let cues = CuePoints {
+            ins: [Some(900), None, None, Some(300)],
+            outs: [Some(700), None, Some(100), None],
+        };
+
+        // When selecting valid cues within a 1000-frame track.
+        let selected_in = cues.earliest_valid(CueKind::In, 1_000);
+        let selected_out = cues.earliest_valid(CueKind::Out, 1_000);
+
+        // Then source position, not slot number, determines precedence.
+        assert_eq!(selected_in, Some(300));
+        assert_eq!(selected_out, Some(100));
+    }
+
+    #[test]
+    fn cue_points_ignore_positions_after_track_end() {
+        // Given an in-cue beyond the source duration.
+        let cues = CuePoints {
+            ins: [Some(1_001), None, None, None],
+            ..CuePoints::default()
+        };
+
+        // When selecting a cue within a 1000-frame track.
+        let selected = cues.earliest_valid(CueKind::In, 1_000);
+
+        // Then the out-of-range cue is not valid.
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn cue_points_keep_slot_identity_when_editing() {
+        // Given an empty cue set.
+        let mut cues = CuePoints::default();
+
+        // When setting and deleting a numbered slot.
+        cues.set(CueKind::In, 3, 240);
+        cues.delete(CueKind::In, 3);
+
+        // Then only that slot is affected.
+        assert_eq!(cues.get(CueKind::In, 3), None);
+        assert!(cues.is_empty());
+    }
+
+    #[test]
+    fn cue_points_ignore_out_of_range_slot_edits() {
+        // Given an empty cue set.
+        let mut cues = CuePoints::default();
+
+        // When editing a slot outside the four-slot range.
+        cues.set(CueKind::Out, CUE_SLOTS, 240);
+        cues.delete(CueKind::Out, CUE_SLOTS);
+
+        // Then the cue set remains empty.
+        assert!(cues.is_empty());
+    }
+
+    #[test]
+    fn cue_points_report_kind_presence_independently() {
+        // Given one out-cue and no in-cues.
+        let cues = CuePoints {
+            outs: [Some(120), None, None, None],
+            ..CuePoints::default()
+        };
+
+        // When checking each cue kind.
+        // Then only the out-cue kind is present.
+        assert!(!cues.has_any(CueKind::In));
+        assert!(cues.has_any(CueKind::Out));
     }
 
     fn test_segment(hash: &str, start: u64, len: u64) -> Segment {

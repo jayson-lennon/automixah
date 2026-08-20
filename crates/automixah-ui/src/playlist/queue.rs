@@ -229,6 +229,9 @@ pub(crate) mod tests {
         Services {
             paths: AppPaths::for_test(std::path::Path::new("/tmp/unused")),
             grid_store: GridStoreService::new(std::sync::Arc::new(InMemoryGridStore::new())),
+            cue_store: crate::store::CueStoreService::new(std::sync::Arc::new(
+                crate::store::in_memory::InMemoryCueStore::new(),
+            )),
             playlist_store: PlaylistStoreService::new(std::sync::Arc::new(
                 InMemoryPlaylistStore::new(),
             )),

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use error_stack::{Report, ResultExt as _};
 use wherror::Error;
 
-use automixah_engine::timeline::types::TrackHash;
+use automixah_engine::timeline::types::{CuePoints, TrackHash};
 
 pub mod in_memory;
 pub mod sqlite;
@@ -140,6 +140,96 @@ impl GridStoreService {
     #[must_use]
     pub fn name(&self) -> &'static str {
         self.backend.name()
+    }
+}
+
+/// Error type for cue-store failures.
+#[derive(Debug, Error)]
+#[error(debug)]
+pub struct CueStoreError;
+
+/// Persistence backend for source-frame cue points.
+#[async_trait]
+pub trait CueStore: Send + Sync {
+    /// Loads cue slots for `hash`; an absent row is an empty cue set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    async fn get(&self, hash: &TrackHash) -> Result<CuePoints, Report<CueStoreError>>;
+
+    /// Replaces all cue slots for `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails.
+    async fn put(&self, hash: &TrackHash, cues: &CuePoints) -> Result<(), Report<CueStoreError>>;
+
+    /// Deletes all cue slots for `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    async fn delete(&self, hash: &TrackHash) -> Result<(), Report<CueStoreError>>;
+
+    /// Backend name for debugging.
+    fn name(&self) -> &'static str;
+}
+
+/// Cheap-clone service wrapper around a [`CueStore`] backend.
+#[derive(Clone)]
+pub struct CueStoreService {
+    backend: Arc<dyn CueStore>,
+}
+
+impl CueStoreService {
+    /// Wraps a cue persistence backend.
+    #[must_use]
+    pub fn new(backend: Arc<dyn CueStore>) -> Self {
+        Self { backend }
+    }
+
+    /// Loads all cue slots for `hash`, if any have been persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend lookup fails.
+    pub async fn get(&self, hash: &TrackHash) -> Result<CuePoints, Report<CueStoreError>> {
+        self.backend.get(hash).await
+    }
+
+    /// Replaces all persisted cue slots for `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend write fails.
+    pub async fn put(
+        &self,
+        hash: &TrackHash,
+        cues: &CuePoints,
+    ) -> Result<(), Report<CueStoreError>> {
+        self.backend.put(hash, cues).await
+    }
+
+    /// Deletes all persisted cues for `hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend delete fails.
+    pub async fn delete(&self, hash: &TrackHash) -> Result<(), Report<CueStoreError>> {
+        self.backend.delete(hash).await
+    }
+
+    /// Backend name for debugging.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.backend.name()
+    }
+}
+
+impl std::fmt::Debug for CueStoreService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CueStoreService<{}>", self.backend.name())
     }
 }
 
