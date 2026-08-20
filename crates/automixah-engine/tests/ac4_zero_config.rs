@@ -40,6 +40,7 @@ fn synth(hash: &str, bpm: f32, duration_s: f32) -> TrackAnalysis {
         sample_rate: 44_100,
         channels: 2,
         format: "wav".into(),
+        cues: Default::default(),
     }
 }
 
@@ -85,6 +86,7 @@ fn zero_config_flow_yields_continuous_planned_mix() {
         sample_rate: audio.sample_rate,
         channels: 2,
         format: "ogg".into(),
+        cues: Default::default(),
     };
 
     let tracks = vec![

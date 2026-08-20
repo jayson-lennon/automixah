@@ -439,11 +439,16 @@ pub(crate) fn synthetic_track(hash: &str, bpm: f32, duration: f32, beats: usize)
         sample_rate: 44_100,
         channels: 2,
         format: "wav".into(),
+        cues: TestCuePoints::default(),
     }
 }
 
 #[cfg(test)]
 use djcore::analyzer::BeatGrid;
+
+// `CuePoints` becomes a lib import once the planner consumes cues (Phase 3).
+#[cfg(test)]
+use crate::timeline::types::CuePoints as TestCuePoints;
 
 #[cfg(test)]
 mod tests {

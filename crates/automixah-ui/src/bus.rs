@@ -68,6 +68,14 @@ pub enum Event {
     },
     /// A grid save failed; the string carries the rendered report.
     GridSaveFailed(String),
+    // Cue saves (debounced flush outcomes).
+    /// A cue-point edit was persisted; the cues refresh the record.
+    CuesSaved {
+        hash: TrackHash,
+        cues: automixah_engine::timeline::types::CuePoints,
+    },
+    /// A cue save failed; the string carries the rendered report.
+    CuesSaveFailed(String),
     // Track events (address tracks by content hash; mutate records).
     /// Tags resolved for a hash (add-task or hydration).
     TagsResolved { hash: TrackHash, tags: TrackTags },
@@ -171,6 +179,13 @@ impl std::fmt::Debug for Event {
                 .finish_non_exhaustive(),
             Self::GridSaveFailed(message) => {
                 f.debug_tuple("GridSaveFailed").field(message).finish()
+            }
+            Self::CuesSaved { hash, .. } => f
+                .debug_struct("CuesSaved")
+                .field("hash", hash)
+                .finish_non_exhaustive(),
+            Self::CuesSaveFailed(message) => {
+                f.debug_tuple("CuesSaveFailed").field(message).finish()
             }
             Self::TagsResolved { hash, .. } => f
                 .debug_struct("TagsResolved")

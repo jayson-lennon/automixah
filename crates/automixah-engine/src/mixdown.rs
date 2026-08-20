@@ -28,7 +28,9 @@ use crate::render::renderer::{Renderer, TrackFetchError, TrackProvider};
 use crate::render::resample::Resampler;
 use crate::render::wsola::Wsola;
 use crate::timeline::plan::{PlanOptions, plan_with};
-use crate::timeline::types::{SessionPlan, SessionTime, TrackAnalysis, TrackHash};
+use crate::timeline::types::{
+    CuePoints, SessionPlan, SessionTime, TrackAnalysis, TrackHash,
+};
 
 /// Beats per bar assumed when projecting a canonical grid (4/4).
 pub const BEATS_PER_BAR: u8 = 4;
@@ -71,6 +73,8 @@ pub struct MixdownTrack {
     pub key: djcore::key::Key,
     /// Track duration in seconds (source time).
     pub duration: f32,
+    /// User-authored source-frame cue points (snapshotted at click time).
+    pub cues: CuePoints,
 }
 
 /// A mixdown request: ordered tracks plus the output WAV path.
@@ -173,6 +177,7 @@ fn analysis_from(track: &MixdownTrack, decoded: &DecodeAudio) -> TrackAnalysis {
         sample_rate: decoded.sample_rate,
         channels: decoded.channels.max(1),
         format: String::new(),
+        cues: track.cues.clone(),
     }
 }
 
@@ -567,6 +572,7 @@ mod tests {
                 mode: djcore::key::KeyMode::Minor,
             },
             duration: 10.0,
+            cues: CuePoints::default(),
         };
         let decoded = DecodeAudio {
             samples: vec![0.0; 44_100],

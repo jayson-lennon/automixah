@@ -8,7 +8,7 @@
 //!
 use std::path::PathBuf;
 
-use automixah_engine::timeline::types::TrackHash;
+use automixah_engine::timeline::types::{CuePoints, TrackHash};
 use djcore::analyzer::AnalyzerOutput;
 use djcore::decoder::{DecodeAudio, DecoderRegistry};
 
@@ -185,11 +185,16 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>, path:
                 let bpm = beats_grid.grid_bpm;
                 #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
                 let duration = audio.frames() as f32 / audio.sample_rate as f32;
+                let cues = block_handle
+                    .block_on(async { services.cue_store.get(&lookup_hash).await })
+                    .ok()
+                    .unwrap_or_default();
                 Analysis {
                     grid: beats_grid,
                     bpm,
                     key,
                     duration_seconds: duration,
+                    cues,
                 }
             }
             None => {
@@ -203,7 +208,15 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>, path:
                     Err(report) => return fail(&hash, format!("{report:#}")),
                 };
                 persist_fresh(&services, &block_handle, &hash, &output);
-                analysis_from(&output, &audio)
+                let cues = {
+                    let store = services.cue_store.clone();
+                    let lookup_hash = hash.clone();
+                    block_handle
+                        .block_on(async { store.get(&lookup_hash).await })
+                        .ok()
+                        .unwrap_or_default()
+                };
+                analysis_from(&output, &audio, cues)
             }
         };
 
@@ -223,7 +236,7 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>, path:
 }
 
 /// Builds the analysis package from an analyzer output.
-fn analysis_from(output: &AnalyzerOutput, audio: &DecodeAudio) -> Analysis {
+fn analysis_from(output: &AnalyzerOutput, audio: &DecodeAudio, cues: CuePoints) -> Analysis {
     #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
     let duration = audio.frames() as f32 / audio.sample_rate as f32;
     Analysis {
@@ -231,6 +244,7 @@ fn analysis_from(output: &AnalyzerOutput, audio: &DecodeAudio) -> Analysis {
         bpm: output.bpm,
         key: output.key.clone(),
         duration_seconds: duration,
+        cues,
     }
 }
 

@@ -723,6 +723,7 @@ mod tests {
                 mode: djcore::key::KeyMode::Minor,
             },
             duration_seconds: 61.0,
+            cues: automixah_engine::timeline::types::CuePoints::default(),
         }
     }
 

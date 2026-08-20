@@ -24,6 +24,7 @@ fn fake_analysis() -> Analysis {
             mode: djcore::key::KeyMode::Minor,
         },
         duration_seconds: 2.0,
+        cues: automixah_engine::timeline::types::CuePoints::default(),
     }
 }
 

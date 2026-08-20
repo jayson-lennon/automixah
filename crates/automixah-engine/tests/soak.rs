@@ -46,6 +46,7 @@ fn four_tracks() -> Vec<TrackAnalysis> {
                 sample_rate: 44_100,
                 channels: 2,
                 format: "wav".into(),
+                cues: Default::default(),
             }
         })
         .collect()

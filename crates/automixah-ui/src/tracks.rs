@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use automixah_engine::timeline::types::TrackHash;
+use automixah_engine::timeline::types::{CuePoints, TrackHash};
 use djcore::analyzer::BeatGrid;
 use djcore::key::Key;
 
@@ -38,6 +38,8 @@ pub struct Analysis {
     pub key: Key,
     /// Duration in seconds (source time).
     pub duration_seconds: f32,
+    /// User-authored cue points (source frames, snapped in the UI).
+    pub cues: CuePoints,
 }
 
 /// Analysis lifecycle for one content hash.
@@ -167,6 +169,15 @@ impl Tracks {
         }
     }
 
+    /// Refreshes a `Ready` record's persisted cue points after a flush.
+    pub fn refresh_cues(&mut self, hash: &TrackHash, cues: &CuePoints) {
+        if let Some(record) = self.by_hash.get_mut(hash)
+            && let AnalysisState::Ready(analysis) = &mut record.analysis
+        {
+            analysis.cues = cues.clone();
+        }
+    }
+
     /// Source path for `hash` (the queue job's file), if known.
     #[must_use]
     pub fn path_of(&self, hash: &TrackHash) -> Option<&PathBuf> {
@@ -193,6 +204,7 @@ impl Tracks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use automixah_engine::timeline::types::CueKind;
 
     fn hash(id: u32) -> TrackHash {
         TrackHash(format!("h{id}"))
@@ -218,6 +230,7 @@ mod tests {
                 mode: djcore::key::KeyMode::Minor,
             },
             duration_seconds: 61.0,
+            cues: CuePoints::default(),
         }
     }
 
@@ -373,5 +386,21 @@ mod tests {
         };
         assert!((a.bpm - 141.0).abs() < f32::EPSILON);
         assert!((a.grid.grid_bpm - 141.0).abs() < f32::EPSILON);
+    }
+
+    // Given a ready record.
+    // When a cue save refreshes the cues.
+    // Then the cached cue positions follow the flush.
+    #[test]
+    fn refresh_cues_updates_cue_points_of_ready_record() {
+        let mut tracks = Tracks::default();
+        tracks.upsert(record(1, AnalysisState::Ready(analysis(138.0))));
+
+        tracks.refresh_cues(&hash(1), &CuePoints::with_in(3, 44_100));
+
+        let AnalysisState::Ready(a) = &tracks.get(&hash(1)).expect("record").analysis else {
+            panic!("ready");
+        };
+        assert_eq!(a.cues.get(CueKind::In, 3), Some(44_100));
     }
 }

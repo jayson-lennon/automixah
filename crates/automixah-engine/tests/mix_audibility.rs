@@ -52,6 +52,7 @@ fn synth(hash: &str, bpm: f32, hz: f32, s: f32) -> SynthTrack {
             sample_rate: 44_100,
             channels: 2,
             format: String::new(),
+            cues: Default::default(),
         },
         pcm,
     }

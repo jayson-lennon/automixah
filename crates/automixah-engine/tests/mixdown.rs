@@ -38,6 +38,7 @@ fn click_job(out: &Path) -> MixdownJob {
             mode: KeyMode::Minor,
         },
         duration: 8.0,
+        cues: automixah_engine::timeline::types::CuePoints::default(),
     };
     MixdownJob {
         tracks: vec![mk("t120", click120(), 120.0), mk("t128", click128(), 128.0)],

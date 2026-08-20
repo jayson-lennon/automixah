@@ -162,6 +162,10 @@ fn run_job(services: &Services, job: &QueueJob, events: &Sender<Event>) {
     });
 
     // PCM (`audio`, `bytes`) goes out of scope here — nothing retains it.
+    let cues = runtime
+        .block_on(async { services.cue_store.get(&hash).await })
+        .ok()
+        .unwrap_or_default();
     send(Event::AnalysisDone {
         hash,
         analysis: Analysis {
@@ -169,6 +173,7 @@ fn run_job(services: &Services, job: &QueueJob, events: &Sender<Event>) {
             bpm: output.bpm,
             key: output.key,
             duration_seconds: output.duration_seconds,
+            cues,
         },
     });
 }
@@ -187,6 +192,10 @@ fn library_hit(services: &Services, hash: &TrackHash) -> Option<Analysis> {
         .block_on(async { services.playlist_store.track_duration(hash).await })
         .ok()
         .flatten()?;
+    let cues = runtime
+        .block_on(async { services.cue_store.get(hash).await })
+        .ok()
+        .unwrap_or_default();
     #[expect(clippy::cast_possible_truncation, reason = "f64 store to f32 display")]
     Some(Analysis {
         grid: crate::grid::EditableGrid {
@@ -198,6 +207,7 @@ fn library_hit(services: &Services, hash: &TrackHash) -> Option<Analysis> {
         bpm: stored.grid_bpm,
         key,
         duration_seconds: duration as f32,
+        cues,
     })
 }
 
@@ -210,6 +220,7 @@ pub fn queued_state() -> AnalysisState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use automixah_engine::timeline::types::CueKind;
     use crate::bus::EventBus;
     use crate::playlist::store::PlaylistStoreService;
     use crate::playlist::store::in_memory::InMemoryPlaylistStore;
@@ -555,6 +566,13 @@ pub(crate) mod tests {
         });
         drain_terminal(&bus, &hash);
 
+        // A user in-cue persists for this hash.
+        let seeded_cues = automixah_engine::timeline::types::CuePoints::with_in(0, 44_100);
+        services
+            .runtime
+            .block_on(async { services.cue_store.put(&hash, &seeded_cues).await })
+            .expect("seed cue");
+
         // Forced job: delete-before-read, fresh analysis.
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
@@ -579,5 +597,11 @@ pub(crate) mod tests {
             (stored.grid_bpm - 138.0).abs() < f32::EPSILON,
             "fake analyzer bpm"
         );
+        // Cues live in a separate table, so forced re-analysis preserves them.
+        let preserved = services
+            .runtime
+            .block_on(async { services.cue_store.get(&hash).await })
+            .expect("cue lookup");
+        assert_eq!(preserved.get(CueKind::In, 0), Some(44_100));
     }
 }

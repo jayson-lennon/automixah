@@ -97,6 +97,7 @@ impl AutomixahUiApp {
     fn spawn_contents_load(&self, playlist_id: i64) {
         let store = self.services.playlist_store.clone();
         let grid_store = self.services.grid_store.clone();
+        let cue_store = self.services.cue_store.clone();
         let tx = self.bus.sender();
         self.services.runtime.handle().spawn(async move {
             let persisted = match store.tracks_for(playlist_id).await {
@@ -112,7 +113,8 @@ impl AutomixahUiApp {
             // Grid join: the grid store is the source of truth for both
             // backends; the overlay fills rows the join left null.
             let joined = join_grids(grid_store, persisted).await;
-            let (hashes, records) = hydrate_records(joined);
+            let cues = load_cues(cue_store, &joined).await;
+            let (hashes, records) = hydrate_records(joined, &cues);
             let _ = tx.send(Event::RowsLoaded {
                 playlist_id,
                 hashes,
@@ -122,12 +124,30 @@ impl AutomixahUiApp {
     }
 }
 
+/// Loads each persisted track's cue points from the cue store.
+async fn load_cues(
+    cue_store: crate::store::CueStoreService,
+    persisted: &[crate::playlist::store::PersistedTrack],
+) -> std::collections::HashMap<TrackHash, automixah_engine::timeline::types::CuePoints> {
+    let mut cues = std::collections::HashMap::with_capacity(persisted.len());
+    for track in persisted {
+        let cue_points = cue_store
+            .get(&track.track_hash)
+            .await
+            .ok()
+            .unwrap_or_default();
+        cues.insert(track.track_hash.clone(), cue_points);
+    }
+    cues
+}
+
 /// Builds contents hashes + hydrated records from persisted tracks:
 /// complete entries (grid + key + duration) carry a `Ready` analysis;
 /// incomplete ones stay `Queued` (the enqueue derivation re-enqueues).
 #[must_use]
 fn hydrate_records(
     persisted: Vec<crate::playlist::store::PersistedTrack>,
+    cues: &std::collections::HashMap<TrackHash, automixah_engine::timeline::types::CuePoints>,
 ) -> (Vec<TrackHash>, Vec<TrackRecord>) {
     let mut hashes = Vec::with_capacity(persisted.len());
     let mut records = Vec::new();
@@ -159,6 +179,10 @@ fn hydrate_records(
                 key,
                 #[expect(clippy::cast_possible_truncation, reason = "f64 tag to f32 display")]
                 duration_seconds: duration as f32,
+                cues: cues
+                    .get(&track.track_hash)
+                    .copied()
+                    .unwrap_or_default(),
             }),
         });
     }
@@ -171,7 +195,8 @@ fn hydrate_records(
 pub(crate) fn hydrate_records_for_test(
     persisted: Vec<crate::playlist::store::PersistedTrack>,
 ) -> (Vec<TrackHash>, Vec<TrackRecord>) {
-    hydrate_records(persisted)
+    let cues = std::collections::HashMap::new();
+    hydrate_records(persisted, &cues)
 }
 
 /// Overlays each persisted track's grid from the grid store.
@@ -326,6 +351,13 @@ impl AutomixahUiApp {
             }
             Event::GridSaveFailed(message) => {
                 self.status = format!("\u{26a0} save failed: {message}");
+            }
+            Event::CuesSaved { hash, cues } => {
+                self.tracks.refresh_cues(&hash, &cues);
+                self.status = format!("cues saved ({:.8})", hash.0);
+            }
+            Event::CuesSaveFailed(message) => {
+                self.status = format!("\u{26a0} cue save failed: {message}");
             }
             Event::RowsLoaded { hashes, .. } => {
                 // Retry semantics: hashes whose store hydration found no
@@ -818,6 +850,7 @@ impl AutomixahUiApp {
                     downbeat_phase: grid.downbeat_phase,
                     key: analysis.key.clone(),
                     duration: analysis.duration_seconds,
+                    cues: analysis.cues.clone(),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -1022,6 +1055,51 @@ mod tests {
         assert!(records[0].analysis.is_ready());
     }
 
+    // Given a complete persisted track plus a stored cue map.
+    // When hydrated with that cue map.
+    // Then the Ready analysis carries the stored in-cue position.
+    #[test]
+    fn hydrate_records_carries_stored_cues_into_ready_analysis() {
+        let complete = crate::playlist::store::PersistedTrack {
+            id: 1,
+            position: 0,
+            track_hash: TrackHash("done".to_owned()),
+            title: "T".to_owned(),
+            artist: "A".to_owned(),
+            added_path: "/done".to_owned(),
+            duration: Some(60.0),
+            grid: Some(crate::store::GridOverride {
+                grid_bpm: 128.0,
+                anchor_seconds: 0.0,
+                downbeat_phase: 0,
+                updated_at: 0,
+                key: Some(djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                }),
+            }),
+        };
+        let mut cues = std::collections::HashMap::new();
+        cues.insert(
+            TrackHash("done".to_owned()),
+            automixah_engine::timeline::types::CuePoints::with_in(2, 44_100 * 30),
+        );
+
+        let (_, records) = hydrate_records(vec![complete], &cues);
+
+        assert_eq!(records.len(), 1, "complete track hydrated");
+        let AnalysisState::Ready(analysis) = &records[0].analysis else {
+            panic!("ready");
+        };
+        assert_eq!(
+            analysis
+                .cues
+                .get(automixah_engine::timeline::types::CueKind::In, 2),
+            Some(44_100 * 30),
+            "stored cue hydrates into the record"
+        );
+    }
+
     // Given a loaded record with a ready analysis.
     // When re-analysis runs (record cleared, started/done events applied).
     // Then the record derives queued → analyzing → ready with no
@@ -1050,6 +1128,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Minor,
                 },
                 duration_seconds: 60.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             }),
         });
 
@@ -1082,6 +1161,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Major,
                 },
                 duration_seconds: 61.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             },
         });
         let Some(crate::tracks::AnalysisState::Ready(a)) =
@@ -1113,6 +1193,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Minor,
                 },
                 duration_seconds: 60.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             }),
         });
         let mut pending = Vec::new();
@@ -1171,6 +1252,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Minor,
                 },
                 duration_seconds: 0.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             },
             audio: djcore::decoder::DecodeAudio {
                 samples: Vec::new(),
@@ -1225,6 +1307,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Minor,
                 },
                 duration_seconds: 0.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             },
             audio: djcore::decoder::DecodeAudio {
                 samples: Vec::new(),
@@ -1260,6 +1343,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Major,
                 },
                 duration_seconds: 61.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             },
         });
 
@@ -1300,6 +1384,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Minor,
                 },
                 duration_seconds: 60.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             }),
         );
         app.load_row(&hash);
@@ -1319,6 +1404,7 @@ mod tests {
                     mode: djcore::key::KeyMode::Major,
                 },
                 duration_seconds: 50.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
             },
         });
 
@@ -1364,9 +1450,15 @@ mod render_tests {
                         mode: djcore::key::KeyMode::Minor,
                     },
                     duration_seconds: 60.0,
+                    cues: automixah_engine::timeline::types::CuePoints::default(),
                 }),
             });
         }
+        // Seed one in-cue on r0 so render-time snapshotting carries it.
+        app.tracks.refresh_cues(
+            &hashes[0],
+            &automixah_engine::timeline::types::CuePoints::with_in(0, 44_100 * 8),
+        );
         app.playlist_state.selected = Some(7);
         app.playlist_state.contents = Contents::Loaded(hashes);
         app
@@ -1459,6 +1551,12 @@ mod render_tests {
         assert_eq!(job.tracks.len(), 2);
         assert_eq!(job.tracks[0].hash.0, "r0");
         assert_eq!(job.tracks[1].hash.0, "r1");
+        // r0's seeded in-cue snapshots into the job.
+        assert_eq!(
+            job.tracks[0].cues.get(automixah_engine::timeline::types::CueKind::In, 0),
+            Some(44_100 * 8),
+            "job carries the click-time in-cue snapshot"
+        );
         for track in &job.tracks {
             assert_eq!(track.grid_bpm, 128.0);
             assert_eq!(track.anchor_seconds, 0.25);

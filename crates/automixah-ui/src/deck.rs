@@ -9,6 +9,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use automixah_engine::timeline::types::CuePoints;
+
 use crate::audio::output::OutputEngine;
 use crate::audio::scrub_state::ScrubMachine;
 use crate::bus::LoadOutcome;
@@ -51,6 +53,10 @@ pub struct Deck {
     /// `true` for one frame after a grid gesture (the app schedules the
     /// save; the deck stays borrow-friendly).
     pub grid_dirty: bool,
+    /// Live-editable cue points (working copy; saves go to the cue store).
+    pub cues: CuePoints,
+    /// `true` while unsaved cue edits are pending a flush.
+    pub cues_dirty: bool,
     /// cpal output; `None` when audio is unavailable (grid editing
     /// still works; audio methods no-op).
     pub engine: Option<OutputEngine>,
@@ -113,6 +119,8 @@ impl Deck {
             edit_grid: EditableGrid::from_grid(&outcome.analysis.grid),
             pending_save: None,
             grid_dirty: false,
+            cues: outcome.analysis.cues,
+            cues_dirty: false,
             engine,
             // unit_speed: 1× in source frames; RateFolder does the
             // single rate conversion to the device inside the engine.

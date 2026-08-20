@@ -233,6 +233,8 @@ impl PlaylistState {
             | Event::LoadDone(_)
             | Event::GridSaved { .. }
             | Event::GridSaveFailed(_)
+            | Event::CuesSaved { .. }
+            | Event::CuesSaveFailed(_)
             | Event::RenderProgress { .. }
             | Event::RenderDone { .. }
             | Event::RenderCancelled

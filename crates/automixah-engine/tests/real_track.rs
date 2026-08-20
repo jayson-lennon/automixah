@@ -41,6 +41,7 @@ fn full_track_analysis_reports_expected_bpm_and_key() {
         sample_rate: audio.sample_rate,
         channels: 2,
         format: "ogg".into(),
+        cues: Default::default(),
     };
 
     // Then the reported BPM is near 148 and the key is G minor.

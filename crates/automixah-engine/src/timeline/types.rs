@@ -103,6 +103,22 @@ impl CuePoints {
         }
     }
 
+    /// Builds a set carrying one in-cue in `slot`.
+    #[must_use]
+    pub fn with_in(slot: usize, frames: u64) -> Self {
+        let mut c = Self::default();
+        c.set(CueKind::In, slot, frames);
+        c
+    }
+
+    /// Builds a set carrying one out-cue in `slot`.
+    #[must_use]
+    pub fn with_out(slot: usize, frames: u64) -> Self {
+        let mut c = Self::default();
+        c.set(CueKind::Out, slot, frames);
+        c
+    }
+
     /// The earliest set position of `kind` at or before `duration_frames`.
     ///
     /// Positions past the track's end are ignored. Relationship checks such
@@ -168,6 +184,8 @@ pub struct TrackAnalysis {
     pub channels: u16,
     /// Container/codec extension (e.g. `"mp3"`).
     pub format: String,
+    /// User-authored source-frame cue points (empty when unset).
+    pub cues: CuePoints,
 }
 
 /// How a track's tempo is matched to the session BPM.

@@ -35,6 +35,7 @@ fn track(hash: &str, bpm: f32, duration: f32) -> TrackAnalysis {
         sample_rate: 44_100,
         channels: 2,
         format: String::new(),
+        cues: Default::default(),
     }
 }
 
@@ -153,6 +154,7 @@ fn unconfident_grid_window_stays_inside_stretched_audio() {
         sample_rate: 44_100,
         channels: 2,
         format: String::new(),
+        cues: Default::default(),
     };
     let next = TrackAnalysis {
         hash: TrackHash("y".into()),
@@ -174,6 +176,7 @@ fn unconfident_grid_window_stays_inside_stretched_audio() {
         sample_rate: 44_100,
         channels: 2,
         format: String::new(),
+        cues: Default::default(),
     };
 
     // When planning at 150 BPM.
