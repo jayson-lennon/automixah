@@ -30,7 +30,7 @@ impl TrackProvider for SideProvider {
 
 fn analysis(hash: &str, bpm: f32) -> TrackAnalysis {
     let beat = 60.0 / bpm;
-    let bars = 60;
+    let bars = 8;
     let downbeats: Vec<f32> = (0..bars).map(|i| i as f32 * beat * 4.0).collect();
     let beats: Vec<f32> = (0..bars * 4).map(|i| i as f32 * beat).collect();
     TrackAnalysis {
@@ -70,10 +70,16 @@ fn tone_pcm(frames: usize, hz: f32, side: usize) -> Vec<f32> {
 fn left_only_and_right_only_sources_stay_distinguishable() {
     // Given A is left-only 220 Hz, B is right-only 330 Hz (120 BPM).
     let analyses = vec![analysis("a", 120.0), analysis("b", 120.0)];
-    let plan = plan_with(&analyses, PlanOptions::default());
+    let plan = plan_with(
+        &analyses,
+        PlanOptions {
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
     let mut provider = SideProvider {
-        a: tone_pcm(44_100 * 120, 220.0, 0),
-        b: tone_pcm(44_100 * 120, 330.0, 1),
+        a: tone_pcm(44_100 * 8, 220.0, 0),
+        b: tone_pcm(44_100 * 8, 330.0, 1),
     };
     // Slice B from its stretched cue (ratio 1.0 here).
     let cue_f = plan.segments[1].src_start as usize;

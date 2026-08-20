@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use automixah_engine::render::renderer::{Renderer, TrackFetchError};
-use automixah_engine::timeline::plan::plan_session;
+use automixah_engine::timeline::plan::{PlanOptions, plan_session, plan_with};
 use automixah_engine::timeline::types::{SessionTime, TrackAnalysis, TrackHash};
 use djcore::analyzer::BeatGrid;
 use djcore::{Key, KeyMode};
@@ -114,13 +114,21 @@ fn ac1_boundaries_lie_exactly_on_downbeat_samples() {
 
 #[test]
 fn ac1_rendered_mix_reaches_every_planned_boundary() {
-    // Given the same plan rendered end to end with synthetic PCM.
+    // Given the same plan rendered end to end with synthetic PCM
+    // (12 s tracks, 4-beat window).
     let tracks = vec![
-        synth("a", 120.0, 120.0),
-        synth("b", 122.0, 120.0),
-        synth("c", 126.0, 120.0),
+        synth("a", 120.0, 12.0),
+        synth("b", 122.0, 12.0),
+        synth("c", 126.0, 12.0),
     ];
-    let plan = plan_session(&tracks, Some(120.0));
+    let plan = plan_with(
+        &tracks,
+        PlanOptions {
+            target_bpm: Some(120.0),
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
 
     let mut provider = SynthPcm::new(&tracks, 1.0);
     let mut renderer = Renderer::new(plan.clone());

@@ -10,10 +10,16 @@
 check:
     cargo check --workspace --all-targets
 
-# Run unit/integration tests (native)
+# Run unit/integration tests via nextest, plus doc tests
 [group('build')]
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
+    cargo test --workspace --doc
+
+# Run the ignored slow real-audio tests
+[group('build')]
+test-heavy:
+    cargo nextest run --workspace --run-ignored only
 
 # Lint (clippy, warnings as errors)
 [group('build')]

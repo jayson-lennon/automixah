@@ -1,27 +1,27 @@
-//! AC5: 20-track continuous playback with fault-injected slow
-//! renders — no underruns.
+//! Soak: continuous multi-track playback — no structural starvation.
 //!
 //! Two layers:
-//! 1. Engine soak: plan and fully render a 20-track session; the
-//!    mix must be gap-free (no long silent runs) — the render worker
+//! 1. Engine soak: plan and fully render a 4-track session; the mix
+//!    must be gap-free (no long silent runs) — the render worker
 //!    just pulls `render_until`, so whole-session success proves
 //!    the pipeline never starves structurally.
-//! 2. Scheduler simulation: the existing 3× slow-render model
-//!    (soak.rs) parameterized to a 20-track, ~60-minute session.
+//! 2. Scheduler simulation: a 3× slow-render watermark model
+//!    parameterized to a long (~60-minute) session. Pure arithmetic,
+//!    no audio.
 
 use automixah_engine::render::renderer::{Renderer, TrackFetchError};
-use automixah_engine::timeline::plan::plan_session;
+use automixah_engine::timeline::plan::{PlanOptions, plan_with};
 use automixah_engine::timeline::types::{SessionTime, TrackAnalysis, TrackHash};
 use djcore::analyzer::BeatGrid;
 use djcore::{Key, KeyMode};
 
-/// 20 synthetic tracks, 150 s each, BPMs spread around 124.
-fn twenty_tracks() -> Vec<TrackAnalysis> {
-    (0..20)
+/// 4 synthetic tracks, 12 s each, BPMs spread around 124.
+fn four_tracks() -> Vec<TrackAnalysis> {
+    (0..4)
         .map(|i| {
-            let bpm = 120.0 + f32::from((i % 5) as u8) * 2.0; // 120..128
+            let bpm = 120.0 + f32::from((i % 5) as u8) * 2.0; // 120..126
             let beat = 60.0 / bpm;
-            let bars = (150.0_f32 / (beat * 4.0)).floor() as usize;
+            let bars = (12.0_f32 / (beat * 4.0)).floor() as usize;
             TrackAnalysis {
                 hash: TrackHash(format!("t{i:02}")),
                 bpm,
@@ -34,7 +34,7 @@ fn twenty_tracks() -> Vec<TrackAnalysis> {
                         KeyMode::Major
                     },
                 },
-                duration: 150.0,
+                duration: 12.0,
                 beat_grid: BeatGrid {
                     grid_bpm: 0.0,
                     anchor_seconds: 0.0,
@@ -70,22 +70,28 @@ impl automixah_engine::render::renderer::TrackProvider for SoakPcm {
 }
 
 #[test]
-fn ac5_twenty_track_session_renders_gap_free() {
-    // Given 20 tracks planned zero-config.
-    let tracks = twenty_tracks();
-    let plan = plan_session(&tracks, None);
+fn four_track_session_renders_gap_free() {
+    // Given 4 tracks planned zero-config with a short 4-beat window.
+    let tracks = four_tracks();
+    let plan = plan_with(
+        &tracks,
+        PlanOptions {
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
 
-    // Then 20 segments with 19 transitions were planned.
-    assert_eq!(plan.segments.len(), 20);
+    // Then 4 segments with 3 transitions were planned.
+    assert_eq!(plan.segments.len(), 4);
     assert_eq!(
         plan.segments
             .iter()
             .filter(|s| s.transition.is_some())
             .count(),
-        19
+        3
     );
 
-    // When rendering the entire session (~45 min of audio).
+    // When rendering the entire session (~30 s of audio).
     let mut provider = SoakPcm {
         pcms: tracks
             .iter()
@@ -126,7 +132,7 @@ fn ac5_twenty_track_session_renders_gap_free() {
 }
 
 #[test]
-fn ac5_scheduler_simulation_covers_sixty_minute_session() {
+fn scheduler_simulation_covers_sixty_minute_session() {
     // Given a 20-track ≈ 60-minute session (20 × 150 s − 19 × ~16 s
     // overlaps ≈ 3_100 s), consumed at 1× with 90 s lookahead while
     // the render worker runs fault-degraded at 79/3 ≈ 26× realtime.

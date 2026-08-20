@@ -45,6 +45,7 @@ fn read_wav(path: &std::path::Path) -> (u32, Vec<f32>, u16) {
     (rate, samples, channels)
 }
 
+#[ignore = "real-audio (decode+analyze in debug); run via just test-heavy"]
 #[test]
 fn two_track_render_has_planned_duration_no_gaps_no_clip() {
     // Given two click fixtures mixed with zero config.
@@ -83,6 +84,7 @@ fn two_track_render_has_planned_duration_no_gaps_no_clip() {
 }
 
 // Given a 48 kHz click first and a 44.1 kHz click second.
+#[ignore = "real-audio (decode+analyze in debug); run via just test-heavy"]
 #[test]
 fn forty_eight_k_first_track_writes_forty_eight_k_wav() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -106,6 +108,7 @@ fn forty_eight_k_first_track_writes_forty_eight_k_wav() {
     assert_eq!(samples.len() as u64, total.0 * 2);
 }
 
+#[ignore = "real-audio (decode+analyze in debug); run via just test-heavy"]
 #[test]
 fn target_bpm_override_changes_plan() {
     // Given the same two tracks with an explicit target.
@@ -189,6 +192,7 @@ fn missing_file_fails_loudly() {
     );
 }
 
+#[ignore = "real-audio (decode+analyze in debug); run via just test-heavy"]
 #[test]
 fn real_fixture_end_to_end_when_present() {
     // Given the real 148 BPM / Gm fixture (gitignored, may be absent).

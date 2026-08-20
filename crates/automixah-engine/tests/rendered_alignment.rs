@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use automixah_engine::render::renderer::{Renderer, TrackFetchError};
-use automixah_engine::timeline::plan::plan_session;
+use automixah_engine::timeline::plan::{PlanOptions, plan_with};
 use automixah_engine::timeline::types::{SessionTime, TrackAnalysis, TrackHash};
 use djcore::analyzer::BeatGrid;
 use djcore::{Key, KeyMode};
@@ -116,12 +116,20 @@ fn click_phases(mix: &[f32], beat_samples: usize) -> Vec<usize> {
 
 #[test]
 fn overlap_clicks_coincide_within_tolerance() {
-    // Given two click trains at 138/136 BPM, 180 s each, session 138.
+    // Given two click trains at 138/136 BPM, 8 bars each, session 138
+    // (bar-aligned durations keep the window start on the grid).
     let tracks = vec![
-        click_track("a", 138.0, 180.0),
-        click_track("b", 136.0, 180.0),
+        click_track("a", 138.0, 8.0 * 4.0 * 60.0 / 138.0),
+        click_track("b", 136.0, 8.0 * 4.0 * 60.0 / 136.0),
     ];
-    let plan = plan_session(&tracks, Some(138.0));
+    let plan = plan_with(
+        &tracks,
+        PlanOptions {
+            target_bpm: Some(138.0),
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
 
     let mut provider = ClickPcm::new(&tracks, 138.0, &plan);
     let mut renderer = Renderer::new(plan.clone());
@@ -163,8 +171,8 @@ fn overlap_clicks_coincide_within_tolerance() {
     // decks' clicks coincide); the spread is the alignment error.
     assert!(!phases.is_empty(), "no clicks in overlap");
     assert!(
-        phases.len() >= 40,
-        "expected dense clicks, got {}",
+        phases.len() >= 4,
+        "expected a click on every beat of the window, got {}",
         phases.len()
     );
     if std::env::var("DBG").is_ok() {

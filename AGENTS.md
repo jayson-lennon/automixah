@@ -166,7 +166,8 @@ Read the `justfile` for the full list; prefer `just` recipes over manual invocat
 | --- | --- | --- |
 | `vcs` | Git | This repo uses git. |
 | `check` | `just check` | `cargo check --workspace --all-targets` |
-| `test` | `just test` | `cargo test --workspace` — all tests must pass before committing |
+| `test` | `just test` | `cargo nextest run --workspace` + doc tests — the fast suite; all must pass before committing |
+| `test-heavy` | `just test-heavy` | the `#[ignore]`d real-audio tests (`--run-ignored only`) |
 | `lint` | `just lint` | clippy with warnings as errors |
 | `format` | `just fmt` | `cargo fmt --all` |
 | `commit` | `just commit '<message>'` | Stages everything and commits |

@@ -185,6 +185,7 @@ fn symphonia_decoder_name_and_extensions() {
     assert!(decoder.supported_extensions().contains(&"opus"));
 }
 
+#[ignore = "real-audio (decode+analyze in debug); run via just test-heavy"]
 #[test]
 fn click_track_analysis_detects_120bpm_and_populates_grid() {
     // Given an 8-second click track at 120 BPM with accented downbeats.

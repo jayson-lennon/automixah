@@ -43,6 +43,7 @@ fn fixture_path(filename: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[ignore = "real-audio (analyze in debug); run via just test-heavy"]
     #[test]
     fn test_analyze_120bpm_kick() {
         let path = fixture_path("120bpm_4bar.wav");
@@ -123,6 +124,7 @@ mod tests {
         }
     }
 
+    #[ignore = "real-audio (analyze in debug); run via just test-heavy"]
     #[test]
     fn test_analyze_128bpm_kick() {
         let path = fixture_path("128bpm_4bar.wav");
@@ -188,6 +190,7 @@ mod tests {
         }
     }
 
+    #[ignore = "real-audio (analyze in debug); run via just test-heavy"]
     #[test]
     fn test_analyze_cmajor_scale() {
         let path = fixture_path("cmajor_scale.wav");
@@ -228,6 +231,7 @@ mod tests {
         }
     }
 
+    #[ignore = "real-audio (analyze in debug); run via just test-heavy"]
     #[test]
     fn test_silence_detection_and_trimming() {
         let path = fixture_path("mixed_silence.wav");

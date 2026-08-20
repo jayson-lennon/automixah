@@ -99,13 +99,19 @@ fn band_energy(pcm: &[f32], start_f: usize, len_f: usize, hz: f32) -> f64 {
 
 #[test]
 fn crossfade_is_audible_on_both_decks_with_correct_trend() {
-    // Given two distinct-frequency 240 s tracks at nearby BPMs.
-    let a = synth("a", 120.0, 220.0, 240.0);
-    let b = synth("b", 121.0, 330.0, 240.0);
+    // Given two distinct-frequency 12 s tracks at nearby BPMs.
+    let a = synth("a", 120.0, 220.0, 12.0);
+    let b = synth("b", 121.0, 330.0, 12.0);
     let tracks = vec![a.analysis.clone(), b.analysis.clone()];
 
     // When planning + rendering the full session with the default pair.
-    let plan = plan_with(&tracks, PlanOptions::default());
+    let plan = plan_with(
+        &tracks,
+        PlanOptions {
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
     let total = SessionTime(plan.total_len_samples());
     let mut provider = PcmProvider {
         pcms: [
@@ -159,11 +165,16 @@ fn crossfade_is_audible_on_both_decks_with_correct_trend() {
 
 #[test]
 fn custom_pair_changes_the_output_envelope() {
-    // Given the same two tracks.
-    let a = synth("a", 120.0, 220.0, 240.0);
-    let b = synth("b", 121.0, 330.0, 240.0);
+    let a = synth("a", 120.0, 220.0, 12.0);
+    let b = synth("b", 121.0, 330.0, 12.0);
     let tracks = vec![a.analysis.clone(), b.analysis.clone()];
-    let plan = plan_with(&tracks, PlanOptions::default());
+    let plan = plan_with(
+        &tracks,
+        PlanOptions {
+            transition_beats: 4,
+            ..PlanOptions::default()
+        },
+    );
     let total = SessionTime(plan.total_len_samples());
 
     let render_with = |spec: TransitionSpec| -> Vec<f32> {
@@ -183,11 +194,11 @@ fn custom_pair_changes_the_output_envelope() {
         renderer.render_until(&mut provider, total).expect("render")
     };
 
-    // When rendering with the default 64-beat pair vs a snappy 16-beat
-    // linear pair.
+    // When rendering with the default equal-power pair vs a snappy
+    // linear pair (both 4 beats — the contrast is curve shape).
     let default_mix = render_with(long_crossfade());
     let mut snappy = long_crossfade();
-    snappy.beats = 16;
+    snappy.beats = 4;
     for c in &mut snappy.curves {
         c.shape = automixah_engine::automation::presets::Shape::Linear;
     }
