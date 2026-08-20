@@ -766,6 +766,12 @@ impl eframe::App for AutomixahUiApp {
             }
             self.flush_save_if_due();
         }
+        // Every frame: gestures mutate the scrub machine anywhere
+        // (waveform drag, spacebar); the audio thread only sees what is
+        // pushed here, so this must not be call-site dependent.
+        if let Some(deck) = self.deck.as_mut() {
+            deck.push_command();
+        }
 
         // Keep the UI live while a deck is loaded (playhead ticking), a
         // load is in flight, any shown row is pending, or a mixdown is
