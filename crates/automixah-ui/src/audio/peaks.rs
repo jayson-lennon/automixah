@@ -71,43 +71,55 @@ pub struct Peaks {
 impl Peaks {
     /// Builds the peak track from interleaved stereo PCM.
     ///
-    /// The final partial stride is flushed (Mixxx advances the stride only
-    /// on boundary, but its buffer tail still holds the trailing max).
+    /// Slot *k* covers source frames `[k·stride, (k+1)·stride)` exactly:
+    /// the boundary accumulator is fractional (f64), so non-integer
+    /// strides (48000/441 ≈ 108.84) advance on true boundaries instead
+    /// of rounding up to 109 every slot — which stretched the rendered
+    /// timeline ~86 ms/min against the audio and grid on 48 kHz sources.
+    ///
+    /// The final partial slot is flushed when at least one frame of it
+    /// is covered.
     #[must_use]
     pub fn build(samples: &[f32], sample_rate: u32) -> Self {
-        #[expect(clippy::cast_precision_loss, reason = "sample rate fits f32")]
-        let stride = sample_rate as f32 / VISUAL_RATE;
+        let stride = f64::from(sample_rate) / f64::from(VISUAL_RATE);
         let frames = samples.len() / 2;
         let visual_len = if frames == 0 {
             0
         } else {
-            ((frames as f32 / stride).ceil() as usize).max(1)
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "frame/stride ratio < 2^24 for any real track"
+            )]
+            ((frames as f64 / stride).ceil() as usize).max(1)
         };
 
         let mut splitter = BandSplitter::new(f64::from(sample_rate));
         let mut data = Vec::with_capacity(visual_len);
         let mut running = RunningPeak::default();
-        let mut stride_frames_consumed = 0;
+        // End frame of the slot currently being accumulated: slot k
+        // covers [k·stride, (k+1)·stride); kept in f64 so the boundary
+        // lands at the true fractional position (an integer counter vs
+        // 108.84 could only ever fire at 109).
+        let mut next_boundary = stride;
 
-        for frame in samples.chunks_exact(2) {
+        for (frame_idx, frame) in samples.chunks_exact(2).enumerate() {
             let (l, r) = (frame[0], frame[1]);
             let bands = splitter.process_frame(l, r);
             running.absorb(bands, l, r);
-            stride_frames_consumed += 1;
-            #[expect(clippy::cast_precision_loss, reason = "counter fits f32")]
-            if stride_frames_consumed as f32 >= stride {
+            let frame_end = f64::from(frame_idx as u32) + 1.0;
+            if frame_end >= next_boundary {
                 data.push(PeakQuartet::from_running(&running));
                 running = RunningPeak::default();
-                stride_frames_consumed = 0;
+                next_boundary += stride;
             }
         }
-        if stride_frames_consumed > 0 {
+        if frames as f64 > next_boundary - stride {
             data.push(PeakQuartet::from_running(&running));
         }
 
         Self {
             data,
-            stride_frames: stride,
+            stride_frames: stride as f32,
         }
     }
 }
@@ -155,6 +167,75 @@ mod tests {
         let peaks = Peaks::build(&pcm, RATE);
         assert_eq!(peaks.data.len(), 1, "single flushed stride");
         assert!(peaks.data[0].all > 0);
+    }
+
+    // Given a 48 kHz source whose stride is fractional (48000/441 ≈
+    // 108.84) and impulses placed at the first frame of slots
+    // 50, 100, and 150 (past where an every-slot-109 loop has
+    // accumulated a full slot of error).
+    // When peaks are built.
+    // Then each impulse lands in its own slot k with silence on both
+    // neighbors — the timeline does not stretch against true time.
+    #[test]
+    fn peaks_slot_k_covers_k_stride_at_48k() {
+        let rate = 48_000u32;
+        let stride = f64::from(rate) / f64::from(VISUAL_RATE);
+        let slots = 160_usize;
+        #[expect(clippy::cast_possible_truncation, reason = "fixture size")]
+        let frames = (stride * slots as f64).round() as usize + 8;
+
+        let mut pcm = vec![0.0_f32; frames * 2];
+        for k in [50_usize, 100, 150] {
+            #[expect(clippy::cast_possible_truncation, reason = "boundary frame index")]
+            let frame = (k as f64 * stride).ceil() as usize; // first frame of slot k
+            pcm[frame * 2] = 1.0;
+            pcm[frame * 2 + 1] = 1.0;
+        }
+
+        let peaks = Peaks::build(&pcm, rate);
+
+        for k in [50_usize, 100, 150] {
+            assert_eq!(
+                peaks.data[k].all, 255,
+                "impulse for slot {k} landed elsewhere"
+            );
+            assert_eq!(peaks.data[k - 1].all, 0, "slot before {k} not silent");
+            assert_eq!(peaks.data[k + 1].all, 0, "slot after {k} not silent");
+        }
+    }
+
+    // Given a 48 kHz source long enough that the old every-slot-109 loop
+    // truncated ~1 frame per slot (about 0.6 s over a full track).
+    // When peaks are built and the render-domain total is derived.
+    // Then the represented timeline matches the true frame count within
+    // ±2 frames — the waveform's right edge reaches the track end.
+    #[test]
+    fn peaks_total_frames_matches_source_at_48k() {
+        let rate = 48_000u32;
+        // 7 minutes: the size class of the track that exposed the bug.
+        let frames = 420 * rate as usize + 137;
+        let pcm = vec![0.0_f32; frames * 2];
+
+        let peaks = Peaks::build(&pcm, rate);
+
+        // data.len() must be ceil(frames / stride): one visual sample per
+        // (possibly partial) stride. The length itself carries the no-
+        // truncation guarantee; the f32 stride used by the render domain
+        // rounds it to within one stride of the true frame count.
+        let stride = f64::from(rate) / f64::from(VISUAL_RATE);
+        let expected_slots = (frames as f64 / stride).ceil() as usize;
+        assert_eq!(
+            peaks.data.len(),
+            expected_slots,
+            "slot count must cover the full source"
+        );
+        let total = peaks.data.len() as f32 * peaks.stride_frames;
+        let error = (total - frames as f32).abs();
+        let one_stride = f64::from(rate) / f64::from(VISUAL_RATE);
+        assert!(
+            f64::from(error) <= one_stride,
+            "timeline {total} vs true {frames} frames (off by {error:.1})"
+        );
     }
 
     // Given samples exceeding ±1.0.

@@ -888,6 +888,15 @@ impl eframe::App for AutomixahUiApp {
                     )
                     .logarithmic(true),
                 );
+                // Phrase density at this zoom: beats per white line.
+                let stride = crate::view::grid::white_stride(
+                    self.edit_grid.beat_seconds(),
+                    zoom / self
+                        .track
+                        .as_ref()
+                        .map_or(44_100.0, |t| t.audio.sample_rate as f32),
+                );
+                ui.weak(format!("white line: every {stride} beats"));
             });
             self.view.frames_per_pixel = zoom;
 

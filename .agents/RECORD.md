@@ -68,3 +68,5 @@ Entries are added or amended **only with human approval**.
 - (cli) The CLI writes the output WAV at the session sample rate (the first track's rate) rather than a fixed 44.1 kHz.
 - (ui) Audition playback is source-rate agnostic: scrub reads at 1x in source frames, a single RateFolder pass converts to the device rate, and source channels fold to the device channel count.
 - (ui) The scrub playhead is tracked in f64 frames; playback reaches the true end of any track (an f32 position would freeze at 2²⁴ frames ≈ 6.3 min).
+- (ui) The waveform peak track advances visual slots by fractional stride accumulation, so non-44.1 kHz sources render on a true-time timeline (an integer counter vs 48000/441 previously stretched 48 kHz renders ~86 ms/min).
+- (ui) Grid beat lines render as thin translucent white and hide when beat spacing falls below ~4 px; white lines (downbeats) thin out by beat stride — every 4th, 8th, 16th… beat — once 4-beat spacing falls below ~50 px, and the zoom slider shows the current beats-per-white-line.
