@@ -189,7 +189,20 @@ mod tests {
     }
 
     // Given a paused machine with an active drag.
-    // When the drag moves at +2 audio-seconds per wall second.
+    // When the drag begins before it moves.
+    // Then the command is already marked playing so the audio callback can
+    // begin the scrub immediately.
+    #[test]
+    fn drag_start_command_is_playing() {
+        let mut m = machine();
+        m.drag_start();
+        let command = m.command();
+        assert!(command.playing);
+        assert_eq!(command.speed, 0.0);
+    }
+
+    // Given a paused machine with an active drag.
+    // When the drag velocity changes.
     // Then the command speed approaches +2 × unit (clamped), playing.
     #[test]
     fn drag_velocity_sets_speed() {

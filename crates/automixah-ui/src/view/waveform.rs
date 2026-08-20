@@ -559,6 +559,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
         } else {
             deck.drag_mode = DragMode::Scrub;
             deck.scrub.drag_start();
+            deck.push_command();
             // Seed the view accumulation from the current source position;
             // using the view transform here keeps cue creation correct even
             // when audio output is unavailable.
@@ -590,6 +591,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
                 // (continuous output, no per-frame seek rebuilds).
                 let frame_dt = ui.input(|i| i.unstable_dt);
                 deck.scrub.drag_move(-drag_dx * seconds_per_pixel, frame_dt);
+                deck.push_command();
                 // View: raw pointer accumulation, 1:1 at any zoom.
                 if let Some(view_frame) = deck.drag_view_frame.as_mut() {
                     *view_frame = drag_view_step(*view_frame, drag_dx, deck.view.frames_per_pixel);
@@ -597,6 +599,7 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
             }
             if response.drag_stopped_by(egui::PointerButton::Primary) {
                 deck.scrub.drag_end();
+                deck.push_command();
                 // Snap audio to the pointer so following resumes without
                 // jumping back to the lagged audio position.
                 if let (Some(frame), Some(engine)) = (deck.drag_view_frame, deck.engine.as_ref()) {
