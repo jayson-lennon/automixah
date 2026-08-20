@@ -15,8 +15,8 @@ use crate::timeline::placement::{
 use crate::timeline::stretch::decide_stretch;
 use crate::timeline::tempo::select_target_bpm;
 use crate::timeline::types::{
-    PresetName, Segment, SessionPlan, SessionTime, StretchDecision, TempoStrategy, TrackAnalysis,
-    TrackHash, TransitionPlan, TransitionWindow,
+    CueKind, PresetName, Segment, SessionPlan, SessionTime, StretchDecision, TempoStrategy,
+    TrackAnalysis, TrackHash, TransitionPlan, TransitionWindow,
 };
 
 /// Options for [`plan_session`].
@@ -95,14 +95,15 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
         let stretched_len =
             SessionTime::from_seconds(track.duration * stretch.ratio.max(0.0), sample_rate);
 
-        // Cue: where in the source track this segment starts. First
-        // track starts at zero; incoming tracks cue at a phrase
-        // anchor (a downbeat near 25% in) when their grid is
-        // confident, else at zero with a fallback.
-        let (src_start, cue_warn) = if i == 0 {
-            (0_u64, None)
-        } else {
-            cue_for(track)
+        // Cue: where in the source track this segment starts. A user
+        // in-cue (earliest source-valid, first track included) wins;
+        // otherwise the first track starts at zero and incoming
+        // tracks cue at a phrase anchor (a downbeat near the start)
+        // when their grid is confident, else zero with a fallback.
+        let (src_start, cue_warn) = match in_cue_for(track) {
+            Some(cue) => (cue, None),
+            None if i == 0 => (0_u64, None),
+            None => cue_for(track),
         };
         if let Some(reason) = &cue_warn {
             eprintln!(
@@ -312,6 +313,80 @@ fn cue_seconds_of(track: &TrackAnalysis) -> f32 {
     }
 }
 
+/// The earliest source-valid user in-cue, if any. Positions at or
+/// before the track's end are considered valid; the planner consumes
+/// the value verbatim (no plan-time snapping — the UI snaps on
+/// write). `None` means no usable user in-cue, so the caller falls
+/// back to the grid-derived cue.
+fn in_cue_for(track: &TrackAnalysis) -> Option<u64> {
+    #[expect(clippy::cast_precision_loss, reason = "track duration to frames")]
+    let duration_frames = (track.duration * track.sample_rate as f32).ceil() as u64;
+    track.cues.earliest_valid(CueKind::In, duration_frames)
+}
+
+/// The track's effective cue in source seconds: the user in-cue when
+/// present, else the grid's first downbeat (the fallback cue).
+fn effective_cue_seconds(track: &TrackAnalysis) -> f32 {
+    match in_cue_for(track) {
+        Some(frames) => {
+            #[expect(clippy::cast_precision_loss, reason = "cue frames to seconds")]
+            let seconds = frames as f32 / track.sample_rate as f32;
+            seconds
+        }
+        None => cue_seconds_of(track),
+    }
+}
+
+/// Places the transition window's START at A's earliest source-valid
+/// user out-cue, spanning the full automation length forward.
+///
+/// Returns `None` when the out-cue is unusable: at or before the
+/// selected in-cue, or without enough tail to fit the whole window —
+/// the caller then falls back to grid-derived placement. The window is
+/// consumed verbatim (no plan-time snapping): source-grid snapping at
+/// write time already aligns it with the session grid once stretched.
+fn out_window_for(
+    a: &TrackAnalysis,
+    a_cue_seconds: f32,
+    ratio: f32,
+    cursor: SessionTime,
+    a_audio_end: SessionTime,
+    session_bpm: f32,
+    sample_rate: u32,
+    transition_beats: usize,
+) -> Option<TransitionWindow> {
+    #[expect(clippy::cast_precision_loss, reason = "track duration to frames")]
+    let duration_frames = (a.duration * a.sample_rate as f32).ceil() as u64;
+    let out_cue = a.cues.earliest_valid(CueKind::Out, duration_frames)?;
+    #[expect(clippy::cast_precision_loss, reason = "cue frames to seconds")]
+    let out_seconds = out_cue as f32 / a.sample_rate as f32;
+    // The out-cue must come strictly after A's selected in-cue.
+    if out_seconds <= a_cue_seconds {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "session offset is small")]
+    let out_session = SessionTime(cursor.0.saturating_add(
+        SessionTime::from_seconds((out_seconds - a_cue_seconds) * ratio, sample_rate).0,
+    ));
+    let beat = 60.0 / session_bpm;
+    #[expect(clippy::cast_precision_loss, reason = "beat count is small")]
+    let window_len = SessionTime::from_seconds(transition_beats as f32 * beat, sample_rate);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "window length is small"
+    )]
+    let end = SessionTime(out_session.0.saturating_add(window_len.0));
+    // Enough tail: the whole automation window must fit inside A's audio.
+    if end.0 > a_audio_end.0 {
+        return None;
+    }
+    Some(TransitionWindow {
+        start: out_session,
+        end,
+    })
+}
+
 /// Places the transition out of track `i` (into `i + 1`), if any.
 ///
 /// The window closes at A's natural end: the stretched position of
@@ -340,29 +415,46 @@ fn next_transition(
     };
     let _b_anchor = anchors_from_grid(&next.beat_grid, next.duration);
 
+    let cue = effective_cue_seconds(a);
+    let ratio = decide_stretch(grid_bpm_of(a), session_bpm, a.sample_rate, sample_rate).ratio;
+
     // Window closes at A's natural end in session time: the
     // stretched position of its last downbeat with audio when the
     // grid is confident, else its full stretched end.
     let full_end = SessionTime(cursor.0 + stretched_len.0);
     let a_session_end = a_anchor.as_ref().map_or(full_end, |anchor| {
-        let cue = cue_seconds_of(a);
-        let ratio = decide_stretch(grid_bpm_of(a), session_bpm, a.sample_rate, sample_rate).ratio;
         SessionTime(cursor.0.saturating_add(
             SessionTime::from_seconds((anchor.end_anchor_seconds - cue) * ratio, sample_rate).0,
         ))
     });
 
-    let window = place_window(WindowInputs {
-        preset_beats: transition_beats.max(1),
-        a_session_end,
-        b_cue_session: SessionTime::ZERO,
+    // A valid user out-cue anchors the window START (B begins mixing
+    // in there and the full automation spans [out, out + len]). It
+    // replaces the grid-derived fallback placement entirely;
+    // otherwise the fallback window (closing at A's end) is used.
+    let window = out_window_for(
+        a,
+        cue,
+        ratio,
+        cursor,
+        full_end,
         session_bpm,
         sample_rate,
-        a_grid_phase: if grid_confident {
-            a_grid_phase(a, session_bpm, sample_rate, cursor, stretched_len)
-        } else {
-            None
-        },
+        transition_beats,
+    )
+    .unwrap_or_else(|| {
+        place_window(WindowInputs {
+            preset_beats: transition_beats.max(1),
+            a_session_end,
+            b_cue_session: SessionTime::ZERO,
+            session_bpm,
+            sample_rate,
+            a_grid_phase: if grid_confident {
+                a_grid_phase(a, session_bpm, sample_rate, cursor, stretched_len)
+            } else {
+                None
+            },
+        })
     });
 
     Some((window, PresetName(transition_name.to_owned())))
@@ -631,5 +723,102 @@ mod tests {
             snapshot,
             "bpm=124.0 segments=4 first_len=18106608 second_start=16644193 cut_preset=LongCrossfade"
         );
+    }
+
+    #[test]
+    fn first_track_in_cue_is_honored() {
+        // Given a first track with a user in-cue at 8 s.
+        let mut a = synthetic_track("a", 120.0, 200.0, 800);
+        a.cues = TestCuePoints::with_in(0, 44_100_u64 * 8);
+        let b = synthetic_track("b", 120.0, 200.0, 800);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then segment 0 starts at the user in-cue, not at frame 0.
+        assert_eq!(plan.segments[0].src_start, 44_100_u64 * 8);
+    }
+
+    #[test]
+    fn incoming_in_cue_overrides_grid_downbeat() {
+        // Given an incoming (second) track with an in-cue after the grid downbeat.
+        let a = synthetic_track("a", 120.0, 200.0, 800);
+        let mut b = synthetic_track("b", 120.0, 200.0, 800);
+        b.cues = TestCuePoints::with_in(2, 44_100_u64 * 16);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then segment 1 cues at the user in-cue (16 s) rather than its first downbeat.
+        assert_eq!(plan.segments[1].src_start, 44_100_u64 * 16);
+    }
+
+    #[test]
+    fn earliest_in_cue_wins_over_slot_order() {
+        // Given an in-cue in slot 3 (later) and one in slot 0 placed earlier.
+        let a = synthetic_track("a", 120.0, 200.0, 800);
+        let mut b = synthetic_track("b", 120.0, 200.0, 800);
+        b.cues = TestCuePoints::with_in(0, 44_100_u64 * 40);
+        b.cues.set(CueKind::In, 3, 44_100_u64 * 12);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then the earliest position (slot 3 at 12 s) is selected — slots are labels.
+        assert_eq!(plan.segments[1].src_start, 44_100_u64 * 12);
+    }
+
+    #[test]
+    fn out_cue_anchors_transition_window_start() {
+        // Given an outgoing track with a valid out-cue at 90 s and tail for the window.
+        let mut a = synthetic_track("a", 120.0, 200.0, 800);
+        a.cues = TestCuePoints::with_out(0, 44_100_u64 * 90);
+        let b = synthetic_track("b", 120.0, 200.0, 800);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then the window starts exactly at the out-cue (consumed verbatim, no snap).
+        let t = plan.segments[0].transition.as_ref().expect("transition");
+        let expected = (90.0_f64 * 44_100.0_f64).round() as u64;
+        assert_eq!(t.window.start.0, expected);
+    }
+
+    #[test]
+    fn out_cue_too_late_falls_back_to_grid_placement() {
+        // Given an out-cue so late the full window cannot fit before A's end.
+        let mut a = synthetic_track("a", 120.0, 100.0, 400); // 100 s track
+        a.cues = TestCuePoints::with_out(0, 44_100_u64 * 95); // 95 s out
+        let b = synthetic_track("b", 120.0, 200.0, 800);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then the out-cue is ignored and the grid-derived fallback closes A's window.
+        let t = plan.segments[0].transition.as_ref().expect("transition");
+        assert_ne!(t.window.start.0, 44_100_u64 * 95);
+    }
+
+    #[test]
+    fn out_cue_before_in_cue_is_rejected() {
+        // Given an out-cue earlier than the selected in-cue.
+        let mut a = synthetic_track("a", 120.0, 200.0, 800);
+        a.cues = TestCuePoints::with_in(0, 44_100_u64 * 50);
+        a.cues.set(CueKind::Out, 0, 44_100_u64 * 40);
+        let b = synthetic_track("b", 120.0, 200.0, 800);
+        let tracks = vec![a, b];
+
+        // When planning.
+        let plan = plan_session(&tracks, Some(120.0));
+
+        // Then the in-cue is honored and the out-cue falls back to grid placement.
+        assert_eq!(plan.segments[0].src_start, 44_100_u64 * 50);
+        let t = plan.segments[0].transition.as_ref().expect("transition");
+        assert_ne!(t.window.start.0, 44_100_u64 * 40);
     }
 }
