@@ -574,7 +574,7 @@ impl AutomixahUiApp {
         });
     }
 
-    /// Renames a playlist; the panel's context menu carries the field.
+    /// Renames a playlist; the panel's inline editor carries the field.
     fn rename_playlist(&mut self, id: i64, name: String) {
         let store = self.services.playlist_store.clone();
         let tx = self.bus.sender();

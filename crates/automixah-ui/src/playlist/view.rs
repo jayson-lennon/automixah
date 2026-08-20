@@ -2,11 +2,8 @@
 //!
 //! The panel is a full-width, user-resizable strip below the waveform:
 //! the left column lists playlists (select / ＋ new / right-click
-//! rename-delete), the right column shows the selected playlist's
-//! tracks. Row rendering ([`rows`]) draws artist–title on the left and
-//! BPM / Camelot key / duration right-aligned; the key text is colored
-//! by [`harmonic_color`] against the previous ready row's key (the
-//! DJ-adjacency view — reordering instantly recolors).
+//! rename-delete; rename swaps the row for an in-place editor), the
+//! right column shows the selected playlist's tracks. Row rendering
 //!
 //! All state lives on [`crate::playlist::PlaylistState`]; this module
 //! only paints and emits user intents back through [`PanelActions`].
@@ -14,20 +11,22 @@
 use egui::Color32;
 
 use crate::playlist::queue::RowId;
-use crate::playlist::{Contents, PlaylistRow, PlaylistState, RowStatus};
+use crate::playlist::{
+    Contents, PlaylistRow, PlaylistState, RenameOutcome, RowStatus, rename_outcome,
+};
 
 /// User intents emitted by the panel (the app wires them to stores).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PanelAction {
     /// A playlist was clicked (selection change).
     SelectPlaylist(i64),
     /// The ＋ button was clicked.
     NewPlaylist,
-    /// Rename was submitted in a playlist's context menu.
+    /// Rename was submitted by the inline row editor.
     RenamePlaylist {
         /// Playlist to rename.
         id: i64,
-        /// Submitted name (non-empty; the field rejects empties).
+        /// Submitted name (non-empty; the editor reverts empties).
         name: String,
     },
     /// Delete was chosen in a playlist's context menu.
@@ -105,7 +104,8 @@ pub fn panel(ctx: &egui::Context, state: &mut PlaylistState) -> PanelActions {
     actions
 }
 
-/// The left column: one selectable row per playlist with a context menu.
+/// The left column: one selectable row per playlist with a context menu;
+/// the renamed row swaps in-place for a focused text editor.
 fn playlist_list(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions) {
     let n = state.playlists.len();
     for i in 0..n {
@@ -114,6 +114,10 @@ fn playlist_list(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut Pan
             (playlist.id, playlist.name.clone())
         };
         let selected = state.selected == Some(id);
+        if state.rename.matches(id) {
+            rename_row(ui, state, id, actions);
+            continue;
+        }
         let response = ui.selectable_label(selected, &name);
         if response.clicked() {
             actions.actions.push(PanelAction::SelectPlaylist(id));
@@ -121,19 +125,7 @@ fn playlist_list(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut Pan
         response.context_menu(|ui| {
             if ui.button("Rename…").clicked() {
                 state.rename.begin(id, &name);
-            }
-            if state.rename.matches(id) {
-                ui.text_edit_singleline(&mut state.rename.buffer);
-                let submitted =
-                    ui.button("Apply").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if submitted && !state.rename.buffer.trim().is_empty() {
-                    actions.actions.push(PanelAction::RenamePlaylist {
-                        id,
-                        name: state.rename.buffer.trim().to_owned(),
-                    });
-                    state.rename.clear();
-                    ui.close();
-                }
+                ui.close();
             }
             if ui.button("Delete").clicked() {
                 actions.actions.push(PanelAction::DeletePlaylist(id));
@@ -144,6 +136,85 @@ fn playlist_list(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut Pan
     if state.playlists.is_empty() {
         ui.weak("no playlists");
     }
+}
+
+/// The rename editor row: replaces the playlist's label in-place with
+/// a focused text edit over the current name.
+fn rename_row(ui: &mut egui::Ui, state: &mut PlaylistState, id: i64, actions: &mut PanelActions) {
+    let edit_id = egui::Id::new("playlist_rename_editor");
+    if state.rename.pending_focus {
+        seed_select_all(ui.ctx(), edit_id, &state.rename.buffer);
+        ui.ctx().memory_mut(|m| m.request_focus(edit_id));
+        state.rename.pending_focus = false;
+    }
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut state.rename.buffer)
+            .id(edit_id)
+            .return_key(None::<egui::KeyboardShortcut>)
+            .desired_width(ui.available_width()),
+    );
+    if state.rename.hint.is_some() {
+        ui.label(
+            egui::RichText::new("name already exists")
+                .small()
+                .color(egui::Color32::RED),
+        );
+    }
+    // Escape never reaches `has_focus`: egui clears focus pre-frame on
+    // Escape (the TextEdit event filter cannot lock it), so the cancel
+    // lands in `lost_focus` below.
+    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        match rename_outcome(&state.rename, &state.playlists) {
+            RenameOutcome::Submit(name) => {
+                actions
+                    .actions
+                    .push(PanelAction::RenamePlaylist { id, name });
+                state.rename.clear();
+                ui.ctx().memory_mut(|m| m.surrender_focus(edit_id));
+            }
+            RenameOutcome::Revert => {
+                state.rename.clear();
+                ui.ctx().memory_mut(|m| m.surrender_focus(edit_id));
+            }
+            RenameOutcome::RejectDuplicate => {
+                state.rename.hint = Some("name already exists");
+            }
+        }
+        return;
+    }
+    if response.lost_focus() {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.rename.clear();
+            return;
+        }
+        match rename_outcome(&state.rename, &state.playlists) {
+            RenameOutcome::Submit(name) => {
+                actions
+                    .actions
+                    .push(PanelAction::RenamePlaylist { id, name });
+            }
+            // A duplicate cannot stay open without the field fighting
+            // the click that took focus; revert instead.
+            RenameOutcome::Revert | RenameOutcome::RejectDuplicate => {}
+        }
+        state.rename.clear();
+    }
+}
+
+/// Seeds the editor's text state so the current name opens fully
+/// selected (type-to-replace). Char indices, not bytes.
+fn seed_select_all(ctx: &egui::Context, id: egui::Id, buffer: &str) {
+    let mut text_state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    let end = buffer.chars().count();
+    text_state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::default(),
+            egui::text::CCursor {
+                index: end,
+                prefer_next_row: false,
+            },
+        )));
 }
 
 /// The right column: track rows with status icons, drag-reorder,
@@ -491,6 +562,119 @@ mod tests {
             root,
             mode: djcore::key::KeyMode::Minor,
         }
+    }
+
+    fn editing_state() -> PlaylistState {
+        let mut state = PlaylistState {
+            playlists: vec![crate::playlist::store::PlaylistSummary {
+                id: 1,
+                name: "old".to_owned(),
+            }],
+            ..Default::default()
+        };
+        state.rename.begin(1, "old");
+        state
+    }
+
+    // Given the inline rename editor focused with a typed name.
+    // When Enter is pressed.
+    // Then a rename action with the typed name is emitted and the
+    // editor closes.
+    #[test]
+    fn inline_editor_enter_commits() {
+        let mut state = editing_state();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = panel(ctx, &mut state);
+        });
+        state.rename.buffer = "  new  ".to_owned();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut actions = PanelActions::default();
+        let _ = ctx.run(input, |ctx| {
+            actions = panel(ctx, &mut state);
+        });
+
+        assert_eq!(
+            actions.actions,
+            vec![PanelAction::RenamePlaylist {
+                id: 1,
+                name: "new".to_owned(),
+            }],
+            "trimmed typed name commits"
+        );
+        assert!(!state.rename.matches(1), "editor closed");
+    }
+
+    // Given the inline rename editor focused.
+    // When Escape is pressed.
+    // Then no rename action is emitted and the editor closes.
+    #[test]
+    fn inline_editor_escape_cancels() {
+        let mut state = editing_state();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = panel(ctx, &mut state);
+        });
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut actions = PanelActions::default();
+        let _ = ctx.run(input, |ctx| {
+            actions = panel(ctx, &mut state);
+        });
+
+        assert!(actions.actions.is_empty(), "nothing submitted");
+        assert!(!state.rename.matches(1), "editor closed");
+    }
+
+    // Given the inline rename editor with a typed name that then loses
+    // focus (click-away).
+    // When the next frame renders.
+    // Then the typed name commits like Enter.
+    #[test]
+    fn inline_editor_focus_loss_commits() {
+        let mut state = editing_state();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = panel(ctx, &mut state);
+        });
+        state.rename.buffer = "new".to_owned();
+        // Click-away is another widget grabbing focus during a frame.
+        let mut actions = PanelActions::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.ctx()
+                    .memory_mut(|m| m.request_focus(egui::Id::new("click_away_target")));
+                let _ = ui.allocate_space(egui::vec2(1.0, 1.0));
+            });
+            actions = panel(ctx, &mut state);
+        });
+
+        assert_eq!(
+            actions.actions,
+            vec![PanelAction::RenamePlaylist {
+                id: 1,
+                name: "new".to_owned(),
+            }],
+            "focus loss commits the typed name"
+        );
+        assert!(!state.rename.matches(1), "editor closed");
     }
 
     // Given a row with a key but no previous row.

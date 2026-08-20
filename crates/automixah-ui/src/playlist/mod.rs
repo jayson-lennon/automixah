@@ -102,13 +102,18 @@ pub struct PlaylistState {
     pub rename: RenameEditor,
 }
 
-/// Inline rename editor for the playlist context menu.
+/// Inline rename editor: swaps a playlist row for an in-place field.
 #[derive(Debug, Default)]
 pub struct RenameEditor {
     /// The playlist being renamed (`None` when idle).
     pub id: Option<i64>,
     /// The in-progress name.
     pub buffer: String,
+    /// `true` for one frame after `begin`: the row seeds focus and
+    /// select-all, then clears it.
+    pub pending_focus: bool,
+    /// Inline rejection hint shown while editing (`None` normally).
+    pub hint: Option<&'static str>,
 }
 
 impl RenameEditor {
@@ -116,6 +121,8 @@ impl RenameEditor {
     pub fn begin(&mut self, id: i64, name: &str) {
         self.id = Some(id);
         self.buffer = name.to_owned();
+        self.pending_focus = true;
+        self.hint = None;
     }
 
     /// `true` when the editor targets `id`.
@@ -128,7 +135,45 @@ impl RenameEditor {
     pub fn clear(&mut self) {
         self.id = None;
         self.buffer.clear();
+        self.pending_focus = false;
+        self.hint = None;
     }
+}
+
+/// What the rename editor should do with its buffer on a commit
+/// attempt (Enter or focus loss).
+#[derive(Debug, PartialEq)]
+pub(crate) enum RenameOutcome {
+    /// Commit this trimmed name.
+    Submit(String),
+    /// Empty/whitespace input: close the editor, emit nothing.
+    Revert,
+    /// Name already owned by another playlist: keep editing, show hint.
+    RejectDuplicate,
+}
+
+/// Decides the commit outcome for the editor against the known
+/// playlists.
+///
+/// Duplicate detection is case-sensitive byte equality, mirroring
+/// the store's `ORDER BY name` / UNIQUE (BINARY collation).
+/// Renaming to the playlist's own current name is allowed.
+#[must_use]
+pub(crate) fn rename_outcome(
+    editor: &RenameEditor,
+    playlists: &[PlaylistSummary],
+) -> RenameOutcome {
+    let Some(id) = editor.id else {
+        return RenameOutcome::Revert;
+    };
+    let trimmed = editor.buffer.trim();
+    if trimmed.is_empty() {
+        return RenameOutcome::Revert;
+    }
+    if playlists.iter().any(|p| p.id != id && p.name == trimmed) {
+        return RenameOutcome::RejectDuplicate;
+    }
+    RenameOutcome::Submit(trimmed.to_owned())
 }
 
 impl PlaylistState {
@@ -153,6 +198,8 @@ impl PlaylistState {
                 if let Some(p) = self.playlists.iter_mut().find(|p| p.id == *id) {
                     p.name = name.clone();
                 }
+                // The store lists name-ordered; keep the list matching.
+                self.playlists.sort_by(|a, b| a.name.cmp(&b.name));
             }
             Event::PlaylistDeleted(id) => {
                 if self.selected == Some(*id) {
@@ -451,6 +498,99 @@ mod tests {
         });
 
         assert_eq!(state.playlists[0].name, "new");
+    }
+
+    fn rename_editor(id: i64, buffer: &str) -> RenameEditor {
+        let mut editor = RenameEditor::default();
+        editor.begin(id, "seed");
+        editor.buffer = buffer.to_owned();
+        editor
+    }
+
+    // Given an editor with a padded non-empty buffer.
+    // When deciding the rename outcome.
+    // Then it submits the trimmed name.
+    #[test]
+    fn rename_decision_trims_nonempty_buffer() {
+        let editor = rename_editor(1, "  house  ");
+
+        let outcome = rename_outcome(&editor, &[]);
+
+        assert_eq!(outcome, RenameOutcome::Submit("house".to_owned()));
+    }
+
+    // Given an editor whose buffer is empty or whitespace-only.
+    // When deciding the rename outcome.
+    // Then it reverts (nothing to submit).
+    #[rstest::rstest]
+    #[case("")]
+    #[case("   ")]
+    fn rename_decision_whitespace_reverts(#[case] buffer: &str) {
+        let editor = rename_editor(1, buffer);
+
+        let outcome = rename_outcome(&editor, &[]);
+
+        assert_eq!(outcome, RenameOutcome::Revert);
+    }
+
+    // Given an editor targeting a name another playlist already has.
+    // When deciding the rename outcome.
+    // Then the duplicate is rejected (editing continues with a hint).
+    #[test]
+    fn rename_duplicate_name_keeps_editing() {
+        let editor = rename_editor(1, "taken");
+        let playlists = [PlaylistSummary {
+            id: 2,
+            name: "taken".to_owned(),
+        }];
+
+        let outcome = rename_outcome(&editor, &playlists);
+
+        assert_eq!(outcome, RenameOutcome::RejectDuplicate);
+    }
+
+    // Given an editor whose buffer equals its own playlist's name.
+    // When deciding the rename outcome.
+    // Then it is not a duplicate and submits.
+    #[test]
+    fn rename_same_name_is_not_duplicate() {
+        let editor = rename_editor(1, "mine");
+        let playlists = [PlaylistSummary {
+            id: 1,
+            name: "mine".to_owned(),
+        }];
+
+        let outcome = rename_outcome(&editor, &playlists);
+
+        assert_eq!(outcome, RenameOutcome::Submit("mine".to_owned()));
+    }
+
+    // Given two playlists where renaming moves one between the others.
+    // When the rename event applies.
+    // Then the list re-sorts into name order (the store's order).
+    #[test]
+    fn playlist_renamed_resorts_list() {
+        let mut state = PlaylistState {
+            playlists: vec![
+                PlaylistSummary {
+                    id: 1,
+                    name: "A".to_owned(),
+                },
+                PlaylistSummary {
+                    id: 2,
+                    name: "C".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        state.apply(&Event::PlaylistRenamed {
+            id: 2,
+            name: "B".to_owned(),
+        });
+
+        let names: Vec<&str> = state.playlists.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B"], "sorted by name");
     }
 
     // Given the selected playlist is deleted.
