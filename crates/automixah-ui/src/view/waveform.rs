@@ -10,6 +10,7 @@ use crate::deck::{Deck, DragMode};
 use automixah_engine::timeline::types::{CUE_SLOTS, CueKind, CuePoints};
 
 const CUE_BOX_SIZE: Vec2 = Vec2::new(24.0, 20.0);
+const CUE_PANEL_HEIGHT: f32 = 86.0;
 const IN_CUE_COLOR: Color32 = Color32::from_rgb(40, 190, 80);
 const OUT_CUE_COLOR: Color32 = Color32::from_rgb(230, 145, 35);
 const INVALID_CUE_COLOR: Color32 = Color32::from_gray(125);
@@ -166,7 +167,18 @@ pub fn show(
     view: &mut WaveformView,
     pin_frame: Option<f32>,
 ) -> (Response, Rect, f32) {
-    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    let desired_size = ui.available_size();
+    show_sized(ui, peaks, view, pin_frame, desired_size)
+}
+
+fn show_sized(
+    ui: &mut egui::Ui,
+    peaks: &Peaks,
+    view: &mut WaveformView,
+    pin_frame: Option<f32>,
+    desired_size: Vec2,
+) -> (Response, Rect, f32) {
+    let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
     let mut response = response;
     let painter = ui.painter_at(rect);
     let width = rect.width();
@@ -483,7 +495,14 @@ pub fn deck_panel(ui: &mut egui::Ui, deck: &mut Deck, status: &mut String) {
     let follow = follow.map(|frame| frame as f32);
     #[expect(clippy::cast_precision_loss, reason = "u32 rate to f32 display math")]
     let sample_rate = deck.sample_rate as f32;
-    let (response, rect, _rate) = show(ui, &deck.peaks, &mut deck.view, follow);
+    let waveform_height = (ui.available_height() - CUE_PANEL_HEIGHT).max(1.0);
+    let (response, rect, _rate) = show_sized(
+        ui,
+        &deck.peaks,
+        &mut deck.view,
+        follow,
+        Vec2::new(ui.available_width(), waveform_height),
+    );
     let seconds_per_pixel = deck.view.frames_per_pixel / sample_rate;
     let time_at_left = deck.view.left_frame / sample_rate;
     let pointer_time = response
