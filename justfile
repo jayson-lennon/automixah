@@ -1,4 +1,4 @@
-# automixah — Rust-only terminal auto-DJ.
+# automixah — egui desktop auto-DJ: align grids, audition, render mixes.
 
 # List all recipes
 [group('meta')]
@@ -36,15 +36,10 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Build the CLI binary (debug)
+# Build the egui desktop binary (debug)
 [group('build')]
 build:
-    cargo build -p automixah-cli
-
-# Run: mix two tracks into mix.wav
-[group('build')]
-mix out tracks:
-    cargo run -p automixah-cli -- --out {{out}} {{tracks}}
+    cargo build -p automixah-ui
 
 # Commit all changes with a message
 [group('meta')]

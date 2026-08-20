@@ -129,8 +129,30 @@ pub enum Event {
     /// An add-track task failed (its terminal event; distinct from
     /// `CommandFailed` so the in-flight count is never corrupted).
     AddFailed { message: String },
+    // Render pipeline (one job at a time; a singleton, so events
+    // address nothing).
+    /// Staged progress from the active mixdown (throttled upstream).
+    RenderProgress { stage: RenderStage },
+    /// Terminal: the WAV exists at the requested path.
+    RenderDone { out: std::path::PathBuf },
+    /// Terminal: the user cancelled; the partial file was removed.
+    RenderCancelled,
+    /// Terminal: the mixdown failed; the message carries the rendered
+    /// report.
+    RenderFailed { message: String },
     /// A fire-and-forget command failed.
     CommandFailed(String),
+}
+
+/// One progress report from the active mixdown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderStage {
+    /// Track `done` of `total` decoded from disk.
+    Decoding { done: usize, total: usize },
+    /// Track `done` of `total` stretched and cue-sliced.
+    Stretching { done: usize, total: usize },
+    /// Session mixing, `fraction` of total samples in `[0, 1]`.
+    Mixing { fraction: f32 },
 }
 
 impl std::fmt::Debug for Event {
@@ -224,6 +246,16 @@ impl std::fmt::Debug for Event {
                 f.debug_struct("AddStarted").field("count", count).finish()
             }
             Self::AddFailed { message } => f.debug_tuple("AddFailed").field(message).finish(),
+            Self::RenderProgress { stage } => f
+                .debug_struct("RenderProgress")
+                .field("stage", stage)
+                .finish(),
+            Self::RenderDone { out } => f
+                .debug_struct("RenderDone")
+                .field("out", &out.display().to_string())
+                .finish(),
+            Self::RenderCancelled => f.debug_tuple("RenderCancelled").finish(),
+            Self::RenderFailed { message } => f.debug_tuple("RenderFailed").field(message).finish(),
             Self::CommandFailed(message) => f.debug_tuple("CommandFailed").field(message).finish(),
         }
     }

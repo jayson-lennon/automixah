@@ -6,7 +6,7 @@ This document defines the _coding conventions_, _patterns_, and _architecture_ f
 
 ## 1. Overview
 
-automixah is an experimental auto-DJ application: fixed-BPM tracks are decoded, analyzed (constant beat grids), planned into overlapping transitions, and rendered to a mixed WAV. A companion egui desktop tool (`automixah-ui`) aligns beat grids by hand and auditions them with vinyl-style scrubbing.
+automixah is an experimental auto-DJ application: fixed-BPM tracks are decoded, analyzed (constant beat grids), planned into overlapping transitions, and rendered to a mixed WAV. The egui desktop application (`automixah-ui`) aligns beat grids by hand, auditions them with vinyl-style scrubbing, and renders playlist mixes to WAV.
 
 This guide keeps patterns _sparse and generic_ so they survive architectural change. When this document and the code disagree, fix the document in the same change.
 
@@ -136,14 +136,15 @@ Sparse by design — the crate list below is the only fixed map:
 | `stratum-dsp` | DSP feature extraction (onsets, tempo, beat grids) |
 | `djcore` | Decode + analyze: files in, `AnalyzerOutput` (grid, key, BPM) out |
 | `automixah-schema` | Shared data types |
-| `automixah-engine` | Transition planning and mix rendering |
-| `automixah-cli` | Offline render binary (WAV out) |
-| `automixah-ui` | egui grid-alignment + scrub-audition tool |
+| `automixah-engine` | Transition planning and mix rendering (`mixdown`: playlist → WAV) |
+| `automixah-ui` | egui application: grid alignment, scrub audition, playlist, mixdown render |
 
 Data flows one direction:
 
 ```
 files → decode → analyze (constant grid) → plan (phase-snapped overlap) → render → WAV
+        driven by the egui UI (`automixah-ui`): playlists queue analysis,
+        stored grids short-circuit re-analysis, mixdown renders the playlist
                      ↘ sqlite grid library (manual overrides) ↗
                          ↘ playlist library (playlists, track tags, analysis queue) ↗
 ```
@@ -176,7 +177,7 @@ Locate concerns by convention, not hardcoded paths — `grep`/`rg` for the curre
 
 1. **DSP/analysis change** → `stratum-dsp/src/features/*`; grid math lives with the beat-tracking feature.
 2. **Decode/analyze change** → `djcore/src` (`decoder/`, `analyzer.rs`).
-3. **Transition/placement change** → `automixah-engine/src/timeline` (planning) and `render` (mixdown).
+3. **Transition/placement change** → `automixah-engine/src/timeline` (planning) and `mixdown` (playlist → WAV pipeline; the UI renders through `run_mixdown` from `app.rs`).
 4. **New persisted data** → add a store trait method + SQLite migration (`_migrations` versioning) + in-memory impl, then wire through `Services`.
 5. **UI change** → `automixah-ui/src`: `tracks.rs` (track database), `playlist/` (ordering, queue, panel view), `deck.rs` (loaded media/playback), `bus.rs` (event dialect), `view/` (waveform, grid overlay), `audio/` (output, scrub), `app.rs` (wiring + event applier).
 6. **Write tests** per §4 — a unit test next to the module, an integration test for cross-crate behavior.
@@ -195,8 +196,7 @@ Read the `justfile` for the full list; prefer `just` recipes over manual invocat
 | `lint` | `just lint` | clippy with warnings as errors |
 | `format` | `just fmt` | `cargo fmt --all` |
 | `commit` | `just commit '<message>'` | Stages everything and commits |
-| `build` | `just build` | Debug build of the CLI |
-| `mix` | `just mix <out> <tracks...>` | Render a mix through the CLI |
+| `build` | `just build` | Debug build of the egui app |
 
 ### Plan Directory
 

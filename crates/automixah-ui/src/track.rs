@@ -22,7 +22,7 @@ pub mod identity {
     use std::path::Path;
 
     /// SHA-256 hex digest of bytes — the content hash every subsystem
-    /// addresses tracks by. Mirrors `automixah-cli`'s hashing.
+    /// addresses tracks by.
     #[must_use]
     pub fn hex_sha256(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};

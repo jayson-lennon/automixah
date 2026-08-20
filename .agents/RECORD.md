@@ -38,8 +38,7 @@ Entries are added or amended **only with human approval**.
 - (analysis) Beat grids are constant-tempo: one rounded BPM and one phase anchor per track; beats/downbeats/bars arrays are projections of that grid, with the downbeat phase chosen by energy.
 - (analysis) The grid BPM uses a Mixxx-style rounding ladder (integer → ½ → ⅓ → 1/12) within regression confidence bounds; near-musical values snap when the bounds admit them.
 - (boundary) Fixed-BPM tracks are the only supported input; variable-tempo tracks are out of scope.
-- (cli) Track inputs are absolute paths passed via repeated `--track` flags in the given order; the CLI hashes, decodes, and analyzes them from scratch on every invocation.
-- (cli) The CLI's primary interface is offline rendering: it mixes the given tracks and writes a WAV; the Leptos/wasm UI and web build machinery were removed.
+- (engine) automixah-engine exposes a mixdown pipeline: a job message (per-track path, canonical grid, key, duration, in playlist order) renders a session to WAV; audio is read and decoded from disk inside the render worker, never re-analyzed.
 - (db) The grid library persists to a SQLite database in the XDG data dir, keyed by track content hash, behind a `GridStore` trait with SQLite and in-memory backends and versioned migrations.
 - (db) Track analysis persists BPM, key, and the beat grid per content hash; manual grid edits preserve the stored key.
 - (db) Playlists persist to the library database as ordered content-hash references with add-time paths; track tags (artist/title/duration) persist keyed by content hash.
@@ -68,7 +67,9 @@ Entries are added or amended **only with human approval**.
 - (ui) The editor holds a single optional Deck (media, working grid, engine, scrub, view) for the loaded track; decoded PCM/peaks exist only inside the deck and are dropped on load or re-analyze.
 - (workflow) This repository uses git; commits go through `just commit '<message>'`, checks through `just check`, `just test`, and `just lint`.
 - (analysis) djcore decodes mp3, flac, wav, ogg, aac, opus, and m4a (AAC or ALAC) input via symphonia; opus uses a bundled libopus adapter available on native targets only.
-- (cli) The CLI writes the output WAV at the session sample rate (the first track's rate) rather than a fixed 44.1 kHz.
+- (engine) Mixdown writes to a `.part` sibling of the output and atomically renames on success; cancel or failure removes the partial file.
+- (ui) The playlist panel renders the selected playlist to a user-chosen WAV path: path input, browse (system save dialog), and a render/cancel button enabled only when the playlist has at least two rows, every row is analysis-ready, and a path is set.
+- (ui) Render job metadata is snapshotted from the track database at click time; grid edits during a render cannot affect the in-flight job.
 - (ui) Audition playback is source-rate agnostic: scrub reads at 1x in source frames, a single RateFolder pass converts to the device rate, and source channels fold to the device channel count.
 - (ui) The scrub playhead is tracked in f64 frames; playback reaches the true end of any track (an f32 position would freeze at 2²⁴ frames ≈ 6.3 min).
 - (workflow) `just test` runs the fast suite via nextest; slow real-audio tests are `#[ignore]`d and run via `just test-heavy`.

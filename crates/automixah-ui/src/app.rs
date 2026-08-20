@@ -15,7 +15,10 @@ use crate::deck::Deck;
 use crate::playlist::Contents;
 use crate::services::Services;
 use crate::tracks::{AnalysisState, TrackRecord};
+use automixah_engine::mixdown::MixdownOutcome;
 use automixah_engine::timeline::types::TrackHash;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// The automixah-ui application.
 pub struct AutomixahUiApp {
@@ -39,6 +42,13 @@ pub struct AutomixahUiApp {
     pending_deck_load: Option<TrackHash>,
     /// Status line shown in the top bar.
     status: String,
+    /// Absolute output path for the next mixdown (free-text + browse).
+    pub(crate) render_out: String,
+    /// Cancel flag for the in-flight mixdown; `None` when idle. Only
+    /// a terminal render event may clear it — CancelRender only sets.
+    pub(crate) render_cancel: Option<Arc<AtomicBool>>,
+    /// Latest staged progress of the in-flight mixdown; `None` idle.
+    pub(crate) render_stage: Option<crate::bus::RenderStage>,
     /// The UI event bus: every async outcome lands here; `update`
     /// drains it and applies events (the sole state mutation path).
     pub(crate) bus: crate::bus::EventBus,
@@ -59,6 +69,9 @@ impl AutomixahUiApp {
             load_in_flight: false,
             pending_deck_load: None,
             status: "pick a track from the playlist to begin".to_owned(),
+            render_out: String::new(),
+            render_cancel: None,
+            render_stage: None,
             bus,
         }
     }
@@ -325,6 +338,24 @@ impl AutomixahUiApp {
             Event::CommandFailed(message) => {
                 self.status = format!("\u{26a0} {message}");
             }
+            Event::RenderProgress { stage } => {
+                self.render_stage = Some(stage);
+            }
+            Event::RenderDone { out } => {
+                self.render_cancel = None;
+                self.render_stage = None;
+                self.status = format!("wrote {}", out.display());
+            }
+            Event::RenderCancelled => {
+                self.render_cancel = None;
+                self.render_stage = None;
+                self.status = "render cancelled".to_owned();
+            }
+            Event::RenderFailed { message } => {
+                self.render_cancel = None;
+                self.render_stage = None;
+                self.status = format!("\u{26a0} render failed: {message}");
+            }
             // Ordering events were applied by the playlist state above.
             Event::PlaylistsLoaded(_)
             | Event::PlaylistCreated(_)
@@ -384,6 +415,13 @@ impl AutomixahUiApp {
                 PanelAction::LoadRow(hash) => self.load_row(&hash),
                 PanelAction::MoveRow { from, to } => self.move_row_persist(&from, &to),
                 PanelAction::RemoveRow { hash } => self.remove_row_persist(&hash),
+                PanelAction::BrowseRenderOut => self.browse_render_out(),
+                PanelAction::Render => {
+                    if self.can_render() {
+                        self.spawn_render();
+                    }
+                }
+                PanelAction::CancelRender => self.cancel_render(),
             }
         }
     }
@@ -662,7 +700,20 @@ impl eframe::App for AutomixahUiApp {
         self.drain_bus();
         // Bottom panel first: it registers before CentralPanel claims
         // the remaining space.
-        let actions = crate::playlist::view::panel(ctx, &mut self.playlist_state, &self.tracks);
+        let actions = {
+            // Snapshot derivations before the mutable borrow of the
+            // path buffer.
+            let running = self.render_cancel.is_some();
+            let can_render = self.can_render();
+            let stage = self.render_stage;
+            let render = crate::playlist::view::RenderUiState {
+                out: &mut self.render_out,
+                running,
+                can_render,
+                stage,
+            };
+            crate::playlist::view::panel(ctx, &mut self.playlist_state, &self.tracks, render)
+        };
         self.handle_panel_actions(actions);
         if ctx.input(|i| i.key_pressed(egui::Key::Space))
             && let Some(deck) = self.deck.as_mut()
@@ -717,13 +768,150 @@ impl eframe::App for AutomixahUiApp {
         }
 
         // Keep the UI live while a deck is loaded (playhead ticking), a
-        // load is in flight, or any shown row is pending.
+        // load is in flight, any shown row is pending, or a mixdown is
+        // rendering (throttled progress).
         if self.deck.is_some()
             || self.load_in_flight
             || self.playlist_state.any_pending(&self.tracks)
+            || self.render_cancel.is_some()
         {
             ctx.request_repaint();
         }
+    }
+}
+
+impl AutomixahUiApp {
+    /// `true` when the render button may start a mixdown: idle, a
+    /// playlist selected with at least two ready rows, and a
+    /// non-empty output path. Derived — never stored.
+    pub(crate) fn can_render(&self) -> bool {
+        let Some(rows) = self.playlist_state.selected_rows() else {
+            return false;
+        };
+        self.render_cancel.is_none()
+            && !self.render_out.trim().is_empty()
+            && rows.len() >= 2
+            && rows.iter().all(|h| self.tracks.is_ready(h))
+    }
+
+    /// Snapshots the selected playlist into a mixdown job from the
+    /// track database at click time; later grid edits cannot affect
+    /// the returned job.
+    pub(crate) fn build_mixdown_job(&self) -> Option<automixah_engine::mixdown::MixdownJob> {
+        let rows = self.playlist_state.selected_rows()?;
+        if rows.len() < 2 {
+            return None;
+        }
+        let tracks = rows
+            .iter()
+            .map(|hash| {
+                let record = self.tracks.get(hash)?;
+                let crate::tracks::AnalysisState::Ready(analysis) = &record.analysis else {
+                    return None;
+                };
+                let grid = crate::grid::EditableGrid::from_grid(&analysis.grid);
+                Some(automixah_engine::mixdown::MixdownTrack {
+                    hash: hash.clone(),
+                    path: record.tags.path.clone(),
+                    grid_bpm: grid.grid_bpm,
+                    anchor_seconds: grid.anchor_seconds,
+                    downbeat_phase: grid.downbeat_phase,
+                    key: analysis.key.clone(),
+                    duration: analysis.duration_seconds,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let out = std::path::PathBuf::from(self.render_out.trim());
+        Some(automixah_engine::mixdown::MixdownJob { tracks, out })
+    }
+
+    /// Starts the mixdown on a blocking thread. Progress lands on
+    /// the bus (throttled to ~10/s per stage class); the cancel flag
+    /// is stored until a terminal render event clears it.
+    fn spawn_render(&mut self) {
+        let Some(job) = self.build_mixdown_job() else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.render_cancel = Some(Arc::clone(&cancel));
+        self.render_stage = None;
+        let tx = self.bus.sender();
+        let out = job.out.clone();
+        let handle = self.services.runtime.handle().clone();
+        handle.spawn_blocking(move || {
+            let mut last = ThrottleState::default();
+            let mut progress = |stage: automixah_engine::mixdown::MixdownStage| {
+                let bus_stage = to_bus_stage(stage);
+                if last.should_send(bus_stage) {
+                    let _ = tx.send(Event::RenderProgress { stage: bus_stage });
+                }
+            };
+            let is_cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+            let outcome =
+                automixah_engine::mixdown::run_mixdown(&job, &mut progress, &is_cancelled);
+            let event = match outcome {
+                MixdownOutcome::Done => Event::RenderDone { out },
+                MixdownOutcome::Cancelled => Event::RenderCancelled,
+                MixdownOutcome::Failed(message) => Event::RenderFailed { message },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    /// Cancels the in-flight mixdown. Only the terminal render event
+    /// may clear `render_cancel` — the worker must observe the flag
+    /// and report back before the app returns to idle.
+    fn cancel_render(&mut self) {
+        if let Some(flag) = &self.render_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Opens the system save dialog for the mixdown output path.
+    fn browse_render_out(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Render mix to")
+            .add_filter("WAV", &["wav"])
+            .set_file_name("mix.wav")
+            .save_file()
+            && let Some(text) = path.to_str()
+        {
+            self.render_out = text.to_owned();
+        }
+    }
+}
+
+/// Progress-send throttle state: emit on stage-class change or
+/// after the interval elapses.
+#[derive(Default)]
+struct ThrottleState {
+    last_sent: Option<(std::time::Instant, crate::bus::RenderStage)>,
+}
+
+impl ThrottleState {
+    fn should_send(&mut self, stage: crate::bus::RenderStage) -> bool {
+        let now = std::time::Instant::now();
+        if let Some((sent_at, last)) = self.last_sent
+            && std::mem::discriminant(&last) == std::mem::discriminant(&stage)
+            && now.duration_since(sent_at) < PROGRESS_INTERVAL
+        {
+            return false;
+        }
+        self.last_sent = Some((now, stage));
+        true
+    }
+}
+
+/// Minimum spacing between same-class progress events.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn to_bus_stage(stage: automixah_engine::mixdown::MixdownStage) -> crate::bus::RenderStage {
+    use crate::bus::RenderStage as Bus;
+    use automixah_engine::mixdown::MixdownStage as Eng;
+    match stage {
+        Eng::Decoding { done, total } => Bus::Decoding { done, total },
+        Eng::Stretching { done, total } => Bus::Stretching { done, total },
+        Eng::Mixing { fraction } => Bus::Mixing { fraction },
     }
 }
 
@@ -1138,5 +1326,228 @@ mod tests {
             app.pending_deck_load.is_none(),
             "a bare done event never arms or loads"
         );
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::bus::RenderStage;
+    use crate::tracks::Analysis;
+
+    fn app_with_ready_playlist(rows: usize) -> AutomixahUiApp {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hashes: Vec<TrackHash> = (0..rows).map(|i| TrackHash(format!("r{i}"))).collect();
+        for (i, hash) in hashes.iter().enumerate() {
+            app.tracks.upsert(TrackRecord {
+                hash: hash.clone(),
+                tags: crate::tracks::TrackTags {
+                    title: format!("T{i}"),
+                    artist: String::new(),
+                    path: format!("/t{i}.wav").into(),
+                },
+                analysis: AnalysisState::Ready(Analysis {
+                    grid: crate::grid::EditableGrid {
+                        grid_bpm: 128.0,
+                        anchor_seconds: 0.25,
+                        downbeat_phase: 2,
+                    }
+                    .project(),
+                    bpm: 128.0,
+                    key: djcore::key::Key {
+                        root: 9,
+                        mode: djcore::key::KeyMode::Minor,
+                    },
+                    duration_seconds: 60.0,
+                }),
+            });
+        }
+        app.playlist_state.selected = Some(7);
+        app.playlist_state.contents = Contents::Loaded(hashes);
+        app
+    }
+
+    // Given every render precondition met.
+    // When deriving button enablement.
+    // Then rendering is allowed.
+    #[test]
+    fn can_render_allows_fully_ready_playlist() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = "  /out/mix.wav  ".to_owned();
+
+        assert!(app.can_render());
+    }
+
+    // Given only one ready row.
+    // When deriving button enablement.
+    // Then rendering is disallowed (two-row minimum).
+    #[test]
+    fn can_render_requires_two_rows() {
+        let mut app = app_with_ready_playlist(1);
+        app.render_out = "/out/mix.wav".to_owned();
+
+        assert!(!app.can_render());
+    }
+
+    // Given a playlist with a pending row.
+    // When deriving button enablement.
+    // Then rendering is disallowed.
+    #[test]
+    fn can_render_requires_all_rows_ready() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = "/out/mix.wav".to_owned();
+        app.tracks.clear_analysis(&TrackHash("r0".to_owned()));
+
+        assert!(!app.can_render());
+    }
+
+    // Given a render already in flight.
+    // When deriving button enablement.
+    // Then rendering is disallowed.
+    #[test]
+    fn can_render_blocks_while_rendering() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = "/out/mix.wav".to_owned();
+        app.render_cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+
+        assert!(!app.can_render());
+    }
+
+    // Given a ready two-row playlist and a whitespace path.
+    // When deriving button enablement.
+    // Then rendering is disallowed.
+    #[test]
+    fn can_render_requires_nonempty_trimmed_path() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = "   ".to_owned();
+
+        assert!(!app.can_render());
+    }
+
+    // Given a ready two-row playlist with no selection.
+    // When deriving button enablement.
+    // Then rendering is disallowed.
+    #[test]
+    fn can_render_requires_a_selected_playlist() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = "/out/mix.wav".to_owned();
+        app.playlist_state.selected = None;
+        app.playlist_state.contents = Contents::None;
+
+        assert!(!app.can_render());
+    }
+
+    // Given a ready two-row playlist.
+    // When snapshotting the job.
+    // Then it carries ordered tracks with the stored canonical
+    // triple, key, duration, and the trimmed output path.
+    #[test]
+    fn build_mixdown_job_snapshots_metadata_in_row_order() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_out = " /out/mix.wav ".to_owned();
+
+        let job = app.build_mixdown_job().expect("job");
+
+        assert_eq!(job.out, std::path::PathBuf::from("/out/mix.wav"));
+        assert_eq!(job.tracks.len(), 2);
+        assert_eq!(job.tracks[0].hash.0, "r0");
+        assert_eq!(job.tracks[1].hash.0, "r1");
+        for track in &job.tracks {
+            assert_eq!(track.grid_bpm, 128.0);
+            assert_eq!(track.anchor_seconds, 0.25);
+            assert_eq!(track.downbeat_phase, 2);
+            assert_eq!(track.duration, 60.0);
+            assert_eq!(track.key.root, 9);
+            assert!(track.path.to_string_lossy().contains(".wav"));
+        }
+    }
+
+    // Given a render in flight with staged progress.
+    // When a progress event applies.
+    // Then the stage displays.
+    #[test]
+    fn render_progress_event_updates_display_state() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_cancel = Some(Arc::new(AtomicBool::new(false)));
+
+        app.apply(Event::RenderProgress {
+            stage: RenderStage::Mixing { fraction: 0.5 },
+        });
+
+        assert_eq!(
+            app.render_stage,
+            Some(RenderStage::Mixing { fraction: 0.5 })
+        );
+    }
+
+    // Given a render in flight.
+    // When the terminal done event applies.
+    // Then the app returns to idle and the status reports the path.
+    #[test]
+    fn render_done_event_clears_in_flight_and_reports_success() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.render_stage = Some(RenderStage::Mixing { fraction: 0.5 });
+
+        app.apply(Event::RenderDone {
+            out: "/out/mix.wav".into(),
+        });
+
+        assert!(app.render_cancel.is_none());
+        assert!(app.render_stage.is_none());
+        assert!(app.status.contains("/out/mix.wav"));
+    }
+
+    // Given a render in flight.
+    // When the terminal cancelled event applies.
+    // Then the app returns to idle.
+    #[test]
+    fn render_cancelled_event_restores_idle_state() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.render_stage = Some(RenderStage::Decoding { done: 1, total: 2 });
+
+        app.apply(Event::RenderCancelled);
+
+        assert!(app.render_cancel.is_none());
+        assert!(app.render_stage.is_none());
+    }
+
+    // Given a render in flight.
+    // When the terminal failed event applies.
+    // Then the app returns to idle with the message shown.
+    #[test]
+    fn render_failed_event_restores_idle_state() {
+        let mut app = app_with_ready_playlist(2);
+        app.render_cancel = Some(Arc::new(AtomicBool::new(false)));
+
+        app.apply(Event::RenderFailed {
+            message: "boom".to_owned(),
+        });
+
+        assert!(app.render_cancel.is_none());
+        assert!(app.status.contains("boom"));
+    }
+
+    // Given a fresh throttle and a stage.
+    // When asked twice in quick succession.
+    // Then only the first sends and a class change always sends.
+    #[test]
+    fn throttle_suppresses_same_class_within_interval() {
+        let mut throttle = ThrottleState::default();
+        let first = throttle.should_send(RenderStage::Decoding { done: 0, total: 2 });
+        let repeat = throttle.should_send(RenderStage::Decoding { done: 1, total: 2 });
+        let class_change = throttle.should_send(RenderStage::Mixing { fraction: 0.0 });
+
+        assert!(first, "first event sends");
+        assert!(!repeat, "same class inside the interval is suppressed");
+        assert!(class_change, "stage-class change sends immediately");
     }
 }

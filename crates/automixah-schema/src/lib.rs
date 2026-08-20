@@ -151,10 +151,10 @@ fn apply_migration_chain(
 
 /// v1: The `beat_grids` table — manual grid overrides keyed by content hash.
 ///
-/// `track_hash` is the SHA-256 hex digest of the audio file's bytes (the
-/// same key `automixah-cli` computes for `TrackHash`), so a grid survives
-/// file renames and moves. `downbeat_phase` is the beat-in-bar (0..=3) of
-/// the anchor.
+/// `track_hash` is the SHA-256 hex digest of the audio file's bytes
+/// (the content hash every subsystem addresses tracks by), so a grid
+/// survives file renames and moves. `downbeat_phase` is the beat-in-bar
+/// (0..=3) of the anchor.
 fn migrate_v1(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrationError>> {
     conn.execute_batch(
         "CREATE TABLE beat_grids (\

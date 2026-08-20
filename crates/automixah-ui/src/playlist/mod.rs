@@ -141,6 +141,15 @@ impl PlaylistState {
                     | crate::tracks::AnalysisState::Analyzing))))
     }
 
+    /// Position-ordered hashes of the loaded selection, if a
+    /// playlist is selected and its contents have loaded.
+    #[must_use]
+    pub fn selected_rows(&self) -> Option<&[TrackHash]> {
+        match (&self.selected, &self.contents) {
+            (Some(_), Contents::Loaded(hashes)) => Some(hashes),
+            _ => None,
+        }
+    }
     /// Applies a bus event to the playlist ordering state.
     ///
     /// Track-record mutations (tags, analysis) belong to the track
@@ -224,6 +233,10 @@ impl PlaylistState {
             | Event::LoadDone(_)
             | Event::GridSaved { .. }
             | Event::GridSaveFailed(_)
+            | Event::RenderProgress { .. }
+            | Event::RenderDone { .. }
+            | Event::RenderCancelled
+            | Event::RenderFailed { .. }
             | Event::CommandFailed(_) => {}
         }
     }

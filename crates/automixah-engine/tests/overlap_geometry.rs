@@ -4,7 +4,7 @@
 use automixah_engine::timeline::plan::PlanOptions;
 use automixah_engine::timeline::plan::plan_session;
 use automixah_engine::timeline::plan::plan_with;
-use automixah_engine::timeline::types::{TrackAnalysis, TrackHash};
+use automixah_engine::timeline::types::{SessionTime, TrackAnalysis, TrackHash};
 use djcore::analyzer::BeatGrid;
 use djcore::key::{Key, KeyMode};
 
@@ -85,24 +85,30 @@ fn session_total_is_sum_minus_overlaps() {
 }
 
 #[test]
-fn confident_grid_cues_on_a_downbeat() {
-    // Given a track whose downbeats sit every 2 s from 0.
-    let tracks = vec![track("a", 120.0, 240.0), track("b", 120.0, 240.0)];
+fn confident_grid_cues_on_first_downbeat() {
+    // Given a track whose first downbeat sits at bar 2 (4 s in).
+    let b = offset_grid(track("b", 120.0, 240.0), 4.0);
+    let tracks = vec![track("a", 120.0, 240.0), b];
 
     // When planning.
     let plan = plan_with(&tracks, PlanOptions::default());
 
-    // Then the incoming cue is within one beat of a downbeat.
+    // Then the incoming cue is the first downbeat exactly.
     let seg = &plan.segments[1];
-    assert!(seg.src_start > 0, "cue should skip into the track");
     #[expect(clippy::cast_precision_loss, reason = "test cue seconds")]
     let cue_s = seg.src_start as f64 / 44_100.0;
-    let bar = 2.0;
-    let nearest = (cue_s / bar).round() * bar;
     assert!(
-        (cue_s - nearest).abs() <= 60.0 / 120.0 + 1e-3,
-        "cue {cue_s}s not on a downbeat (nearest {nearest}s)"
+        (cue_s - 4.0).abs() <= 1e-3,
+        "cue {cue_s}s is not the first downbeat at 4.0s"
     );
+}
+
+/// Shifts every downbeat and beat later by `offset` seconds.
+fn offset_grid(mut t: TrackAnalysis, offset: f32) -> TrackAnalysis {
+    t.beat_grid.downbeats = t.beat_grid.downbeats.iter().map(|&d| d + offset).collect();
+    t.beat_grid.beats = t.beat_grid.beats.iter().map(|&b| b + offset).collect();
+    t.beat_grid.anchor_seconds = offset;
+    t
 }
 
 #[test]
@@ -185,4 +191,28 @@ fn unconfident_grid_window_stays_inside_stretched_audio() {
         stretched_end
     );
     assert!(w.window.start.0 > 0, "window must start inside the track");
+}
+
+#[test]
+fn confident_grid_closes_window_at_last_downbeat_with_audio() {
+    // Given a 120 BPM outgoing track (2 s bars) with its last
+    // downbeat-with-audio at 236 s in a 239 s track (238 + margin
+    // exceeds the audio), stretched 1:1 at session 120.
+    let a = track("a", 120.0, 239.0);
+    let tracks = vec![a, track("b", 120.0, 240.0)];
+
+    // When planning at 120.
+    let plan = plan_session(&tracks, Some(120.0));
+
+    // Then the window ends at the stretched last downbeat (236 s),
+    // not at the full track end (239 s).
+    let seg = &plan.segments[0];
+    let w = seg.transition.as_ref().expect("window");
+    let expected = SessionTime::from_seconds(236.0, 44_100).0;
+    assert!(
+        (w.window.end.0 as i64 - expected as i64).abs() <= 44_100 / 100,
+        "window end {} is not the last downbeat with audio {}",
+        w.window.end.0,
+        expected
+    );
 }

@@ -113,11 +113,12 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
 
         // Audible span: full stretch minus the cue skipped into
         // the source (incoming tracks only).
-        let audible_len = SessionTime(
-            stretched_len
-                .0
-                .saturating_sub(src_stretched(track, src_start)),
-        );
+        let audible_len = SessionTime(stretched_len.0.saturating_sub(src_stretched(
+            track,
+            src_start,
+            session_bpm,
+            sample_rate,
+        )));
 
         // Overlap geometry: an incoming segment starts at the
         // *previous* transition's window start, so its intro plays
@@ -186,9 +187,12 @@ pub fn plan_with(tracks: &[TrackAnalysis], options: PlanOptions) -> SessionPlan 
 
         // Length: the audible span is the full stretched track minus
         // the cue we skipped into it.
-        let len_samples = stretched_len
-            .0
-            .saturating_sub(src_stretched(track, src_start));
+        let len_samples = stretched_len.0.saturating_sub(src_stretched(
+            track,
+            src_start,
+            session_bpm,
+            sample_rate,
+        ));
 
         segments.push(Segment {
             track_hash: TrackHash(track.hash.0.clone()),
@@ -259,8 +263,9 @@ fn verify_cue_alignment(
     }
 }
 
-/// Stretched-session length of a source-frame cue position.
-fn src_stretched(track: &TrackAnalysis, src_start: u64) -> u64 {
+/// Session-time length of a source-frame cue position under the
+/// track's session stretch (tempo-match × rate conversion).
+fn src_stretched(track: &TrackAnalysis, src_start: u64, session_bpm: f32, sample_rate: u32) -> u64 {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -270,18 +275,19 @@ fn src_stretched(track: &TrackAnalysis, src_start: u64) -> u64 {
         * f64::from(
             decide_stretch(
                 grid_bpm_of(track),
-                grid_bpm_of(track),
+                session_bpm,
                 track.sample_rate,
-                track.sample_rate,
+                sample_rate,
             )
             .ratio,
         )) as u64;
     stretched
 }
 
-/// Picks the source cue for an incoming track: the downbeat nearest
-/// 25% of the track's duration when the grid is confident, else zero
-/// with a reason string for the caller to warn about.
+/// Picks the source cue for an incoming track: its first downbeat
+/// (the natural start of the music, after any silence/intro) when
+/// the grid is confident, else zero with a reason string for the
+/// caller to warn about.
 fn cue_for(track: &TrackAnalysis) -> (u64, Option<&'static str>) {
     if !grid_is_confident(&track.beat_grid, track.grid_stability) {
         return (0, Some("beat grid not confident"));
@@ -289,31 +295,29 @@ fn cue_for(track: &TrackAnalysis) -> (u64, Option<&'static str>) {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "cue samples fit u64"
-    )]
-    let anchor = (f64::from(track.duration) * 0.25 * f64::from(track.sample_rate)) as u64;
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
         reason = "downbeat samples fit u64"
     )]
-    let best = track
-        .beat_grid
-        .downbeats
-        .iter()
-        .map(|&t| (f64::from(t) * f64::from(track.sample_rate)).round() as u64)
-        .min_by_key(|&s| s.abs_diff(anchor))
-        .unwrap_or(0);
-    if best == 0 {
-        return (0, None);
+    let first =
+        (f64::from(track.beat_grid.downbeats[0]) * f64::from(track.sample_rate)).round() as u64;
+    (first, None)
+}
+
+/// The track's source-cue offset in seconds: the first downbeat
+/// for confident grids, else zero (the fallback cue).
+fn cue_seconds_of(track: &TrackAnalysis) -> f32 {
+    if grid_is_confident(&track.beat_grid, track.grid_stability) {
+        track.beat_grid.downbeats[0]
+    } else {
+        0.0
     }
-    (best, None)
 }
 
 /// Places the transition out of track `i` (into `i + 1`), if any.
 ///
-/// The window ends at the outgoing segment's end; B's anchors seed the
-/// placement. Returns the placed window and the preset name.
+/// The window closes at A's natural end: the stretched position of
+/// its last downbeat with audio when the grid is confident, else its
+/// full stretched end. B's cue maps onto the window start via
+/// `src_start`.
 #[allow(clippy::too_many_arguments)]
 fn next_transition(
     tracks: &[TrackAnalysis],
@@ -334,27 +338,32 @@ fn next_transition(
     } else {
         None
     };
-    let b_anchor = anchors_from_grid(&next.beat_grid, next.duration);
+    let _b_anchor = anchors_from_grid(&next.beat_grid, next.duration);
 
-    // Window ends at this segment's stretched end, in session time.
-    let a_session_end = SessionTime(cursor.0 + stretched_len.0);
+    // Window closes at A's natural end in session time: the
+    // stretched position of its last downbeat with audio when the
+    // grid is confident, else its full stretched end.
+    let full_end = SessionTime(cursor.0 + stretched_len.0);
+    let a_session_end = a_anchor.as_ref().map_or(full_end, |anchor| {
+        let cue = cue_seconds_of(a);
+        let ratio = decide_stretch(grid_bpm_of(a), session_bpm, a.sample_rate, sample_rate).ratio;
+        SessionTime(cursor.0.saturating_add(
+            SessionTime::from_seconds((anchor.end_anchor_seconds - cue) * ratio, sample_rate).0,
+        ))
+    });
 
-    let window = place_window(
-        a_anchor.as_ref(),
-        b_anchor.as_ref(),
-        WindowInputs {
-            preset_beats: transition_beats.max(1),
-            a_session_end,
-            b_cue_session: SessionTime::ZERO,
-            session_bpm,
-            sample_rate,
-            a_grid_phase: if grid_confident {
-                a_grid_phase(a, session_bpm, sample_rate, cursor, stretched_len)
-            } else {
-                None
-            },
+    let window = place_window(WindowInputs {
+        preset_beats: transition_beats.max(1),
+        a_session_end,
+        b_cue_session: SessionTime::ZERO,
+        session_bpm,
+        sample_rate,
+        a_grid_phase: if grid_confident {
+            a_grid_phase(a, session_bpm, sample_rate, cursor, stretched_len)
+        } else {
+            None
         },
-    );
+    });
 
     Some((window, PresetName(transition_name.to_owned())))
 }
@@ -615,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             snapshot,
-            "bpm=124.0 segments=4 first_len=18106608 second_start=16750887 cut_preset=LongCrossfade"
+            "bpm=124.0 segments=4 first_len=18106608 second_start=16644193 cut_preset=LongCrossfade"
         );
     }
 }

@@ -53,6 +53,26 @@ pub enum PanelAction {
         /// Row to remove.
         hash: TrackHash,
     },
+    /// The Browse button was clicked (system save dialog for the
+    /// mixdown output path).
+    BrowseRenderOut,
+    /// The Render button was clicked (start the mixdown).
+    Render,
+    /// The Cancel button was clicked (cancel the in-flight mixdown).
+    CancelRender,
+}
+
+/// Render-controls view state passed in by the app (owned fields
+/// borrowed for the paint).
+pub struct RenderUiState<'a> {
+    /// Free-text output path buffer.
+    pub out: &'a mut String,
+    /// `true` while a mixdown is in flight (Cancel mode).
+    pub running: bool,
+    /// Derived: render button enablement when idle.
+    pub can_render: bool,
+    /// Latest stage to display (spinner text) while running.
+    pub stage: Option<crate::bus::RenderStage>,
 }
 
 /// Collected user intents from one panel paint; drained by the app.
@@ -63,7 +83,12 @@ pub struct PanelActions {
 }
 
 /// Draws the whole playlist panel. Returns the collected intents.
-pub fn panel(ctx: &egui::Context, state: &mut PlaylistState, tracks: &Tracks) -> PanelActions {
+pub fn panel(
+    ctx: &egui::Context,
+    state: &mut PlaylistState,
+    tracks: &Tracks,
+    render: RenderUiState<'_>,
+) -> PanelActions {
     let mut actions = PanelActions::default();
     egui::TopBottomPanel::bottom("playlist_panel")
         .resizable(true)
@@ -94,6 +119,7 @@ pub fn panel(ctx: &egui::Context, state: &mut PlaylistState, tracks: &Tracks) ->
                     );
                 }
             });
+            render_controls(ui, render, &mut actions);
             ui.separator();
             egui::SidePanel::left("playlist_list")
                 .resizable(false)
@@ -106,6 +132,45 @@ pub fn panel(ctx: &egui::Context, state: &mut PlaylistState, tracks: &Tracks) ->
             });
         });
     actions
+}
+
+/// Mixdown controls: output path field, Browse, Render↔Cancel, and
+/// staged progress while running.
+fn render_controls(ui: &mut egui::Ui, render: RenderUiState<'_>, actions: &mut PanelActions) {
+    ui.horizontal(|ui| {
+        let field = egui::TextEdit::singleline(render.out)
+            .hint_text("mix.wav")
+            .desired_width(ui.available_width() - 260.0);
+        ui.add(field);
+        if ui.button("Browse…").clicked() {
+            actions.actions.push(PanelAction::BrowseRenderOut);
+        }
+        if render.running {
+            let cancel = egui::Button::new("Cancel");
+            if ui.add(cancel).clicked() {
+                actions.actions.push(PanelAction::CancelRender);
+            }
+            ui.spinner();
+            if let Some(stage) = render.stage {
+                ui.weak(stage_text(stage));
+            }
+        } else {
+            let render_btn = egui::Button::new("Render");
+            if ui.add_enabled(render.can_render, render_btn).clicked() {
+                actions.actions.push(PanelAction::Render);
+            }
+        }
+    });
+}
+
+/// Human text for one progress stage.
+fn stage_text(stage: crate::bus::RenderStage) -> String {
+    use crate::bus::RenderStage;
+    match stage {
+        RenderStage::Decoding { done, total } => format!("decoding {done}/{total}"),
+        RenderStage::Stretching { done, total } => format!("stretching {done}/{total}"),
+        RenderStage::Mixing { fraction } => format!("mixing {:.0}%", fraction * 100.0),
+    }
 }
 
 /// The left column: one selectable row per playlist with a context menu;
@@ -619,6 +684,15 @@ pub fn harmonic_color(distance: f32) -> Color32 {
 mod tests {
     use super::*;
 
+    fn render_slice(out: &mut String) -> RenderUiState<'_> {
+        RenderUiState {
+            out,
+            running: false,
+            can_render: false,
+            stage: None,
+        }
+    }
+
     // Given a pointer position inside a row slot.
     // When computing the insertion offset.
     // Then the upper half splices before (0) and the lower after (1).
@@ -811,9 +885,10 @@ mod tests {
     fn inline_editor_enter_commits() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let mut out = String::new();
         let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks);
+            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
         state.rename.buffer = "  new  ".to_owned();
         let input = egui::RawInput {
@@ -829,7 +904,7 @@ mod tests {
         let mut actions = PanelActions::default();
         let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state, &tracks);
+            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
 
         assert_eq!(
@@ -850,9 +925,10 @@ mod tests {
     fn inline_editor_escape_cancels() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let mut out = String::new();
         let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks);
+            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -867,7 +943,7 @@ mod tests {
         let mut actions = PanelActions::default();
         let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state, &tracks);
+            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
 
         assert!(actions.actions.is_empty(), "nothing submitted");
@@ -882,9 +958,10 @@ mod tests {
     fn inline_editor_focus_loss_commits() {
         let mut state = editing_state();
         let ctx = egui::Context::default();
+        let mut out = String::new();
         let tracks = crate::tracks::Tracks::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks);
+            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
         state.rename.buffer = "new".to_owned();
         // Click-away is another widget grabbing focus during a frame.
@@ -896,7 +973,7 @@ mod tests {
                     .memory_mut(|m| m.request_focus(egui::Id::new("click_away_target")));
                 let _ = ui.allocate_space(egui::vec2(1.0, 1.0));
             });
-            actions = panel(ctx, &mut state, &tracks);
+            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out));
         });
 
         assert_eq!(

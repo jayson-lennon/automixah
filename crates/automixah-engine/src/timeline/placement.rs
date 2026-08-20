@@ -144,7 +144,10 @@ fn bar_length_seconds(beat_grid: &BeatGrid) -> Option<f32> {
 pub struct WindowInputs {
     /// The preset's window length in beats (e.g. 32 for Crossfade).
     pub preset_beats: usize,
-    /// Where segment A ends in session samples (window closes here).
+    /// Where segment A's audio ends in session samples: the stretched
+    /// position of A's last downbeat with audio when its grid is
+    /// confident, else A's full stretched end. The window closes at
+    /// or before this point.
     pub a_session_end: SessionTime,
     /// B's cue in session samples (informational; maps to `src_start`).
     pub b_cue_session: SessionTime,
@@ -165,17 +168,14 @@ pub struct WindowInputs {
 /// caller's job). Short effective spans clamp the window to at least
 /// one bar.
 ///
-/// Grid anchors no longer alter the geometry: both confident and
-/// fallback grids place the window against the *stretched* session
-/// end, so tempo scaling can never push the window past the audio
-/// (the old fallback computed in native seconds — the bug that
-/// produced silent gaps between tracks).
+/// `a_session_end` carries A's natural end: the stretched position of
+/// its last downbeat with audio when the grid is confident, else its
+/// full stretched end. Both confident and fallback grids place the
+/// window against that end, so tempo scaling can never push the
+/// window past the audio (the old fallback computed in native seconds
+/// — the bug that produced silent gaps between tracks).
 #[must_use]
-pub fn place_window(
-    _a_anchor: Option<&GridAnchors>,
-    _b_anchor: Option<&GridAnchors>,
-    inputs: WindowInputs,
-) -> TransitionWindow {
+pub fn place_window(inputs: WindowInputs) -> TransitionWindow {
     let WindowInputs {
         preset_beats,
         a_session_end,
@@ -339,22 +339,17 @@ mod tests {
     fn window_places_start_preset_beats_before_end() {
         // Given a confident pair, a 32-beat preset at 120 BPM.
         let g = grid(2.0, 60);
-        let a = anchors_from_grid(&g, 120.0).expect("anchors");
-        let b = anchors_from_grid(&g, 120.0).expect("anchors");
+        let _anchors = anchors_from_grid(&g, 120.0).expect("anchors");
 
         // When placing the window ending at session sample 1_000_000.
-        let w = place_window(
-            Some(&a),
-            Some(&b),
-            WindowInputs {
-                preset_beats: 32,
-                a_session_end: SessionTime(1_000_000),
-                b_cue_session: SessionTime(500_000),
-                session_bpm: 120.0,
-                sample_rate: 44_100,
-                a_grid_phase: None,
-            },
-        );
+        let w = place_window(WindowInputs {
+            preset_beats: 32,
+            a_session_end: SessionTime(1_000_000),
+            b_cue_session: SessionTime(500_000),
+            session_bpm: 120.0,
+            sample_rate: 44_100,
+            a_grid_phase: None,
+        });
 
         // Then the window is clamped to half the outgoing span
         // (500_000 < 2×705_600) and ends at the anchor.
@@ -367,49 +362,38 @@ mod tests {
         // Given a B cue late in the session; the cue maps to src_start,
         // it does not constrain window length.
         let g = grid(2.0, 60);
-        let a = anchors_from_grid(&g, 120.0).expect("anchors");
-        let b = anchors_from_grid(&g, 120.0).expect("anchors");
+        let _anchors = anchors_from_grid(&g, 120.0).expect("anchors");
 
         // When placing a 32-beat window ending at 1_000_000 with cue at 900_000.
-        let w = place_window(
-            Some(&a),
-            Some(&b),
-            WindowInputs {
-                preset_beats: 32,
-                a_session_end: SessionTime(1_000_000),
-                b_cue_session: SessionTime(900_000),
-                session_bpm: 120.0,
-                sample_rate: 44_100,
-                a_grid_phase: None,
-            },
-        );
+        let w = place_window(WindowInputs {
+            preset_beats: 32,
+            a_session_end: SessionTime(1_000_000),
+            b_cue_session: SessionTime(900_000),
+            session_bpm: 120.0,
+            sample_rate: 44_100,
+            a_grid_phase: None,
+        });
 
         // Then the window length is clamped to half the outgoing
         // span regardless of the cue.
         assert_eq!(w.end, SessionTime(1_000_000));
         assert_eq!(w.len_samples(), 500_000);
     }
-
     #[test]
     fn window_floors_at_session_start_when_a_is_short() {
         // Given a session end so early that a 32-beat window cannot fit.
         let g = grid(2.0, 60);
-        let a = anchors_from_grid(&g, 120.0).expect("anchors");
-        let b = anchors_from_grid(&g, 120.0).expect("anchors");
+        let _anchors = anchors_from_grid(&g, 120.0).expect("anchors");
 
         // When placing the window ending at session sample 10_000.
-        let w = place_window(
-            Some(&a),
-            Some(&b),
-            WindowInputs {
-                preset_beats: 32,
-                a_session_end: SessionTime(10_000),
-                b_cue_session: SessionTime(9_000),
-                session_bpm: 120.0,
-                sample_rate: 44_100,
-                a_grid_phase: None,
-            },
-        );
+        let w = place_window(WindowInputs {
+            preset_beats: 32,
+            a_session_end: SessionTime(10_000),
+            b_cue_session: SessionTime(9_000),
+            session_bpm: 120.0,
+            sample_rate: 44_100,
+            a_grid_phase: None,
+        });
 
         // Then the window is half of A's span (min one bar): the
         // tiny 10_000-sample span floors at the bar minimum.
@@ -420,18 +404,14 @@ mod tests {
     #[test]
     fn missing_grid_places_window_against_session_end() {
         // Given no anchors and a session end of 60 s.
-        let w = place_window(
-            None,
-            None,
-            WindowInputs {
-                preset_beats: 32,
-                a_session_end: SessionTime::from_seconds(60.0, 44_100),
-                b_cue_session: SessionTime(0),
-                session_bpm: 120.0,
-                sample_rate: 44_100,
-                a_grid_phase: None,
-            },
-        );
+        let w = place_window(WindowInputs {
+            preset_beats: 32,
+            a_session_end: SessionTime::from_seconds(60.0, 44_100),
+            b_cue_session: SessionTime(0),
+            session_bpm: 120.0,
+            sample_rate: 44_100,
+            a_grid_phase: None,
+        });
 
         // Then the window ends exactly at the session end (never past
         // the audio, regardless of stretch) with the requested length.
@@ -499,25 +479,19 @@ mod tests {
     fn window_snaps_to_session_grid_phase() {
         // Given a confident grid and a session at 150 BPM with an
         // arbitrary phase offset of 37_000 samples.
-        let g = grid(2.0, 60);
-        let a = anchors_from_grid(&g, 120.0).expect("anchors");
         let beat_samples = SessionTime::from_seconds(60.0 / 150.0, 44_100).0;
         let phase = SessionTime(37_000);
 
-        // When placing a 64-beat window ending at 1_000_000 with a
+        // When placing a 64-beat window ending at 3_000_000 with a
         // grid phase.
-        let w = place_window(
-            Some(&a),
-            Some(&a),
-            WindowInputs {
-                preset_beats: 64,
-                a_session_end: SessionTime(3_000_000),
-                b_cue_session: SessionTime(1_500_000),
-                session_bpm: 150.0,
-                sample_rate: 44_100,
-                a_grid_phase: Some(phase),
-            },
-        );
+        let w = place_window(WindowInputs {
+            preset_beats: 64,
+            a_session_end: SessionTime(3_000_000),
+            b_cue_session: SessionTime(1_500_000),
+            session_bpm: 150.0,
+            sample_rate: 44_100,
+            a_grid_phase: Some(phase),
+        });
 
         // Then both boundaries sit exactly on the session grid
         // (phase + k * beat_samples).
