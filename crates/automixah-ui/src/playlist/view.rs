@@ -250,6 +250,7 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
         return;
     };
     let hashes = hashes.as_slice();
+    let median_bpm = playlist_median_bpm(tracks, hashes);
     let row_height = ui.text_style_height(&egui::TextStyle::Body) * 1.4;
     let mut drag_source: Option<TrackHash> = None;
     let mut drop_target: Option<TrackHash> = None;
@@ -265,10 +266,13 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
             let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
             let response = row_ui(
                 ui,
-                record,
-                analysis,
-                prev_key.clone(),
-                interactive,
+                RowDisplay {
+                    record,
+                    analysis,
+                    prev_key: prev_key.clone(),
+                    median_bpm,
+                    interactive,
+                },
                 row_height,
             );
             // Insertion-line preview: while a drag is live, the hovered
@@ -329,23 +333,26 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
     }
 }
 
+/// Per-row display facts derived at render time: everything
+/// `paint_row_content` needs beyond the row's geometry.
+struct RowDisplay<'a> {
+    record: Option<&'a crate::tracks::TrackRecord>,
+    analysis: Option<&'a AnalysisState>,
+    prev_key: Option<djcore::key::Key>,
+    median_bpm: Option<f32>,
+    interactive: bool,
+}
+
 /// One track row: an interaction rect plus painted content.
 ///
 /// Painting (not widgets) keeps scrolling with hundreds of rows cheap;
 /// the response carries click/drag/context-menu sense.
-fn row_ui(
-    ui: &mut egui::Ui,
-    record: Option<&crate::tracks::TrackRecord>,
-    analysis: Option<&AnalysisState>,
-    prev_key: Option<djcore::key::Key>,
-    interactive: bool,
-    row_height: f32,
-) -> egui::Response {
+fn row_ui(ui: &mut egui::Ui, display: RowDisplay<'_>, row_height: f32) -> egui::Response {
     let desired = egui::vec2(ui.available_width(), row_height);
     let (rect, response) = ui.allocate_at_least(desired, egui::Sense::click_and_drag());
     let hovered = response.hovered();
     let painter = ui.painter_at(rect);
-    let bg = if !interactive {
+    let bg = if !display.interactive {
         dimmed_row_color(ui)
     } else if hovered {
         hover_row_color(ui)
@@ -353,8 +360,10 @@ fn row_ui(
         base_row_color(ui)
     };
     painter.rect_filled(rect.shrink(1.0), 2.0, bg);
-    paint_row_content(ui, &painter, rect, record, analysis, prev_key, interactive);
-    let path = record.map_or(String::new(), |r| r.tags.path.display().to_string());
+    let path = display
+        .record
+        .map_or(String::new(), |r| r.tags.path.display().to_string());
+    paint_row_content(ui, &painter, rect, display);
     response.on_hover_text(path)
 }
 
@@ -393,10 +402,7 @@ fn paint_row_content(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     rect: egui::Rect,
-    record: Option<&crate::tracks::TrackRecord>,
-    analysis: Option<&AnalysisState>,
-    prev_key: Option<djcore::key::Key>,
-    interactive: bool,
+    display: RowDisplay<'_>,
 ) {
     let font_id = egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body) * 0.9);
     let strong_color = ui.visuals().strong_text_color();
@@ -418,14 +424,14 @@ fn paint_row_content(
     let mut x = rect.left() + 8.0;
 
     // Status / affordance glyph — derived from the analysis state.
-    let (glyph, color) = match analysis {
+    let (glyph, color) = match display.analysis {
         Some(AnalysisState::Ready(_)) => (" ", strong_color),
         Some(AnalysisState::Queued) | None => ("🕓", weak_color),
         Some(AnalysisState::Analyzing) => ("⭕", weak_color),
         Some(AnalysisState::Failed(_)) => ("!", Color32::RED),
     };
     let icon_size = ui.text_style_height(&egui::TextStyle::Body).min(16.0);
-    if matches!(analysis, Some(AnalysisState::Analyzing)) {
+    if matches!(display.analysis, Some(AnalysisState::Analyzing)) {
         // Animated spinner at the glyph slot; repaint comes from the
         // spinner itself.
         let icon_rect = egui::Rect::from_center_size(
@@ -443,14 +449,14 @@ fn paint_row_content(
     }
 
     // Artist – title from tags (dimmed while pending).
-    let title = record.map_or_else(String::new, |r| {
+    let title = display.record.map_or_else(String::new, |r| {
         if r.tags.artist.is_empty() {
             r.tags.title.clone()
         } else {
             format!("{} – {}", r.tags.artist, r.tags.title)
         }
     });
-    let title_color = if interactive {
+    let title_color = if display.interactive {
         strong_color
     } else {
         weak_color
@@ -464,7 +470,7 @@ fn paint_row_content(
 
     // Right-aligned metadata: duration, key (colored), BPM — all from
     // the analysis package when ready.
-    let ready = analysis.and_then(|a| match a {
+    let ready = display.analysis.and_then(|a| match a {
         AnalysisState::Ready(a) => Some(a),
         _ => None,
     });
@@ -483,10 +489,13 @@ fn paint_row_content(
         || "--".to_owned(),
         |a| a.key.format_with(djcore::key::KeyFormat::Camelot),
     );
-    let key_color = key_display_color(ready.map(|a| a.key.clone()), prev_key, strong_color);
+    let key_color = key_display_color(ready.map(|a| a.key.clone()), display.prev_key, strong_color);
     let d_galley = galley(&duration, weak_color);
     let k_galley = galley(&key_text, key_color);
-    let b_galley = galley(&bpm, weak_color);
+    let bpm_color = ready.map_or(weak_color, |a| {
+        bpm_display_color(a.bpm, display.median_bpm, weak_color)
+    });
+    let b_galley = galley(&bpm, bpm_color);
     let gap = 14.0;
     let mut rx = rect.right() - 8.0;
     for g in [&d_galley, &k_galley, &b_galley] {
@@ -507,6 +516,45 @@ fn paint_row_content(
 pub fn insertion_offset_in_slot(pointer_y: f32, slot_top: f32, slot_height: f32) -> usize {
     let half = slot_height / 2.0;
     if (pointer_y - slot_top) < half { 0 } else { 1 }
+}
+
+/// Median BPM of the ready tracks among `hashes`, or `None` when no
+/// track has analysis.
+///
+/// Odd counts take the middle value; even counts average the two
+/// middle values.
+fn playlist_median_bpm(tracks: &Tracks, hashes: &[TrackHash]) -> Option<f32> {
+    let mut bpms: Vec<f32> = hashes
+        .iter()
+        .filter_map(|hash| {
+            tracks.get(hash).and_then(|r| match &r.analysis {
+                AnalysisState::Ready(a) => Some(a.bpm),
+                _ => None,
+            })
+        })
+        .collect();
+    if bpms.is_empty() {
+        return None;
+    }
+    bpms.sort_by(f32::total_cmp);
+    let n = bpms.len();
+    Some(if n % 2 == 1 {
+        bpms[n / 2]
+    } else {
+        (bpms[n / 2 - 1] + bpms[n / 2]) / 2.0
+    })
+}
+/// Light red used to flag BPM outliers (fixed, theme-independent
+/// like the key heatmap colors).
+const OUTLIER_BPM_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
+
+/// Color for a row's BPM text: light red when the track deviates
+/// more than 8 BPM from the playlist median, the fallback otherwise.
+fn bpm_display_color(bpm: f32, median: Option<f32>, fallback: Color32) -> Color32 {
+    match median {
+        Some(m) if (bpm - m).abs() > 8.0 => OUTLIER_BPM_COLOR,
+        _ => fallback,
+    }
 }
 
 /// Color for a row's key text: gradient against the previous row's key,
@@ -586,6 +634,154 @@ mod tests {
             insertion_offset_in_slot(pointer_y, slot_top, 20.0),
             expected
         );
+    }
+
+    fn hash(id: u32) -> TrackHash {
+        TrackHash(format!("h{id}"))
+    }
+
+    fn analysis(bpm: f32) -> crate::tracks::Analysis {
+        crate::tracks::Analysis {
+            grid: djcore::analyzer::BeatGrid::default(),
+            bpm,
+            key: djcore::key::Key {
+                root: 9,
+                mode: djcore::key::KeyMode::Minor,
+            },
+            duration_seconds: 61.0,
+        }
+    }
+
+    fn upsert_with(
+        tracks: &mut crate::tracks::Tracks,
+        id: u32,
+        state: crate::tracks::AnalysisState,
+    ) {
+        tracks.upsert(crate::tracks::TrackRecord {
+            hash: hash(id),
+            tags: crate::tracks::TrackTags {
+                title: format!("T{id}"),
+                artist: String::new(),
+                path: std::path::PathBuf::from(format!("/t{id}")),
+            },
+            analysis: state,
+        });
+    }
+
+    fn ready(bpm: f32) -> crate::tracks::AnalysisState {
+        crate::tracks::AnalysisState::Ready(analysis(bpm))
+    }
+
+    // Given three ready tracks at 128, 130, 132 BPM.
+    // When computing the playlist median.
+    // Then the middle value 130 is the median.
+    #[test]
+    fn odd_count_median_is_middle_bpm() {
+        let mut tracks = crate::tracks::Tracks::default();
+        for bpm in [128.0, 132.0, 130.0] {
+            tracks.set_analysis(&TrackHash(format!("h{}", bpm as u32)), ready(bpm));
+        }
+        let hashes = vec![
+            TrackHash("h128".to_owned()),
+            TrackHash("h132".to_owned()),
+            TrackHash("h130".to_owned()),
+        ];
+
+        let median = playlist_median_bpm(&tracks, &hashes);
+
+        assert_eq!(median, Some(130.0));
+    }
+
+    // Given two ready tracks at 128 and 130 BPM.
+    // When computing the playlist median.
+    // Then the average of the middles 129 is the median.
+    #[test]
+    fn even_count_median_averages_middles() {
+        let mut tracks = crate::tracks::Tracks::default();
+        tracks.set_analysis(&TrackHash("h1".to_owned()), ready(128.0));
+        tracks.set_analysis(&TrackHash("h2".to_owned()), ready(130.0));
+        let hashes = vec![TrackHash("h1".to_owned()), TrackHash("h2".to_owned())];
+
+        let median = playlist_median_bpm(&tracks, &hashes);
+
+        assert_eq!(median, Some(129.0));
+    }
+
+    // Given rows in every non-ready analysis state plus one ready.
+    // When computing the playlist median.
+    // Then only the ready BPM participates.
+    #[test]
+    fn median_counts_only_ready_rows() {
+        let mut tracks = crate::tracks::Tracks::default();
+        upsert_with(&mut tracks, 1, crate::tracks::AnalysisState::Queued);
+        upsert_with(&mut tracks, 2, crate::tracks::AnalysisState::Analyzing);
+        upsert_with(
+            &mut tracks,
+            3,
+            crate::tracks::AnalysisState::Failed("boom".to_owned()),
+        );
+        upsert_with(&mut tracks, 4, ready(140.0));
+        let hashes: Vec<TrackHash> = (1..=4).map(hash).collect();
+
+        let median = playlist_median_bpm(&tracks, &hashes);
+
+        assert_eq!(median, Some(140.0), "only the ready BPM counted");
+    }
+
+    // Given a track exactly 8 BPM off the median.
+    // When deciding its BPM color.
+    // Then the fallback color is kept (strictly-greater boundary).
+    #[test]
+    fn exactly_eight_off_median_is_not_colored() {
+        let fallback = Color32::WHITE;
+
+        let color = bpm_display_color(138.0, Some(130.0), fallback);
+
+        assert_eq!(color, fallback);
+    }
+
+    // Given a track more than 8 BPM off the median.
+    // When deciding its BPM color.
+    // Then the fixed light red flags it.
+    #[rstest::rstest]
+    #[case(138.1)]
+    #[case(121.9)]
+    fn beyond_eight_off_median_flags_light_red(#[case] bpm: f32) {
+        let color = bpm_display_color(bpm, Some(130.0), Color32::WHITE);
+
+        assert_eq!(color, OUTLIER_BPM_COLOR);
+        assert_eq!(OUTLIER_BPM_COLOR, Color32::from_rgb(255, 120, 120));
+    }
+
+    // Given a playlist with no analyzed tracks.
+    // When computing the median.
+    // Then it is None and any BPM falls back uncolored.
+    #[test]
+    fn no_ready_tracks_yields_none_and_fallback_color() {
+        let tracks = crate::tracks::Tracks::default();
+        let hashes: Vec<TrackHash> = Vec::new();
+
+        let median = playlist_median_bpm(&tracks, &hashes);
+        let color = bpm_display_color(128.0, median, Color32::WHITE);
+
+        assert_eq!(median, None);
+        assert_eq!(color, Color32::WHITE);
+    }
+
+    // Given a playlist with a single analyzed track.
+    // When computing the median and its own color.
+    // Then the median is its own BPM and it stays uncolored.
+    #[test]
+    fn single_ready_track_is_own_median_and_uncolored() {
+        let mut tracks = crate::tracks::Tracks::default();
+        tracks.set_analysis(&TrackHash("h1".to_owned()), ready(128.0));
+        let hashes = vec![TrackHash("h1".to_owned())];
+
+        let median = playlist_median_bpm(&tracks, &hashes);
+        let color = bpm_display_color(128.0, median, Color32::WHITE);
+
+        assert_eq!(median, Some(128.0));
+        assert_eq!(color, Color32::WHITE, "deviation is zero");
     }
 
     fn key(root: u8) -> djcore::key::Key {

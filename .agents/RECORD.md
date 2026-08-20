@@ -75,3 +75,4 @@ Entries are added or amended **only with human approval**.
 - (ui) Playlist renaming is inline: right-click → Rename swaps the playlist row for an in-place text editor where Enter or click-away commits (empty input reverts), Escape cancels, and duplicate names are rejected inline before the store.
 - (ui) The waveform peak track advances visual slots by fractional stride accumulation, so non-44.1 kHz sources render on a true-time timeline (an integer counter vs 48000/441 previously stretched 48 kHz renders ~86 ms/min).
 - (ui) Grid beat lines render as thin translucent white and hide when beat spacing falls below ~4 px; white lines (downbeats) thin out by beat stride — every 4th, 8th, 16th… beat — once 4-beat spacing falls below ~50 px, and the zoom slider shows the current beats-per-white-line.
+- (ui) Playlist rows color the BPM light red when it deviates more than 8 BPM from the selected playlist's ready-track median.
