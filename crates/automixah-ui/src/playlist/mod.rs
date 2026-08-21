@@ -13,6 +13,7 @@
 //! worker in [`queue`].
 
 pub mod queue;
+pub mod reorder;
 pub mod store;
 pub mod view;
 
@@ -207,6 +208,12 @@ impl PlaylistState {
             Event::RowsReordered {
                 playlist_id,
                 hashes: order,
+                ..
+            }
+            | Event::ReorderFailed {
+                playlist_id,
+                hashes: order,
+                ..
             } => {
                 if self.selected == Some(*playlist_id)
                     && let Contents::Loaded(hashes) = &mut self.contents
@@ -239,7 +246,8 @@ impl PlaylistState {
             | Event::RenderDone { .. }
             | Event::RenderCancelled
             | Event::RenderFailed { .. }
-            | Event::CommandFailed(_) => {}
+            | Event::CommandFailed(_)
+            | Event::ReorderCommandFailed { .. } => {}
         }
     }
 }
@@ -259,10 +267,6 @@ fn reorder_by_hashes(hashes: &mut Vec<TrackHash>, order: &[TrackHash]) {
     }
 }
 
-/// Splices a hash to a new index in the contents.
-///
-/// Returns the moved entry's new index; `None` when either hash is
-/// unknown (stale drag) or the indices coincide.
 pub fn move_row(state: &mut PlaylistState, from: &TrackHash, to: &TrackHash) -> Option<usize> {
     let Contents::Loaded(hashes) = &mut state.contents else {
         return None;
@@ -275,6 +279,53 @@ pub fn move_row(state: &mut PlaylistState, from: &TrackHash, to: &TrackHash) -> 
     let hash = hashes.remove(from_idx);
     hashes.insert(to_idx, hash);
     Some(to_idx)
+}
+
+/// Computes an optimistic order for moving `from` onto `to`.
+///
+/// The target index is measured before removal; the returned vector is the
+/// complete post-drop order. `insert_after` selects the lower-half preview.
+#[must_use]
+pub fn moved_order(
+    hashes: &[TrackHash],
+    from: &TrackHash,
+    to: &TrackHash,
+    insert_after: bool,
+) -> Option<Vec<TrackHash>> {
+    let from_idx = hashes.iter().position(|hash| hash == from)?;
+    let to_idx = hashes.iter().position(|hash| hash == to)?;
+    if from_idx == to_idx {
+        return None;
+    }
+    let mut next = hashes.to_vec();
+    let hash = next.remove(from_idx);
+    let insertion = if insert_after {
+        if from_idx < to_idx {
+            to_idx
+        } else {
+            to_idx + 1
+        }
+    } else if from_idx < to_idx {
+        to_idx - 1
+    } else {
+        to_idx
+    };
+    next.insert(insertion.min(next.len()), hash);
+    Some(next)
+}
+
+/// Applies an already computed order to loaded contents after validating its
+/// hash set.
+#[must_use]
+pub fn set_order(state: &mut PlaylistState, order: Vec<TrackHash>) -> bool {
+    let Contents::Loaded(hashes) = &mut state.contents else {
+        return false;
+    };
+    if hashes.len() != order.len() || hashes.iter().any(|hash| !order.contains(hash)) {
+        return false;
+    }
+    *hashes = order;
+    true
 }
 
 /// Removes a hash from the contents.
@@ -509,6 +560,36 @@ mod tests {
         assert_eq!(hashes.len(), 2, "untouched");
     }
 
+    // Given a source above the target and an upper-half drop.
+    // When computing the optimistic order.
+    // Then the source is inserted before the target after removal.
+    #[test]
+    fn moved_order_inserts_before_target_after_removal() {
+        let order = moved_order(&[hash(1), hash(2), hash(3)], &hash(1), &hash(3), false);
+
+        assert_eq!(order, Some(vec![hash(2), hash(1), hash(3)]));
+    }
+
+    // Given a source below the target and a lower-half drop.
+    // When computing the optimistic order.
+    // Then the source is inserted after the target.
+    #[test]
+    fn moved_order_inserts_after_target() {
+        let order = moved_order(&[hash(1), hash(2), hash(3)], &hash(3), &hash(1), true);
+
+        assert_eq!(order, Some(vec![hash(1), hash(3), hash(2)]));
+    }
+
+    // Given a drop on the source row.
+    // When computing the optimistic order.
+    // Then it is a no-op.
+    #[test]
+    fn moved_order_source_target_is_noop() {
+        assert_eq!(
+            moved_order(&[hash(1), hash(2)], &hash(1), &hash(1), true),
+            None
+        );
+    }
     // Given three rows.
     // When the middle one is removed.
     // Then the store tuple (index) returns and the hash is gone.
@@ -534,6 +615,7 @@ mod tests {
 
         state.apply(&Event::RowsReordered {
             playlist_id: 7,
+            sequence: 1,
             hashes: vec![hash(3), hash(1), hash(2)],
         });
 

@@ -28,6 +28,28 @@ pub mod sqlite;
 #[error(debug)]
 pub struct PlaylistStoreError;
 
+/// Result of attempting to rewrite a playlist's ordering.
+///
+/// A rejected reorder is an ordinary backend outcome rather than an outer
+/// error because the transaction already knows the durable order to which the
+/// frontend must roll back. An outer `Report` is reserved for failures that
+/// happen before that order can be determined.
+#[derive(Debug)]
+pub enum ReorderOutcome {
+    /// The requested order was committed.
+    Saved {
+        /// The committed position-ordered hashes.
+        order: Vec<TrackHash>,
+    },
+    /// The request was rejected and the transaction retained this order.
+    Rejected {
+        /// The durable position-ordered hashes after rollback.
+        order: Vec<TrackHash>,
+        /// Why the requested order was rejected.
+        error: Report<PlaylistStoreError>,
+    },
+}
+
 /// A playlist row in the `playlists` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistSummary {
@@ -194,15 +216,14 @@ pub trait PlaylistStore: Send + Sync {
     /// Rewrites the playlist's ordering: rows are deleted and re-inserted in
     /// the given order inside one transaction.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the set of hashes differs from the stored set or
-    /// the write fails.
+    /// A rejected request returns the durable pre-request order in
+    /// [`ReorderOutcome::Rejected`]. An outer error is returned only when the
+    /// backend cannot determine that durable order.
     async fn reorder(
         &self,
         playlist_id: i64,
         ordered: &[TrackHash],
-    ) -> Result<(), Report<PlaylistStoreError>>;
+    ) -> Result<ReorderOutcome, Report<PlaylistStoreError>>;
 
     /// Backend name for debugging.
     fn name(&self) -> &'static str;
@@ -380,12 +401,13 @@ impl PlaylistStoreService {
     ///
     /// # Errors
     ///
-    /// Returns an error if the hash set differs or the write fails.
+    /// Returns an outer error only when the backend cannot determine the
+    /// durable order for a rejected request.
     pub async fn reorder(
         &self,
         playlist_id: i64,
         ordered: &[TrackHash],
-    ) -> Result<(), Report<PlaylistStoreError>> {
+    ) -> Result<ReorderOutcome, Report<PlaylistStoreError>> {
         self.backend.reorder(playlist_id, ordered).await
     }
 

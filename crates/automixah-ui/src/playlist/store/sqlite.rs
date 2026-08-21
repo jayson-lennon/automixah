@@ -11,7 +11,7 @@ use error_stack::{Report, ResultExt as _};
 
 use automixah_engine::timeline::types::TrackHash;
 
-use super::{PersistedTrack, PlaylistStore, PlaylistStoreError, PlaylistSummary};
+use super::{PersistedTrack, PlaylistStore, PlaylistStoreError, PlaylistSummary, ReorderOutcome};
 use crate::store::GridOverride;
 use crate::track::identity::now_unix;
 
@@ -469,7 +469,7 @@ impl PlaylistStore for SqlitePlaylistStore {
         &self,
         playlist_id: i64,
         ordered: &[TrackHash],
-    ) -> Result<(), Report<PlaylistStoreError>> {
+    ) -> Result<ReorderOutcome, Report<PlaylistStoreError>> {
         let tx = self
             .pool
             .begin()
@@ -478,53 +478,73 @@ impl PlaylistStore for SqlitePlaylistStore {
             .attach("begin reorder transaction")?;
         let stored: Vec<EntryRow> = tx
             .query_all(
-                "SELECT track_hash, added_path FROM playlist_tracks WHERE playlist_id = ?",
+                "SELECT track_hash, added_path FROM playlist_tracks WHERE playlist_id = ? ORDER BY position",
                 vec![Box::new(playlist_id)],
             )
             .await
             .change_context(PlaylistStoreError)
             .attach("load stored order")?;
+        let original: Vec<TrackHash> = stored
+            .iter()
+            .map(|entry| TrackHash(entry.track_hash.clone()))
+            .collect();
         let mut incoming: Vec<String> = ordered.iter().map(|h| h.0.clone()).collect();
         incoming.sort();
         let mut expected: Vec<String> = stored.iter().map(|r| r.track_hash.clone()).collect();
         expected.sort();
-        if incoming != expected {
-            return Err(
-                Report::new(PlaylistStoreError).attach("reorder hash set differs from stored set")
-            );
+        let duplicate = ordered
+            .iter()
+            .enumerate()
+            .any(|(index, hash)| ordered[..index].contains(hash));
+        if incoming != expected || duplicate {
+            return Ok(ReorderOutcome::Rejected {
+                order: original,
+                error: Report::new(PlaylistStoreError)
+                    .attach("reorder hash set differs from stored set"),
+            });
         }
-        tx.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id = ?",
-            vec![Box::new(playlist_id)],
-        )
-        .await
-        .change_context(PlaylistStoreError)
-        .attach("clear playlist entries for rewrite")?;
-        for (position, hash) in ordered.iter().enumerate() {
-            // added_path belongs to the entry, not the ordering — re-look it
-            // up from the rows read before the delete.
-            let path = stored
-                .iter()
-                .find(|r| r.track_hash == hash.0)
-                .map_or_else(String::new, |r| r.added_path.clone());
+        if let Err(error) = async {
             tx.execute(
-                "INSERT INTO playlist_tracks (playlist_id, position, track_hash, added_path) VALUES (?, ?, ?, ?)",
-                vec![
-                    Box::new(playlist_id),
-                    Box::new(i64::try_from(position).change_context(PlaylistStoreError)?),
-                    Box::new(hash.0.clone()),
-                    Box::new(path),
-                ],
+                "DELETE FROM playlist_tracks WHERE playlist_id = ?",
+                vec![Box::new(playlist_id)],
             )
             .await
             .change_context(PlaylistStoreError)
-            .attach("re-insert ordered entry")?;
+            .attach("clear playlist entries for rewrite")?;
+            for (position, hash) in ordered.iter().enumerate() {
+                let path = stored
+                    .iter()
+                    .find(|row| row.track_hash == hash.0)
+                    .map_or_else(String::new, |row| row.added_path.clone());
+                tx.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, position, track_hash, added_path) VALUES (?, ?, ?, ?)",
+                    vec![
+                        Box::new(playlist_id),
+                        Box::new(i64::try_from(position).change_context(PlaylistStoreError)?),
+                        Box::new(hash.0.clone()),
+                        Box::new(path),
+                    ],
+                )
+                .await
+                .change_context(PlaylistStoreError)
+                .attach("re-insert ordered entry")?;
+            }
+            tx.commit()
+                .await
+                .change_context(PlaylistStoreError)
+                .attach("commit reorder transaction")?;
+            Ok::<(), Report<PlaylistStoreError>>(())
         }
-        tx.commit()
-            .await
-            .change_context(PlaylistStoreError)
-            .attach("commit reorder transaction")?;
-        Ok(())
+        .await
+        {
+            return Ok(ReorderOutcome::Rejected {
+                order: original,
+                error,
+            });
+        }
+        Ok(ReorderOutcome::Saved {
+            order: ordered.to_vec(),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -681,6 +701,45 @@ mod tests {
         assert_eq!(order, vec!["c", "a", "b"]);
     }
 
+    // Given a playlist with two tracks.
+    // When an invalid hash set is reordered.
+    // Then the rejection returns the durable order and the transaction leaves it unchanged.
+    #[tokio::test]
+    async fn reorder_rejects_with_rollback_order() {
+        let (store, _dir) = test_store().await;
+        let list = store.create_playlist("rollback").await.expect("create");
+        for name in ["a", "b"] {
+            store
+                .insert_track(list.id, &TrackHash(name.to_owned()), "/x", name, "", None)
+                .await
+                .expect("insert");
+        }
+
+        let outcome = store
+            .reorder(
+                list.id,
+                &[TrackHash("a".to_owned()), TrackHash("missing".to_owned())],
+            )
+            .await
+            .expect("outcome");
+
+        match outcome {
+            ReorderOutcome::Rejected { order, .. } => {
+                assert_eq!(
+                    order,
+                    vec![TrackHash("a".to_owned()), TrackHash("b".to_owned())]
+                );
+            }
+            ReorderOutcome::Saved { .. } => panic!("invalid order saved"),
+        }
+        let rows = store.tracks_for(list.id).await.expect("rows");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.track_hash.0.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
     // Given a stored track with duration.
     // When meta is updated with None.
     // Then the stored duration survives.

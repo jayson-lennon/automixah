@@ -122,10 +122,34 @@ pub enum Event {
     RowAdded { playlist_id: i64, hash: TrackHash },
     /// A row was removed from a playlist.
     RowRemoved { playlist_id: i64, hash: TrackHash },
-    /// Rows were reordered; the slice is the new order.
+    /// Rows were reordered; the slice is the confirmed order for one request.
     RowsReordered {
+        /// Which playlist owns the ordering.
         playlist_id: i64,
+        /// FIFO request identity.
+        sequence: u64,
+        /// Position-ordered hashes.
         hashes: Vec<TrackHash>,
+    },
+    /// A reorder was rejected; `hashes` is the durable rollback order.
+    ReorderFailed {
+        /// Which playlist owns the ordering.
+        playlist_id: i64,
+        /// FIFO request identity.
+        sequence: u64,
+        /// Durable position-ordered hashes after rollback.
+        hashes: Vec<TrackHash>,
+        /// Displayable persistence error.
+        message: String,
+    },
+    /// A reorder failed before the backend could provide a durable rollback.
+    ReorderCommandFailed {
+        /// Which playlist owns the request.
+        playlist_id: i64,
+        /// FIFO request identity.
+        sequence: u64,
+        /// Displayable persistence error.
+        message: String,
     },
     /// An add was skipped because the content is already in the playlist.
     DuplicateSkipped {
@@ -251,11 +275,35 @@ impl std::fmt::Debug for Event {
                 .finish(),
             Self::RowsReordered {
                 playlist_id,
+                sequence,
                 hashes,
             } => f
                 .debug_struct("RowsReordered")
                 .field("playlist_id", playlist_id)
+                .field("sequence", sequence)
                 .field("hashes", hashes)
+                .finish(),
+            Self::ReorderFailed {
+                playlist_id,
+                sequence,
+                hashes,
+                message,
+            } => f
+                .debug_struct("ReorderFailed")
+                .field("playlist_id", playlist_id)
+                .field("sequence", sequence)
+                .field("hashes", hashes)
+                .field("message", message)
+                .finish(),
+            Self::ReorderCommandFailed {
+                playlist_id,
+                sequence,
+                message,
+            } => f
+                .debug_struct("ReorderCommandFailed")
+                .field("playlist_id", playlist_id)
+                .field("sequence", sequence)
+                .field("message", message)
                 .finish(),
             Self::DuplicateSkipped { playlist_id, path } => f
                 .debug_struct("DuplicateSkipped")

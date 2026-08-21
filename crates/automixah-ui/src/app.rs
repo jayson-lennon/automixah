@@ -17,6 +17,7 @@ use crate::services::Services;
 use crate::tracks::{AnalysisState, TrackRecord};
 use automixah_engine::mixdown::MixdownOutcome;
 use automixah_engine::timeline::types::TrackHash;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -30,6 +31,8 @@ pub struct AutomixahUiApp {
     pub(crate) playlist_state: crate::playlist::PlaylistState,
     /// Single-worker analysis queue (jobs in; bus events out).
     pub(crate) playlist_queue: crate::playlist::queue::AnalysisQueue,
+    /// FIFO playlist reorder persistence queue.
+    pub(crate) reorder_queue: crate::playlist::reorder::ReorderQueue,
     /// The loaded deck; `None` until a track loads (the one lifecycle
     /// Option in the app).
     pub(crate) deck: Option<Deck>,
@@ -53,6 +56,8 @@ pub struct AutomixahUiApp {
     /// drains it and applies events (the sole state mutation path).
     pub(crate) bus: crate::bus::EventBus,
 
+    /// Latest optimistic reorder sequence per playlist.
+    latest_reorder: HashMap<i64, u64>,
     /// Target BPM for rendering the mix.
     pub(crate) render_bpm: f32,
 }
@@ -63,11 +68,14 @@ impl AutomixahUiApp {
     pub fn new(services: Services, bus: crate::bus::EventBus) -> Self {
         let playlist_queue =
             crate::playlist::queue::AnalysisQueue::spawn(services.clone(), bus.sender());
+        let reorder_queue =
+            crate::playlist::reorder::ReorderQueue::spawn(services.clone(), bus.sender());
         Self {
             services,
             tracks: crate::tracks::Tracks::default(),
             playlist_state: crate::playlist::PlaylistState::default(),
             playlist_queue,
+            reorder_queue,
             deck: None,
             load_in_flight: false,
             pending_deck_load: None,
@@ -76,6 +84,7 @@ impl AutomixahUiApp {
             render_cancel: None,
             render_stage: None,
             bus,
+            latest_reorder: HashMap::new(),
             render_bpm: 138.0,
         }
     }
@@ -333,8 +342,32 @@ impl AutomixahUiApp {
     /// The single frontend mutation path: applies drained bus events to
     /// runtime state. Everything async arrives here.
     fn apply(&mut self, event: Event) {
-        // Playlist ordering first (its appliers own the add counter).
-        self.playlist_state.apply(&event);
+        let apply_reorder = match &event {
+            Event::RowsReordered {
+                playlist_id,
+                sequence,
+                ..
+            }
+            | Event::ReorderFailed {
+                playlist_id,
+                sequence,
+                ..
+            }
+            | Event::ReorderCommandFailed {
+                playlist_id,
+                sequence,
+                ..
+            } => {
+                self.playlist_state.selected == Some(*playlist_id)
+                    && self.latest_reorder.get(playlist_id) == Some(sequence)
+            }
+            _ => true,
+        };
+        // Playlist ordering is mutated only here; stale reorder completions
+        // are deliberately ignored after a newer optimistic drop exists.
+        if apply_reorder {
+            self.playlist_state.apply(&event);
+        }
 
         match event {
             Event::LoadStage(stage) => {
@@ -442,6 +475,12 @@ impl AutomixahUiApp {
                 // analysis clear a terminal Failed state.
                 self.tracks.retry_failed(&hashes);
             }
+            Event::ReorderFailed { message, .. } if apply_reorder => {
+                self.status = format!("⚠ {message}");
+            }
+            Event::ReorderCommandFailed { message, .. } if apply_reorder => {
+                self.status = format!("⚠ {message}");
+            }
             Event::AddFailed { message } => {
                 self.status = format!("\u{26a0} add failed: {message}");
             }
@@ -475,6 +514,8 @@ impl AutomixahUiApp {
             | Event::RowAdded { .. }
             | Event::RowRemoved { .. }
             | Event::RowsReordered { .. }
+            | Event::ReorderFailed { .. }
+            | Event::ReorderCommandFailed { .. }
             | Event::DuplicateSkipped { .. }
             | Event::AddStarted { .. } => {}
         }
@@ -514,6 +555,7 @@ impl AutomixahUiApp {
         for action in actions.actions {
             match action {
                 PanelAction::SelectPlaylist(id) => {
+                    self.latest_reorder.remove(&id);
                     self.playlist_state.selected = Some(id);
                     self.playlist_state.contents = Contents::Loading;
                     self.spawn_contents_load(id);
@@ -523,7 +565,11 @@ impl AutomixahUiApp {
                 PanelAction::DeletePlaylist(id) => self.delete_playlist(id),
                 PanelAction::AddTracks => self.add_tracks_dialog(),
                 PanelAction::LoadRow(hash) => self.load_row(&hash),
-                PanelAction::MoveRow { from, to } => self.move_row_persist(&from, &to),
+                PanelAction::MoveRow {
+                    from,
+                    to,
+                    insert_after,
+                } => self.move_row_persist(&from, &to, insert_after),
                 PanelAction::RemoveRow { hash } => self.remove_row_persist(&hash),
                 PanelAction::BrowseRenderOut => self.browse_render_out(),
                 PanelAction::Render => {
@@ -685,32 +731,24 @@ impl AutomixahUiApp {
             });
     }
 
-    /// Splices rows locally (instant visual feedback) and persists the
-    /// new order; the store's confirmation event re-asserts order.
-    fn move_row_persist(&mut self, from: &TrackHash, to: &TrackHash) {
+    /// Splices rows locally and queues exactly one serialized persistence
+    /// request for the completed drop.
+    fn move_row_persist(&mut self, from: &TrackHash, to: &TrackHash, insert_after: bool) {
         let Some(playlist_id) = self.playlist_state.selected else {
             return;
         };
-        let _ = crate::playlist::move_row(&mut self.playlist_state, from, to);
-        let Contents::Loaded(hashes) = &self.playlist_state.contents else {
+        let Some(current) = self.playlist_state.selected_rows() else {
             return;
         };
-        let store = self.services.playlist_store.clone();
-        let tx = self.bus.sender();
-        let order = hashes.clone();
-        self.services.runtime.handle().spawn(async move {
-            match store.reorder(playlist_id, &order).await {
-                Ok(()) => {
-                    let _ = tx.send(Event::RowsReordered {
-                        playlist_id,
-                        hashes: order,
-                    });
-                }
-                Err(report) => {
-                    let _ = tx.send(Event::CommandFailed(format!("reorder: {report:#}")));
-                }
-            }
-        });
+        let Some(order) = crate::playlist::moved_order(current, from, to, insert_after) else {
+            return;
+        };
+        let Ok(sequence) = self.reorder_queue.enqueue(playlist_id, order.clone()) else {
+            self.status = "⚠ reorder worker unavailable".to_owned();
+            return;
+        };
+        let _ = crate::playlist::set_order(&mut self.playlist_state, order);
+        self.latest_reorder.insert(playlist_id, sequence);
     }
 
     /// Removes a row: local splice plus a persisted removal.

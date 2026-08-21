@@ -47,6 +47,8 @@ pub enum PanelAction {
         from: TrackHash,
         /// Slot the drag ended on.
         to: TrackHash,
+        /// `true` when the drop was in the lower half of the target slot.
+        insert_after: bool,
     },
     /// Remove was chosen in a row's context menu.
     RemoveRow {
@@ -336,66 +338,59 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
     let hashes = hashes.as_slice();
     let median_bpm = playlist_median_bpm(tracks, hashes);
     let row_height = ui.text_style_height(&egui::TextStyle::Body) * 1.4;
-    let mut drag_source: Option<TrackHash> = None;
-    let mut drop_target: Option<TrackHash> = None;
+    let mut drop: Option<(TrackHash, TrackHash, bool)> = None;
     let mut prev_key: Option<djcore::key::Key> = None;
     egui::ScrollArea::vertical().show_rows(ui, row_height, hashes.len(), |ui, range| {
         for i in range {
             let hash = &hashes[i];
             let record = tracks.get(hash);
             let analysis = record.map(|r| &r.analysis);
-            // Clickable whenever a record exists: ready rows load
-            // immediately; pending rows arm the deck (loads when the
-            // analysis lands). Failed and unknown rows stay inert.
+            // Clicking remains analysis-dependent, but drag payloads are
+            // available for every loaded row so ordering does not depend on
+            // analysis state.
             let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
-            let response = row_ui(
-                ui,
-                RowDisplay {
-                    record,
-                    analysis,
-                    prev_key: prev_key.clone(),
-                    median_bpm,
-                    interactive,
-                },
-                row_height,
-            );
-            // Insertion-line preview: while a drag is live, the hovered
-            // row shows the insertion line above or below its slot,
-            // decided by the pointer's half of the slot.
-            if drag_source.is_some()
-                && response.hovered()
-                && Some(hash) != drag_source.as_ref()
-                && let Some(pointer) = response.interact_pointer_pos()
-            {
-                let offset = insertion_offset_in_slot(
-                    pointer.y,
-                    response.rect.top(),
-                    response.rect.height(),
-                );
-                let y = if offset == 0 {
-                    response.rect.top()
-                } else {
+            let item_id = egui::Id::new(("playlist-row", hash));
+            let response = ui
+                .dnd_drag_source(item_id, hash.clone(), |ui| {
+                    row_ui(
+                        ui,
+                        RowDisplay {
+                            record,
+                            analysis,
+                            prev_key: prev_key.clone(),
+                            median_bpm,
+                            interactive,
+                        },
+                        row_height,
+                    )
+                })
+                .response;
+
+            // While another row is dragged, `hovered` is false by design;
+            // dnd_hover_payload/contains_pointer are the drop-zone APIs.
+            if let (Some(pointer), Some(_)) = (
+                ui.input(|input| input.pointer.interact_pos()),
+                response.dnd_hover_payload::<TrackHash>(),
+            ) {
+                let insert_after = pointer.y >= response.rect.center().y;
+                let y = if insert_after {
                     response.rect.bottom()
+                } else {
+                    response.rect.top()
                 };
-                let painter = ui.painter();
-                painter.line_segment(
+                ui.painter().line_segment(
                     [
                         egui::pos2(response.rect.left(), y),
                         egui::pos2(response.rect.right(), y),
                     ],
                     egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 60)),
                 );
+                if let Some(released) = response.dnd_release_payload::<TrackHash>() {
+                    drop = Some((released.as_ref().clone(), hash.clone(), insert_after));
+                }
             }
-            if interactive {
-                if response.clicked() {
-                    actions.actions.push(PanelAction::LoadRow(hash.clone()));
-                }
-                if response.drag_started() {
-                    drag_source = Some(hash.clone());
-                }
-                if response.drag_stopped() {
-                    drop_target = Some(hash.clone());
-                }
+            if interactive && response.clicked() {
+                actions.actions.push(PanelAction::LoadRow(hash.clone()));
             }
             response.context_menu(|ui| {
                 if ui.button("Remove").clicked() {
@@ -410,10 +405,14 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
             }
         }
     });
-    if let (Some(from), Some(to)) = (drag_source, drop_target)
+    if let Some((from, to, insert_after)) = drop
         && from != to
     {
-        actions.actions.push(PanelAction::MoveRow { from, to });
+        actions.actions.push(PanelAction::MoveRow {
+            from,
+            to,
+            insert_after,
+        });
     }
 }
 
@@ -593,8 +592,6 @@ fn paint_row_content(
     }
 }
 
-/// Whether a drag over a slot splices before (0) or after (1) it.
-///
 /// The upper half of a slot inserts before it; the lower half after.
 #[must_use]
 pub fn insertion_offset_in_slot(pointer_y: f32, slot_top: f32, slot_height: f32) -> usize {

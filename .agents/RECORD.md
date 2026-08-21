@@ -80,4 +80,4 @@ Entries are added or amended **only with human approval**.
 - (engine) Transitions overlap: the incoming track starts at its selected source in-cue at the transition window start, and a valid outgoing out-cue starts the configured automation window; when cues are absent or invalid, existing grid-derived placement is used.
 - (db) Per-track cue points persist in the library database by content hash as source-frame positions, with up to four in-cues and four out-cues, and survive grid re-analysis.
 - (engine) Mixdown selects the earliest valid in-cue and earliest valid out-cue by source position; cue slots do not determine rendering precedence.
-- (ui) The waveform editor exposes four numbered in-cue slots and four numbered out-cue slots; click creates or jumps to a cue, Ctrl-click deletes it, and cue markers remain fixed-size while following waveform navigation.
+- (ui) Playlist track reordering is hash-addressed and optimistic: all loaded rows are draggable, upper/lower drop halves select before/after placement, and one FIFO persistence worker serializes writes with sequence-filtered success or rollback events.

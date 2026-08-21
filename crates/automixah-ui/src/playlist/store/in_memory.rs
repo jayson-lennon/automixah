@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 
 use automixah_engine::timeline::types::TrackHash;
 
-use super::{PersistedTrack, PlaylistStore, PlaylistStoreError, PlaylistSummary};
+use super::{PersistedTrack, PlaylistStore, PlaylistStoreError, PlaylistSummary, ReorderOutcome};
 use crate::store::GridOverride;
 
 /// One stored playlist.
@@ -279,26 +279,48 @@ impl PlaylistStore for InMemoryPlaylistStore {
         &self,
         playlist_id: i64,
         ordered: &[TrackHash],
-    ) -> Result<(), Report<PlaylistStoreError>> {
+    ) -> Result<ReorderOutcome, Report<PlaylistStoreError>> {
         let mut playlists = self.playlists.lock();
         let Some(data) = playlists.get_mut(&playlist_id) else {
             return Err(Report::new(PlaylistStoreError).attach("no such playlist"));
         };
+        let original: Vec<TrackHash> = data
+            .entries
+            .iter()
+            .map(|entry| entry.hash.clone())
+            .collect();
+        let mut expected = original.clone();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut incoming = ordered.to_vec();
+        incoming.sort_by(|a, b| a.0.cmp(&b.0));
+        if incoming != expected
+            || ordered.iter().any(|hash| {
+                ordered
+                    .iter()
+                    .filter(|candidate| *candidate == hash)
+                    .count()
+                    > 1
+            })
+        {
+            return Ok(ReorderOutcome::Rejected {
+                order: original,
+                error: Report::new(PlaylistStoreError)
+                    .attach("reorder hash set differs from stored set"),
+            });
+        }
         let mut new_entries = Vec::with_capacity(ordered.len());
         for hash in ordered {
-            let Some(entry) = data.entries.iter().find(|e| e.hash == *hash) else {
-                return Err(Report::new(PlaylistStoreError)
-                    .attach("reorder hash set differs from stored set"));
-            };
+            let entry = data
+                .entries
+                .iter()
+                .find(|entry| entry.hash == *hash)
+                .expect("validated reorder hash set");
             new_entries.push(entry.clone());
         }
-        if new_entries.len() != data.entries.len() {
-            return Err(
-                Report::new(PlaylistStoreError).attach("reorder hash set differs from stored set")
-            );
-        }
         data.entries = new_entries;
-        Ok(())
+        Ok(ReorderOutcome::Saved {
+            order: ordered.to_vec(),
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -341,6 +363,40 @@ mod tests {
         );
     }
 
+    // Given a playlist with two tracks.
+    // When an invalid hash set is reordered.
+    // Then the rejection includes the original durable order and storage is unchanged.
+    #[tokio::test]
+    async fn in_memory_reorder_rejects_with_rollback_order() {
+        let store = InMemoryPlaylistStore::new();
+        let list = store.create_playlist("rollback").await.expect("create");
+        for name in ["a", "b"] {
+            store
+                .insert_track(list.id, &TrackHash(name.to_owned()), "/x", name, "", None)
+                .await
+                .expect("insert");
+        }
+
+        let outcome = store
+            .reorder(
+                list.id,
+                &[TrackHash("a".to_owned()), TrackHash("missing".to_owned())],
+            )
+            .await
+            .expect("outcome");
+
+        match outcome {
+            ReorderOutcome::Rejected { order, .. } => {
+                assert_eq!(
+                    order,
+                    vec![TrackHash("a".to_owned()), TrackHash("b".to_owned())]
+                );
+            }
+            ReorderOutcome::Saved { .. } => panic!("invalid order saved"),
+        }
+        let rows = store.tracks_for(list.id).await.expect("rows");
+        assert_eq!(rows[1].track_hash.0, "b");
+    }
     // Given two playlists.
     // When the same hash is inserted into both.
     // Then both accept it (cross-playlist duplicates allowed).
