@@ -1085,18 +1085,6 @@ impl AutomixahUiApp {
                 return;
             };
             let end = deck.duration_seconds();
-            ui.horizontal(|ui| {
-                if let Some(c) = deck.cursor_time {
-                    if ui.button("snap beat @ cursor").clicked() {
-                        deck.edit_grid.snap_nearest_beat(c);
-                        deck.grid_dirty = true;
-                    }
-                    if ui.button("set downbeat @ cursor").clicked() {
-                        deck.edit_grid.set_downbeat_at(c);
-                        deck.grid_dirty = true;
-                    }
-                }
-            });
             ui.add(
                 egui::Slider::new(&mut deck.view.playhead_frac, 0.05..=0.95)
                     .text("playhead x")
