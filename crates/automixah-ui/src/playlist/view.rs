@@ -343,7 +343,7 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
             let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
             let item_id = egui::Id::new(("playlist-row", hash));
             let response = ui
-                .dnd_drag_source(item_id, hash.clone(), |ui| {
+                .push_id(item_id, |ui| {
                     row_ui(
                         ui,
                         RowDisplay {
@@ -356,7 +356,8 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
                         row_height,
                     )
                 })
-                .response;
+                .inner;
+            response.dnd_set_drag_payload(hash.clone());
 
             // While another row is dragged, `hovered` is false by design;
             // dnd_hover_payload/contains_pointer are the drop-zone APIs.
@@ -381,8 +382,13 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
                     drop = Some((released.as_ref().clone(), hash.clone(), insert_after));
                 }
             }
-            if interactive && response.clicked() {
-                actions.actions.push(PanelAction::LoadRow(hash.clone()));
+            if let Some(action) = load_action_for_row(
+                hash,
+                interactive,
+                response.clicked_by(egui::PointerButton::Primary),
+                response.dragged(),
+            ) {
+                actions.actions.push(action);
             }
             response.context_menu(|ui| {
                 if ui.button("Remove").clicked() {
@@ -397,14 +403,36 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
             }
         }
     });
-    if let Some((from, to, insert_after)) = drop
-        && from != to
-    {
-        actions.actions.push(PanelAction::MoveRow {
-            from,
-            to,
-            insert_after,
-        });
+    if let Some(action) = move_action_for_drop(drop) {
+        actions.actions.push(action);
+    }
+}
+
+/// Converts a released payload into a reorder intent, ignoring cancellation
+/// and self-drops.
+#[must_use]
+fn move_action_for_drop(drop: Option<(TrackHash, TrackHash, bool)>) -> Option<PanelAction> {
+    let (from, to, insert_after) = drop?;
+    (from != to).then_some(PanelAction::MoveRow {
+        from,
+        to,
+        insert_after,
+    })
+}
+
+/// Converts one row response into its load intent, if the gesture was a
+/// primary click on a row whose analysis can be loaded.
+#[must_use]
+fn load_action_for_row(
+    hash: &TrackHash,
+    interactive: bool,
+    primary_clicked: bool,
+    dragged: bool,
+) -> Option<PanelAction> {
+    if interactive && primary_clicked && !dragged {
+        Some(PanelAction::LoadRow(hash.clone()))
+    } else {
+        None
     }
 }
 
@@ -721,6 +749,105 @@ mod tests {
 
     fn hash(id: u32) -> TrackHash {
         TrackHash(format!("h{id}"))
+    }
+
+    // Given a loadable row and a primary click with no drag.
+    // When classifying the row gesture.
+    // Then a LoadRow action targets that row.
+    #[test]
+    fn primary_click_on_loadable_row_emits_load_action() {
+        let row = hash(1);
+
+        let action = load_action_for_row(&row, true, true, false);
+
+        assert_eq!(action, Some(PanelAction::LoadRow(row)));
+    }
+
+    // Given a loadable row whose pointer gesture became a drag.
+    // When classifying the row gesture.
+    // Then no LoadRow action is emitted.
+    #[test]
+    fn dragging_loadable_row_suppresses_load_action() {
+        let row = hash(1);
+
+        let action = load_action_for_row(&row, true, true, true);
+
+        assert_eq!(action, None);
+    }
+
+    // Given a row with each analysis lifecycle state or no record.
+    // When classifying a primary click.
+    // Then only ready, queued, and analyzing rows emit LoadRow.
+    #[rstest::rstest]
+    #[case::ready(crate::tracks::AnalysisState::Ready(analysis(128.0)), true)]
+    #[case::queued(crate::tracks::AnalysisState::Queued, true)]
+    #[case::analyzing(crate::tracks::AnalysisState::Analyzing, true)]
+    #[case::failed(crate::tracks::AnalysisState::Failed("boom".to_owned()), false)]
+    fn loadability_matches_analysis_lifecycle(
+        #[case] state: crate::tracks::AnalysisState,
+        #[case] expected_loadable: bool,
+    ) {
+        let row = hash(1);
+        let record = Some(state);
+        let interactive = record
+            .as_ref()
+            .is_some_and(|state| state.is_ready() || state.is_pending());
+
+        let action = load_action_for_row(&row, interactive, true, false);
+
+        assert_eq!(action.is_some(), expected_loadable);
+    }
+
+    // Given no track record for a displayed hash.
+    // When classifying a primary click.
+    // Then no LoadRow action is emitted.
+    #[test]
+    fn unknown_row_does_not_emit_load_action() {
+        let row = hash(1);
+
+        let action = load_action_for_row(&row, false, true, false);
+
+        assert_eq!(action, None);
+    }
+
+    // Given a released drag over the upper or lower half of another row.
+    // When converting the drop to an action.
+    // Then the target and insertion direction are preserved.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn valid_drop_emits_move_action_with_insertion_direction(#[case] insert_after: bool) {
+        let from = hash(1);
+        let to = hash(2);
+
+        let action = move_action_for_drop(Some((from.clone(), to.clone(), insert_after)));
+
+        assert_eq!(
+            action,
+            Some(PanelAction::MoveRow {
+                from,
+                to,
+                insert_after,
+            })
+        );
+    }
+
+    // Given a drag with no valid target.
+    // When converting the drop to an action.
+    // Then the drop is cancelled without an action.
+    #[test]
+    fn drop_without_target_is_cancelled() {
+        assert_eq!(move_action_for_drop(None), None);
+    }
+
+    // Given a released drag over its own row.
+    // When converting the drop to an action.
+    // Then the self-drop is cancelled without an action.
+    #[test]
+    fn self_drop_is_cancelled() {
+        let row = hash(1);
+
+        assert_eq!(move_action_for_drop(Some((row.clone(), row, true))), None);
     }
 
     fn analysis(bpm: f32) -> crate::tracks::Analysis {
