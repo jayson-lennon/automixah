@@ -155,14 +155,6 @@ fn render_controls(ui: &mut egui::Ui, render: RenderUiState<'_>, actions: &mut P
             if ui.add(cancel).clicked() {
                 actions.actions.push(PanelAction::CancelRender);
             }
-            ui.add_enabled(
-                false,
-                egui::DragValue::new(render.bpm)
-                    .min_decimals(1)
-                    .max_decimals(1)
-                    .clamp_existing_to_range(true)
-                    .range(0..=250),
-            );
             ui.spinner();
             if let Some(stage) = render.stage {
                 ui.weak(stage_text(stage));
