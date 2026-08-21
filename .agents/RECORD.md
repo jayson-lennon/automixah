@@ -81,3 +81,5 @@ Entries are added or amended **only with human approval**.
 - (db) Per-track cue points persist in the library database by content hash as source-frame positions, with up to four in-cues and four out-cues, and survive grid re-analysis.
 - (engine) Mixdown selects the earliest valid in-cue and earliest valid out-cue by source position; cue slots do not determine rendering precedence.
 - (ui) Playlist track reordering is hash-addressed and optimistic: all loaded rows are draggable, upper/lower drop halves select before/after placement, and one FIFO persistence worker serializes writes with sequence-filtered success or rollback events.
+- (ui) automixah-ui imports one .m3u file per action into a newly created playlist named from the file stem, suffixing duplicate names with the lowest available (N) suffix.
+- (ui) M3U import accepts absolute local file paths, skips non-entry lines and unsupported entries, deduplicates tracks by content hash, preserves valid entry order, and reports imported and skipped counts.

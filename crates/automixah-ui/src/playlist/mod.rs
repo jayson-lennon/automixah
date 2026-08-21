@@ -12,6 +12,7 @@
 //! is a delta event. Persistence lives in [`store`]; the analysis
 //! worker in [`queue`].
 
+pub mod m3u;
 pub mod queue;
 pub mod reorder;
 pub mod store;
@@ -51,8 +52,34 @@ pub struct PlaylistState {
     /// Outstanding add-track tasks (Add busy indicator; each terminal
     /// outcome — added, duplicate-skipped, failed — decrements).
     pub adds_in_flight: usize,
+    /// M3U import lifecycle and latest progress/result.
+    pub import: ImportState,
     /// Inline rename editor (context menu).
     pub rename: RenameEditor,
+}
+
+/// Frontend state for the single concurrent M3U import.
+#[derive(Debug, Default)]
+pub struct ImportState {
+    /// `true` while the importer is listing, creating, or processing.
+    pub busy: bool,
+    /// Latest processed/imported/skipped counters.
+    pub progress: Option<ImportProgress>,
+    /// Latest terminal result for display until the next import.
+    pub result: Option<String>,
+}
+
+/// Counters reported by the importer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportProgress {
+    /// Entries examined so far.
+    pub processed: usize,
+    /// Usable absolute entries in the file.
+    pub total: usize,
+    /// Rows inserted so far.
+    pub imported: usize,
+    /// Entries skipped so far.
+    pub skipped: usize,
 }
 
 /// Inline rename editor: swaps a playlist row for an in-place field.
@@ -160,7 +187,10 @@ impl PlaylistState {
     pub fn apply(&mut self, event: &Event) {
         match event {
             Event::PlaylistsLoaded(playlists) => self.playlists = playlists.clone(),
-            Event::PlaylistCreated(summary) => self.playlists.push(summary.clone()),
+            Event::PlaylistCreated(summary) => {
+                self.playlists.push(summary.clone());
+                self.playlists.sort_by(|a, b| a.name.cmp(&b.name));
+            }
             Event::PlaylistRenamed { id, name } => {
                 if let Some(p) = self.playlists.iter_mut().find(|p| p.id == *id) {
                     p.name = name.clone();
@@ -229,6 +259,40 @@ impl PlaylistState {
             }
             Event::AddFailed { .. } => {
                 self.adds_in_flight = self.adds_in_flight.saturating_sub(1);
+            }
+            Event::ImportStarted => {
+                self.import.busy = true;
+                self.import.progress = None;
+                self.import.result = None;
+            }
+            Event::ImportProgress {
+                processed,
+                total,
+                imported,
+                skipped,
+            } => {
+                self.import.progress = Some(ImportProgress {
+                    processed: *processed,
+                    total: *total,
+                    imported: *imported,
+                    skipped: *skipped,
+                });
+            }
+            Event::ImportCompleted {
+                imported,
+                skipped,
+                warning,
+                ..
+            } => {
+                self.import.busy = false;
+                self.import.result = Some(match warning {
+                    Some(warning) => format!("imported {imported}, skipped {skipped} ({warning})"),
+                    None => format!("imported {imported}, skipped {skipped}"),
+                });
+            }
+            Event::ImportFailed { message } => {
+                self.import.busy = false;
+                self.import.result = Some(format!("import failed: {message}"));
             }
             // Track-record events and editor events are applied
             // elsewhere; ordering has nothing to do with them.

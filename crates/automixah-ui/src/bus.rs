@@ -166,6 +166,32 @@ pub enum Event {
     /// An add-track task failed (its terminal event; distinct from
     /// `CommandFailed` so the in-flight count is never corrupted).
     AddFailed { message: String },
+    /// An M3U import was accepted and is running.
+    ImportStarted,
+    /// Progress from the sequential M3U entry importer.
+    ImportProgress {
+        /// Number of entries examined so far.
+        processed: usize,
+        /// Number of usable absolute entries in the file.
+        total: usize,
+        /// Number of rows inserted so far.
+        imported: usize,
+        /// Number of entries skipped so far.
+        skipped: usize,
+    },
+    /// An import completed after creating `summary`.
+    ImportCompleted {
+        /// The playlist created by the import.
+        summary: PlaylistSummary,
+        /// Number of rows inserted.
+        imported: usize,
+        /// Number of entries skipped.
+        skipped: usize,
+        /// A non-fatal read/parse message, if setup failed after creation.
+        warning: Option<String>,
+    },
+    /// An import failed before a playlist could be completed.
+    ImportFailed { message: String },
     // Render pipeline (one job at a time; a singleton, so events
     // address nothing).
     /// Staged progress from the active mixdown (throttled upstream).
@@ -314,6 +340,32 @@ impl std::fmt::Debug for Event {
                 f.debug_struct("AddStarted").field("count", count).finish()
             }
             Self::AddFailed { message } => f.debug_tuple("AddFailed").field(message).finish(),
+            Self::ImportStarted => f.debug_tuple("ImportStarted").finish(),
+            Self::ImportProgress {
+                processed,
+                total,
+                imported,
+                skipped,
+            } => f
+                .debug_struct("ImportProgress")
+                .field("processed", processed)
+                .field("total", total)
+                .field("imported", imported)
+                .field("skipped", skipped)
+                .finish(),
+            Self::ImportCompleted {
+                summary,
+                imported,
+                skipped,
+                warning,
+            } => f
+                .debug_struct("ImportCompleted")
+                .field("summary", summary)
+                .field("imported", imported)
+                .field("skipped", skipped)
+                .field("warning", warning)
+                .finish(),
+            Self::ImportFailed { message } => f.debug_tuple("ImportFailed").field(message).finish(),
             Self::RenderProgress { stage } => f
                 .debug_struct("RenderProgress")
                 .field("stage", stage)

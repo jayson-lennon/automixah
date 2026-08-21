@@ -37,6 +37,8 @@ pub enum PanelAction {
     },
     /// Delete was chosen in a playlist's context menu.
     DeletePlaylist(i64),
+    /// The Import button was clicked (the app opens the single-file M3U dialog).
+    ImportPlaylist,
     /// The Add… button was clicked (the app opens the file dialog).
     AddTracks,
     /// A ready row was clicked (load into the grid editor).
@@ -103,6 +105,22 @@ pub fn panel(
                 ui.strong("Playlists");
                 if ui.button("New").clicked() {
                     actions.actions.push(PanelAction::NewPlaylist);
+                }
+                let import = ui.add_enabled(!state.import.busy, egui::Button::new("Import"));
+                if import.clicked() {
+                    actions.actions.push(PanelAction::ImportPlaylist);
+                }
+                if state.import.busy {
+                    ui.spinner();
+                    if let Some(progress) = state.import.progress {
+                        ui.weak(format!(
+                            "{} / {} · imported {} · skipped {}",
+                            progress.processed, progress.total, progress.imported, progress.skipped
+                        ));
+                    }
+                }
+                if let Some(status) = &state.import.result {
+                    ui.weak(status);
                 }
                 ui.separator();
                 if state.selected.is_some() {

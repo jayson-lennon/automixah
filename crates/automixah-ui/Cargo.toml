@@ -37,6 +37,7 @@ daow = "0.1.0"
 sha2.workspace = true
 error-stack.workspace = true
 wherror.workspace = true
+m3u = "1.0.0"
 
 [dev-dependencies]
 rstest = "0.25"

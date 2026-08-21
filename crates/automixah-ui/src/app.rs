@@ -484,6 +484,23 @@ impl AutomixahUiApp {
             Event::AddFailed { message } => {
                 self.status = format!("\u{26a0} add failed: {message}");
             }
+            Event::ImportCompleted {
+                summary,
+                imported,
+                skipped,
+                warning,
+            } => {
+                self.playlist_state.selected = Some(summary.id);
+                self.playlist_state.contents = Contents::Loading;
+                self.spawn_contents_load(summary.id);
+                self.status = match warning {
+                    Some(warning) => format!("imported {imported}, skipped {skipped} ({warning})"),
+                    None => format!("imported {imported}, skipped {skipped}"),
+                };
+            }
+            Event::ImportFailed { message } => {
+                self.status = format!("\u{26a0} import failed: {message}");
+            }
             Event::CommandFailed(message) => {
                 self.status = format!("\u{26a0} {message}");
             }
@@ -517,7 +534,9 @@ impl AutomixahUiApp {
             | Event::ReorderFailed { .. }
             | Event::ReorderCommandFailed { .. }
             | Event::DuplicateSkipped { .. }
-            | Event::AddStarted { .. } => {}
+            | Event::AddStarted { .. }
+            | Event::ImportStarted
+            | Event::ImportProgress { .. } => {}
         }
     }
 
@@ -563,6 +582,7 @@ impl AutomixahUiApp {
                 PanelAction::NewPlaylist => self.create_playlist(),
                 PanelAction::RenamePlaylist { id, name } => self.rename_playlist(id, name),
                 PanelAction::DeletePlaylist(id) => self.delete_playlist(id),
+                PanelAction::ImportPlaylist => self.import_playlist_dialog(),
                 PanelAction::AddTracks => self.add_tracks_dialog(),
                 PanelAction::LoadRow(hash) => self.load_row(&hash),
                 PanelAction::MoveRow {
@@ -633,7 +653,33 @@ impl AutomixahUiApp {
         });
     }
 
-    /// Opens the multi-select file dialog; each picked file becomes an
+    /// Opens a single-file M3U picker and starts the sequential importer.
+    fn import_playlist_dialog(&mut self) {
+        if self.playlist_state.import.busy {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import M3U playlist")
+            .add_filter("M3U playlist", &["m3u"])
+            .pick_file()
+        else {
+            return;
+        };
+        if !crate::playlist::m3u::is_m3u_path(&path) {
+            self.bus.send(Event::ImportFailed {
+                message: "selected file is not an .m3u playlist".to_owned(),
+            });
+            return;
+        }
+        self.bus.send(Event::ImportStarted);
+        let services = self.services.clone();
+        let tx = self.bus.sender();
+        let handle = services.runtime.handle().clone();
+        handle.spawn(async move {
+            import_playlist_task(services, tx, path).await;
+        });
+    }
+
     /// add-track task (hash → tags → duplicate check → insert → events).
     fn add_tracks_dialog(&mut self) {
         let Some(playlist_id) = self.playlist_state.selected else {
@@ -802,7 +848,146 @@ fn enqueue_if_needed(
     }
 }
 
-/// One add-track task's body: hash → tags → duplicate check → insert.
+/// Imports one M3U file after creating its uniquely named playlist.
+///
+/// File entries are processed sequentially because `ensure_track` appends at
+/// the next position. Per-entry failures are counted and do not stop later
+/// valid entries.
+async fn import_playlist_task(
+    services: Services,
+    tx: std::sync::mpsc::Sender<Event>,
+    m3u_path: std::path::PathBuf,
+) {
+    let base = match crate::playlist::m3u::filename_stem(&m3u_path) {
+        Some(base) => base,
+        None => {
+            let _ = tx.send(Event::ImportFailed {
+                message: "playlist filename must have a non-empty .m3u stem".to_owned(),
+            });
+            return;
+        }
+    };
+    let playlists = match services.playlist_store.list_playlists().await {
+        Ok(playlists) => playlists,
+        Err(report) => {
+            let _ = tx.send(Event::ImportFailed {
+                message: format!("list playlists: {report:#}"),
+            });
+            return;
+        }
+    };
+    let name = crate::playlist::m3u::lowest_unused_name(
+        &base,
+        playlists.iter().map(|playlist| playlist.name.as_str()),
+    );
+    let summary = match services.playlist_store.create_playlist(&name).await {
+        Ok(summary) => summary,
+        Err(report) => {
+            let _ = tx.send(Event::ImportFailed {
+                message: format!("create playlist {name}: {report:#}"),
+            });
+            return;
+        }
+    };
+    let playlist_id = summary.id;
+    let _ = tx.send(Event::PlaylistCreated(summary.clone()));
+
+    let document = match std::fs::read_to_string(&m3u_path) {
+        Ok(document) => document,
+        Err(error) => {
+            let _ = tx.send(Event::ImportCompleted {
+                summary,
+                imported: 0,
+                skipped: 0,
+                warning: Some(format!("read {}: {error}", m3u_path.display())),
+            });
+            return;
+        }
+    };
+    let paths = crate::playlist::m3u::parse_entries(&document);
+    let total = paths.len();
+    let _ = tx.send(Event::ImportProgress {
+        processed: 0,
+        total,
+        imported: 0,
+        skipped: 0,
+    });
+    let registry = djcore::decoder::DecoderRegistry::with_symphonia();
+    let supported = registry.supported_extensions();
+    let mut hashes = std::collections::HashSet::new();
+    let mut imported = 0;
+    let mut skipped = 0;
+
+    for path in paths {
+        let result = import_entry(&services, playlist_id, &path, &supported, &mut hashes).await;
+        match result {
+            Ok(Some((hash, tags))) => {
+                imported += 1;
+                let _ = tx.send(Event::TagsResolved {
+                    hash: hash.clone(),
+                    tags,
+                });
+                let _ = tx.send(Event::RowAdded { playlist_id, hash });
+            }
+            Ok(None) | Err(_) => skipped += 1,
+        }
+        let processed = imported + skipped;
+        let _ = tx.send(Event::ImportProgress {
+            processed,
+            total,
+            imported,
+            skipped,
+        });
+    }
+    let _ = tx.send(Event::ImportCompleted {
+        summary,
+        imported,
+        skipped,
+        warning: None,
+    });
+}
+
+/// Reads and persists one supported M3U entry.
+async fn import_entry(
+    services: &Services,
+    playlist_id: i64,
+    path: &std::path::Path,
+    supported: &[String],
+    hashes: &mut std::collections::HashSet<TrackHash>,
+) -> Result<Option<(TrackHash, crate::tracks::TrackTags)>, String> {
+    let extension = crate::track::identity::extension_of(path);
+    if !supported.iter().any(|candidate| candidate == &extension) {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let hash = TrackHash(crate::track::identity::hex_sha256(&bytes));
+    if hashes.contains(&hash)
+        || services
+            .playlist_store
+            .contains_hash(playlist_id, &hash)
+            .await
+            .map_err(|report| format!("check {}: {report:#}", path.display()))?
+    {
+        return Ok(None);
+    }
+    let tags = crate::track::identity::resolve_tags(&bytes, path);
+    let duration = crate::track::identity::probe_duration(&bytes, path);
+    services
+        .playlist_store
+        .ensure_track(
+            playlist_id,
+            &hash,
+            &path.display().to_string(),
+            &tags.title,
+            &tags.artist,
+            duration,
+        )
+        .await
+        .map_err(|report| format!("insert {}: {report:#}", path.display()))?;
+    hashes.insert(hash.clone());
+    Ok(Some((hash, tags)))
+}
+
 /// Returns the new row's hash or `None` for a duplicate (skipped
 /// silently — no row, no queue job).
 async fn add_track_task(
