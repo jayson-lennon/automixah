@@ -43,6 +43,7 @@ fn click_job(out: &Path) -> MixdownJob {
     MixdownJob {
         tracks: vec![mk("t120", click120(), 120.0), mk("t128", click128(), 128.0)],
         out: out.to_path_buf(),
+        bpm: 138.0,
     }
 }
 

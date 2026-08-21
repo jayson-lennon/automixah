@@ -82,6 +82,8 @@ pub struct MixdownJob {
     pub tracks: Vec<MixdownTrack>,
     /// Target WAV path (written atomically via a `.part` sibling).
     pub out: PathBuf,
+
+    pub bpm: f32,
 }
 
 /// One progress report from a running mixdown.
@@ -230,7 +232,7 @@ fn mixdown(
     let plan = plan_with(
         &analyses,
         PlanOptions {
-            target_bpm: None,
+            target_bpm: Some(job.bpm),
             force_drift_back: false,
             transition_beats: transition.beats,
             transition_name: transition.name.clone(),

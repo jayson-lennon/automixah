@@ -52,6 +52,9 @@ pub struct AutomixahUiApp {
     /// The UI event bus: every async outcome lands here; `update`
     /// drains it and applies events (the sole state mutation path).
     pub(crate) bus: crate::bus::EventBus,
+
+    /// Target BPM for rendering the mix.
+    pub(crate) render_bpm: f32,
 }
 
 impl AutomixahUiApp {
@@ -73,6 +76,7 @@ impl AutomixahUiApp {
             render_cancel: None,
             render_stage: None,
             bus,
+            render_bpm: 138.0,
         }
     }
 
@@ -813,10 +817,11 @@ impl eframe::App for AutomixahUiApp {
             let can_render = self.can_render();
             let stage = self.render_stage;
             let render = crate::playlist::view::RenderUiState {
-                out: &mut self.render_out,
+                mix_path: &mut self.render_out,
                 running,
                 can_render,
                 stage,
+                bpm: &mut self.render_bpm,
             };
             crate::playlist::view::panel(ctx, &mut self.playlist_state, &self.tracks, render)
         };
@@ -936,7 +941,12 @@ impl AutomixahUiApp {
             })
             .collect::<Option<Vec<_>>>()?;
         let out = std::path::PathBuf::from(self.render_out.trim());
-        Some(automixah_engine::mixdown::MixdownJob { tracks, out })
+
+        Some(automixah_engine::mixdown::MixdownJob {
+            tracks,
+            out,
+            bpm: self.render_bpm,
+        })
     }
 
     /// Starts the mixdown on a blocking thread. Progress lands on
