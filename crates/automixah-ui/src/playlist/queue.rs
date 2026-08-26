@@ -1,23 +1,52 @@
-//! The analysis queue: a single worker draining FIFO track jobs.
+//! The analysis queue: a single worker draining track jobs by priority.
 //!
 //! One job at a time (analysis is CPU-heavy; parallel jobs would starve
 //! the host). Jobs are addressed by content hash — the same stable
 //! identity the stores and the track database use — so one analysis pass
-//! serves every playlist row referencing the hash. The worker either
+//! serves every playlist row referencing the hash. Jobs are scheduled by
+//! tier ([`Priority`]: user-forced above playlist above background
+//! library backfill), FIFO within a tier; hash duplicates collapse onto
+//! the already-staged job instead of running twice. The worker either
 //! short-circuits on a library hit (grid + key + duration known → no
 //! decode) or reads, decodes, analyzes through the injected analyzer,
 //! persists grid/key, and drops the PCM. All outcomes are bus events
 //! addressed by hash.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 use automixah_engine::timeline::types::TrackHash;
+use parking_lot::{Condvar, Mutex};
 
 use crate::bus::Event;
 use crate::services::Services;
 use crate::track::identity;
 use crate::tracks::{Analysis, AnalysisState};
+
+/// Scheduling tier of a queued job; lower ranks dequeue sooner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    /// User-initiated re-analyze: jumps every pending background work.
+    Force,
+    /// User-visible playlist flow (adds, tag hydration, loads).
+    Playlist,
+    /// Library-refresh backfill: pure prefetch behind all user work.
+    Library,
+}
+
+impl Priority {
+    /// Numeric rank for the heap order (ascending = soonest).
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Force => 0,
+            Self::Playlist => 1,
+            Self::Library => 2,
+        }
+    }
+}
 
 /// One queued analysis job.
 #[derive(Debug, Clone)]
@@ -32,39 +61,158 @@ pub struct QueueJob {
     pub force: bool,
 }
 
-/// Handle to the worker: clone the sender side to enqueue; the worker
-/// sends bus events.
+/// A staged job plus its scheduling metadata.
 #[derive(Debug)]
+struct Pending {
+    job: QueueJob,
+    priority: Priority,
+    /// Monotonic arrival sequence: FIFO within a tier, older wins ties.
+    arrival: u64,
+}
+
+/// Pop order: tier rank first, then arrival sequence.
+type Slot = (u8, u64);
+
+/// State guarded by the pair (`Mutex`, `Condvar`) on [`Shared`].
+#[derive(Debug, Default)]
+struct Slots {
+    /// Staged jobs keyed by content hash — never two entries per hash.
+    staged: HashMap<TrackHash, Pending>,
+    /// Pop-ordered view over `staged`: `(tier, arrival)` slots.
+    ready: BTreeSet<Slot>,
+    next_arrival: u64,
+    /// Set when the owning handle drops: no further enqueues, worker
+    /// exits after draining.
+    closed: bool,
+}
+
+impl Slots {
+    /// Stages `job`, collapsing duplicate hashes onto one execution —
+    /// urgency escalates, `force` merges, the older arrival sequence
+    /// survives so FIFO order holds within the merged tier. Returns
+    /// whether the worker should be woken (a fresh, unseen arrival).
+    fn offer(&mut self, job: QueueJob, priority: Priority) -> bool {
+        let hash = job.hash.clone();
+        let Some(mut merged) = self.staged.remove(&hash) else {
+            // Fresh arrival.
+            let arrival = self.next_arrival;
+            self.next_arrival += 1;
+            self.ready.insert((priority.rank(), arrival));
+            self.staged.insert(
+                hash,
+                Pending {
+                    job,
+                    priority,
+                    arrival,
+                },
+            );
+            return true;
+        };
+        merged.job.force |= job.force;
+        if priority >= merged.priority {
+            self.staged.insert(hash, merged);
+            return false;
+        }
+        // Escalation: relocate onto the more urgent slot, retaining the
+        // original arrival sequence.
+        self.ready.remove(&(merged.priority.rank(), merged.arrival));
+        self.ready.insert((priority.rank(), merged.arrival));
+        merged.priority = priority;
+        self.staged.insert(hash, merged);
+        false
+    }
+
+    /// Removes and returns the soonest staged job. Dequeue scans the
+    /// staged map once for the popped slot's arrival sequence — dequeues
+    /// are rare relative to runtime, staging stays O(log n) either way.
+    fn pop_top(&mut self) -> Option<QueueJob> {
+        let slot @ (_, arrival) = *self.ready.iter().next()?;
+        self.ready.remove(&slot);
+        // Every slot in `ready` matches exactly one staged job.
+        let (_, pending) = self
+            .staged
+            .extract_if(|_, pending| pending.arrival == arrival)
+            .next()?;
+        Some(pending.job)
+    }
+}
+
+/// Shared between the [`AnalysisQueue`] handle clones and the worker.
+#[derive(Debug, Default)]
+struct Shared {
+    slots: Mutex<Slots>,
+    space: Condvar,
+}
+
+/// Handle to the analysis worker: enqueue jobs, clone to share; the
+/// worker sends bus events.
+#[derive(Debug, Clone)]
 pub struct AnalysisQueue {
-    job_tx: Sender<QueueJob>,
+    shared: Arc<Shared>,
 }
 
 impl AnalysisQueue {
     /// Spawns the single worker thread over `services`.
     ///
-    /// The worker parks when idle and exits when every `job_tx` clone is
-    /// dropped (app teardown).
+    /// The worker parks when idle; dropping the last frontend handle
+    /// closes the queue — no further enqueues — and the worker exits
+    /// once the backlog drains (app teardown).
     #[must_use]
     pub fn spawn(services: Services, events: Sender<Event>) -> Self {
-        let (job_tx, job_rx) = std::sync::mpsc::channel::<QueueJob>();
-        std::thread::Builder::new()
-            .name("playlist-analysis".to_owned())
-            .spawn(move || worker_loop(services, job_rx, events))
-            .expect("spawn analysis worker");
-        Self { job_tx }
+        let shared = Arc::new(Shared::default());
+        {
+            let worker_shared = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("playlist-analysis".to_owned())
+                .spawn(move || worker_loop(services, worker_shared, events))
+                .expect("spawn analysis worker");
+        }
+        Self { shared }
     }
 
-    /// Enqueues a job; the track's record should already show `Queued`.
-    pub fn enqueue(&self, job: QueueJob) {
-        // A send fails only when the worker is gone (app teardown); the
-        // record then stays queued harmlessly.
-        let _ = self.job_tx.send(job);
+    /// Enqueues a job at `priority`; the track's record should already
+    /// show `Queued`.
+    ///
+    /// A duplicate hash collapses onto the already-staged job — urgency
+    /// escalates to the more urgent tier and `force` merges in, with one
+    /// execution per hash. A late enqueue after close is a silent no-op
+    /// (records stay queued harmlessly), matching the old failed-send
+    /// behavior.
+    pub fn enqueue(&self, job: QueueJob, priority: Priority) {
+        let mut slots = self.shared.slots.lock();
+        if slots.closed {
+            return;
+        }
+        if slots.offer(job, priority) {
+            self.shared.space.notify_one();
+        }
     }
 }
 
-/// The worker loop: one job at a time, FIFO, until the channel closes.
-fn worker_loop(services: Services, job_rx: Receiver<QueueJob>, events: Sender<Event>) {
-    while let Ok(job) = job_rx.recv() {
+impl Drop for AnalysisQueue {
+    fn drop(&mut self) {
+        // Only this handle can set `closed`; the worker clone never does.
+        let mut slots = self.shared.slots.lock();
+        slots.closed = true;
+        self.shared.space.notify_all();
+    }
+}
+
+/// The worker loop: one job at a time, most urgent tier first, FIFO
+/// within a tier, until closed with an empty backlog.
+fn worker_loop(services: Services, shared: Arc<Shared>, events: Sender<Event>) {
+    while let Some(job) = {
+        let mut slots = shared.slots.lock();
+        loop {
+            if let Some(job) = slots.pop_top() {
+                break Some(job);
+            }
+            if slots.closed {
+                break None;
+            }
+            shared.space.wait(&mut slots);
+        }
+    } {
         run_job(&services, &job, &events);
     }
 }
@@ -345,11 +493,14 @@ pub(crate) mod tests {
         });
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
-        queue.enqueue(QueueJob {
-            hash: hash.clone(),
-            path,
-            force: false,
-        });
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path,
+                force: false,
+            },
+            Priority::Playlist,
+        );
 
         let events = drain_terminal(&bus, &hash);
         assert!(
@@ -422,11 +573,14 @@ pub(crate) mod tests {
         });
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
-        queue.enqueue(QueueJob {
-            hash: hash.clone(),
-            path,
-            force: false,
-        });
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path,
+                force: false,
+            },
+            Priority::Playlist,
+        );
 
         let events = drain_terminal(&bus, &hash);
         assert!(
@@ -458,11 +612,14 @@ pub(crate) mod tests {
         let hash = TrackHash("missing".to_owned());
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services, bus.sender());
-        queue.enqueue(QueueJob {
-            hash: hash.clone(),
-            path: std::path::PathBuf::from("/nonexistent/nope.wav"),
-            force: false,
-        });
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path: std::path::PathBuf::from("/nonexistent/nope.wav"),
+                force: false,
+            },
+            Priority::Playlist,
+        );
 
         let events = drain_terminal(&bus, &hash);
         assert!(
@@ -490,11 +647,14 @@ pub(crate) mod tests {
             bytes[last] = u8::try_from(i).expect("i fits");
             std::fs::write(&path, &bytes).expect("write wav");
             let hash = TrackHash(identity::hex_sha256(&bytes));
-            queue.enqueue(QueueJob {
-                hash,
-                path,
-                force: false,
-            });
+            queue.enqueue(
+                QueueJob {
+                    hash,
+                    path,
+                    force: false,
+                },
+                Priority::Playlist,
+            );
         }
 
         // Two terminal events arrive eventually (both analyze; order kept).
@@ -529,11 +689,14 @@ pub(crate) mod tests {
             bytes[last] = u8::try_from(i).expect("i fits");
             std::fs::write(&path, &bytes).expect("write wav");
             let hash = TrackHash(identity::hex_sha256(&bytes));
-            queue.enqueue(QueueJob {
-                hash,
-                path,
-                force: false,
-            });
+            queue.enqueue(
+                QueueJob {
+                    hash,
+                    path,
+                    force: false,
+                },
+                Priority::Playlist,
+            );
         }
         let rx = bus.receiver_for_test();
         let mut done = 0;
@@ -563,11 +726,14 @@ pub(crate) mod tests {
         // First (non-forced) job analyzes and persists.
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
-        queue.enqueue(QueueJob {
-            hash: hash.clone(),
-            path: path.clone(),
-            force: false,
-        });
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path: path.clone(),
+                force: false,
+            },
+            Priority::Playlist,
+        );
         drain_terminal(&bus, &hash);
 
         // A user in-cue persists for this hash.
@@ -580,11 +746,14 @@ pub(crate) mod tests {
         // Forced job: delete-before-read, fresh analysis.
         let bus = EventBus::without_repaint();
         let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
-        queue.enqueue(QueueJob {
-            hash: hash.clone(),
-            path,
-            force: true,
-        });
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path,
+                force: true,
+            },
+            Priority::Force,
+        );
         let events = drain_terminal(&bus, &hash);
         assert!(
             events
@@ -607,5 +776,189 @@ pub(crate) mod tests {
             .block_on(async { services.cue_store.get(&hash).await })
             .expect("cue lookup");
         assert_eq!(preserved.get(CueKind::In, 0), Some(44_100));
+    }
+
+    fn slot_job(hash: &str) -> QueueJob {
+        QueueJob {
+            hash: TrackHash(hash.to_owned()),
+            path: PathBuf::from(format!("/{hash}.wav")),
+            force: false,
+        }
+    }
+
+    /// Drains the ordering core deterministically: pop order until empty.
+    fn drain_order(slots: &mut Slots) -> Vec<String> {
+        let mut order = Vec::new();
+        while let Some(job) = slots.pop_top() {
+            order.push(job.hash.0);
+        }
+        order
+    }
+
+    // Given a Library-tier backlog staged first and a Playlist job after.
+    // When the queue drains.
+    // Then the playlist job dequeues before every pending library job.
+    #[test]
+    fn prio_pop_orders_playlist_over_library_backlog() {
+        let mut slots = Slots::default();
+        for i in 0..3 {
+            slots.offer(slot_job(&format!("lib{i}")), Priority::Library);
+        }
+        slots.offer(slot_job("urgent"), Priority::Playlist);
+
+        let order = drain_order(&mut slots);
+
+        assert_eq!(
+            order.first().map(String::as_str),
+            Some("urgent"),
+            "playlist tier jumps the library backlog"
+        );
+        assert_eq!(order[1..], ["lib0", "lib1", "lib2"]);
+    }
+
+    // Given same-tier jobs staged in a known arrival order.
+    // When the queue drains.
+    // Then arrival sequence is preserved (FIFO within the tier).
+    #[test]
+    fn equal_priority_preserves_fifo_arrival() {
+        let mut slots = Slots::default();
+        for name in ["first", "second", "third"] {
+            slots.offer(slot_job(name), Priority::Playlist);
+        }
+
+        let order = drain_order(&mut slots);
+
+        assert_eq!(order, ["first", "second", "third"]);
+    }
+
+    // Given a hash staged at Library priority and re-enqueued at
+    // Playlist priority (plus an unrelated fresh job between).
+    // When the queue drains.
+    // Then exactly one execution happens, positioned with the playlist
+    // jobs ahead of remaining library work.
+    #[test]
+    fn duplicate_enqueue_escalates_priority_once() {
+        let mut slots = Slots::default();
+        for i in 0..2 {
+            slots.offer(slot_job(&format!("lib{i}")), Priority::Library);
+        }
+        slots.offer(slot_job("twin"), Priority::Library);
+        slots.offer(slot_job("other"), Priority::Playlist);
+        let woken = slots.offer(slot_job("twin"), Priority::Playlist);
+        assert!(!woken, "duplicate must not wake the worker");
+
+        let order = drain_order(&mut slots);
+
+        let executions = order.iter().filter(|h| *h == "twin").count();
+        assert_eq!(executions, 1, "one execution per hash");
+        let twin_index = order.iter().position(|h| h == "twin").expect("ran");
+        let lib1_index = order.iter().position(|h| h == "lib1").expect("runs");
+        assert!(
+            twin_index < lib1_index,
+            "escalated twin runs before leftover library work: {order:?}"
+        );
+    }
+
+    // Given a queued non-forced duplicate arriving for a staged forced
+    // re-analyze job.
+    // When both merge onto one entry.
+    // Then the merged job keeps force semantics and deletes + re-analyzes.
+    #[test]
+    fn force_merge_keeps_reanalyze_semantics() {
+        let services = fake_services(output_fixture());
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("merged.wav");
+        let bytes = wav_bytes(2.0);
+        std::fs::write(&path, &bytes).expect("write wav");
+        let hash = TrackHash(identity::hex_sha256(&bytes));
+
+        // First pass persists grid + key so a fast path exists.
+        let bus = EventBus::without_repaint();
+        let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path: path.clone(),
+                force: false,
+            },
+            Priority::Playlist,
+        );
+        drain_terminal(&bus, &hash);
+        let stored_before = services
+            .runtime
+            .block_on(async { services.grid_store.get(&hash).await })
+            .expect("lookup")
+            .expect("grid persisted by first pass");
+
+        // Merge test: forced job stages while a plain Library-priority
+        // twin is already pending — one merged execution total.
+        let merged_slots = {
+            let mut slots = Slots::default();
+            slots.offer(
+                QueueJob {
+                    hash: hash.clone(),
+                    path: path.clone(),
+                    force: false,
+                },
+                Priority::Library,
+            );
+            slots.offer(
+                QueueJob {
+                    hash: hash.clone(),
+                    path: path.clone(),
+                    force: true,
+                },
+                Priority::Force,
+            );
+            slots
+        };
+        let drained = drain_order(&mut { merged_slots });
+        assert_eq!(drained.len(), 1, "single merged execution");
+
+        // The real worker with the merged shape deletes the stored grid
+        // first and analyzes fresh — exercised end to end via Force.
+        let bus = EventBus::without_repaint();
+        let queue = AnalysisQueue::spawn(services.clone(), bus.sender());
+        queue.enqueue(
+            QueueJob {
+                hash: hash.clone(),
+                path,
+                force: true,
+            },
+            Priority::Force,
+        );
+        let events = drain_terminal(&bus, &hash);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AnalysisStarted { .. })),
+            "forced merge re-runs analysis"
+        );
+        let stored_after = services
+            .runtime
+            .block_on(async { services.grid_store.get(&hash).await })
+            .expect("lookup")
+            .expect("fresh grid persisted");
+        assert!(stored_after.updated_at >= stored_before.updated_at);
+        assert!(
+            stored_after.key.is_some(),
+            "fast path cannot serve a forced job"
+        );
+    }
+
+    // Given two handles on one queue and the first handle dropped
+    // (closing it).
+    // When a job arrives through the stale surviving clone.
+    // Then the enqueue is accepted silently as a no-op — records stay
+    // queued harmlessly, nothing panics (the app-teardown contract).
+    #[test]
+    fn late_enqueue_after_close_is_silent_noop() {
+        let services = fake_services(output_fixture());
+        let bus = EventBus::without_repaint();
+        let queue = AnalysisQueue::spawn(services, bus.sender());
+        let stale_clone = queue.clone();
+        drop(queue);
+
+        stale_clone.enqueue(slot_job("late"), Priority::Library);
     }
 }

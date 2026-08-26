@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use crate::library::filter::{self, FilterTerm};
 use crate::library::store::{LibraryEntry, LibraryRoot};
 use crate::library::{LibraryState, ScanProgress};
+use crate::tracks::AnalysisState;
 use automixah_engine::timeline::types::TrackHash;
 
 /// User intents emitted by the library columns.
@@ -102,6 +103,7 @@ fn root_rows(ui: &mut egui::Ui, state: &LibraryState, actions: &mut LibraryActio
 pub fn entries_column(
     ui: &mut egui::Ui,
     state: &LibraryState,
+    tracks: Option<&crate::tracks::Tracks>,
     filter_buffer: &mut String,
     selected_hashes: Option<&[TrackHash]>,
     actions: &mut LibraryActions,
@@ -122,16 +124,23 @@ pub fn entries_column(
     egui::ScrollArea::vertical().show_rows(ui, row_height(ui), visible.len(), |ui, range| {
         for index in range {
             let entry = &state.entries[visible[index]];
-            entry_row(ui, entry, &terms, selected_hashes, actions);
+            // The track database join is optional purely for tests;
+            // `None` renders the un-analyzed default glyph.
+            let analysis = tracks
+                .and_then(|db| db.get(&entry.hash))
+                .map(|r| &r.analysis);
+            entry_row(ui, entry, analysis, &terms, selected_hashes, actions);
         }
     });
 }
 
 /// One library entry row: dim when its hash is in the selected
-/// playlist; double-click adds.
+/// playlist; double-click adds. The glyph column derives from the
+/// record's analysis state — the same vocabulary as playlist rows.
 fn entry_row(
     ui: &mut egui::Ui,
     entry: &LibraryEntry,
+    analysis: Option<&AnalysisState>,
     terms: &[FilterTerm],
     selected_hashes: Option<&[TrackHash]>,
     actions: &mut LibraryActions,
@@ -150,7 +159,7 @@ fn entry_row(
         base_color(ui)
     };
     painter.rect_filled(rect.shrink(1.0), 2.0, bg);
-    paint_entry(ui, &painter, rect, entry, terms, duplicate);
+    paint_entry(ui, &painter, rect, entry, analysis, terms, duplicate);
     if let Some(action) = add_action_for_row(&entry.hash, response.double_clicked()) {
         actions.actions.push(action);
     }
@@ -196,13 +205,16 @@ fn row_height(ui: &egui::Ui) -> f32 {
     ui.text_style_height(&egui::TextStyle::Body) * 1.4
 }
 
-/// Paints artist – title · duration · rel-dir, with each field's own
-/// match highlights (artist/title in the main text, path in the dir).
+/// Paints status glyph, artist – title · duration · rel-dir, with each
+/// field's own match highlights (artist/title in the main text, path in
+/// the dir). The glyph derives from the record's analysis state — the
+/// same visual language as playlist rows.
 fn paint_entry(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     rect: egui::Rect,
     entry: &LibraryEntry,
+    analysis: Option<&AnalysisState>,
     terms: &[FilterTerm],
     duplicate: bool,
 ) {
@@ -212,6 +224,33 @@ fn paint_entry(
     let highlight = egui::Color32::from_rgb(255, 210, 60);
     let main_color = if duplicate { weak } else { strong };
     let center_y = rect.center().y;
+    let mut left = rect.left() + 8.0;
+
+    // Status glyph slot — 🕓 pending (the default), an animated spinner
+    // at the same slot while analyzing.
+    let state = analysis.cloned().unwrap_or(AnalysisState::Queued);
+    let analyzing = matches!(state, AnalysisState::Analyzing);
+    let (glyph, color) = analysis_glyph(state, strong, weak);
+    let icon_size = ui.text_style_height(&egui::TextStyle::Body).min(16.0);
+    if analyzing {
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(left + icon_size / 2.0, center_y),
+            egui::vec2(icon_size, icon_size),
+        );
+        egui::Spinner::new().color(weak).paint_at(ui, icon_rect);
+        left += icon_size + 6.0;
+    } else {
+        let g = highlighted_galley(ui, glyph, &font_id, color, highlight, HashSet::new());
+        painter.galley(
+            egui::pos2(left, center_y - g.size().y / 2.0),
+            g.clone(),
+            color,
+        );
+        left += g.size().x + 6.0;
+    }
+
+    // Main text: artist – title (or filename fallback); the artist's
+    // indices address it directly, the title's shift past "artist – ".
     let spans = filter::spans(entry, terms);
 
     // Main text: artist – title (or filename fallback); the artist's
@@ -242,7 +281,7 @@ fn paint_entry(
     );
     let size = main_galley.size();
     painter.galley(
-        egui::pos2(rect.left() + 8.0, center_y - size.y / 2.0),
+        egui::pos2(left, center_y - size.y / 2.0),
         main_galley,
         main_color,
     );
@@ -330,6 +369,22 @@ fn sort_key(entry: &LibraryEntry) -> (u8, String, String, String) {
 #[must_use]
 pub fn has_root(roots: &[LibraryRoot], id: i64) -> bool {
     roots.iter().any(|root| root.id == id)
+}
+
+/// The status-glyph vocabulary shared with playlist rows: blank (ready),
+/// 🕓 pending, ⭕ while analyzing, red ! failed.
+#[must_use]
+fn analysis_glyph(
+    state: AnalysisState,
+    strong: egui::Color32,
+    weak: egui::Color32,
+) -> (&'static str, egui::Color32) {
+    match state {
+        AnalysisState::Ready(_) => (" ", strong),
+        AnalysisState::Queued => ("🕓", weak),
+        AnalysisState::Analyzing => ("⭕", weak),
+        AnalysisState::Failed(_) => ("!", egui::Color32::RED),
+    }
 }
 
 #[cfg(test)]

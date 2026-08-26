@@ -52,9 +52,11 @@ impl LibraryState {
     /// scan flags are idempotent.
     pub fn apply(&mut self, event: &Event) {
         match event {
-            Event::LibraryLoaded { roots, entries } => {
+            Event::LibraryLoaded { roots, entries, .. } => {
                 self.roots = roots.clone();
                 self.entries = entries.clone();
+                // The `analyzed` set belongs to the enqueue derivation
+                // (app layer), not to display state.
             }
             Event::LibraryRootAdded(root) => {
                 if !self.roots.iter().any(|known| known.id == root.id) {
@@ -131,6 +133,7 @@ mod tests {
         state.apply(&Event::LibraryLoaded {
             roots: vec![root(2, "/new")],
             entries: vec![entry(2, "new.flac")],
+            analyzed: std::collections::HashSet::new(),
         });
 
         assert_eq!(state.roots, vec![root(2, "/new")]);

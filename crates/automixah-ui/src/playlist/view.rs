@@ -140,6 +140,7 @@ fn four_columns(
             crate::library::view::entries_column(
                 ui,
                 library,
+                Some(tracks),
                 library_filter,
                 selected_hashes.as_deref(),
                 &mut actions.library,

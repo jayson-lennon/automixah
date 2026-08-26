@@ -5,6 +5,7 @@
 //! The trait exists so tests (and any future consumer) can run against an
 //! in-memory backend instead of a file.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -75,6 +76,16 @@ pub trait GridStore: Send + Sync {
     /// Returns an error if the delete fails.
     async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>>;
 
+    /// Lists the hashes of every stored override that includes a musical
+    /// key — i.e. what the analysis fast path would resolve without a
+    /// decode. Returned as hex strings to keep the pool mapping cheap;
+    /// convert at the consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing fails.
+    async fn analyzed_hashes(&self) -> Result<HashSet<String>, Report<GridStoreError>>;
+
     /// Backend name for debugging.
     fn name(&self) -> &'static str;
 }
@@ -134,6 +145,16 @@ impl GridStoreService {
     /// Returns an error if the delete fails.
     pub async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
         self.backend.delete(hash).await
+    }
+
+    /// Lists the hashes of every stored override that includes a musical
+    /// key (the analysis fast-path population).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend listing fails.
+    pub async fn analyzed_hashes(&self) -> Result<HashSet<String>, Report<GridStoreError>> {
+        self.backend.analyzed_hashes().await
     }
 
     /// Backend name for debugging.
@@ -296,6 +317,10 @@ impl GridStore for CountingStore {
 
     async fn delete(&self, hash: &TrackHash) -> Result<(), Report<GridStoreError>> {
         self.backend.delete(hash).await
+    }
+
+    async fn analyzed_hashes(&self) -> Result<HashSet<String>, Report<GridStoreError>> {
+        self.backend.analyzed_hashes().await
     }
 
     fn name(&self) -> &'static str {

@@ -4,6 +4,7 @@
 //! once at startup through [`super::run_migrations`]. The schema lives in
 //! the `automixah-schema` leaf crate.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -332,6 +333,22 @@ impl GridStore for SqliteGridStore {
         Ok(())
     }
 
+    async fn analyzed_hashes(&self) -> Result<HashSet<String>, Report<GridStoreError>> {
+        // A row without `key_root` predates key analysis: the fast path
+        // cannot serve it (the completeness contract requires the key),
+        // so it must not suppress backfill enrollment.
+        let rows: Vec<String> = self
+            .pool
+            .query_all(
+                "SELECT track_hash FROM beat_grids WHERE key_root IS NOT NULL",
+                vec![],
+            )
+            .await
+            .change_context(GridStoreError)
+            .attach("failed to list analyzed hashes")?;
+        Ok(rows.into_iter().collect())
+    }
+
     fn name(&self) -> &'static str {
         "sqlite"
     }
@@ -604,6 +621,78 @@ mod tests {
             .expect("row");
         assert_eq!(reloaded.grid_bpm, 140.0, "grid values replaced");
         assert_eq!(reloaded.key, analyzed.key, "key preserved through edit");
+    }
+
+    // Given a store holding an analyzed grid and a manual (keyless) grid.
+    // When the analyzed-hash set is listed.
+    // Then only hashes with a stored key appear.
+    #[tokio::test]
+    async fn sqlite_analyzed_hashes_requires_key_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let analyzed = TrackHash("analyzed".to_owned());
+        let manual = TrackHash("manual".to_owned());
+
+        <SqliteGridStore as GridStore>::put(&store, &analyzed, &grid_override())
+            .await
+            .expect("save analyzed");
+        <SqliteGridStore as GridStore>::put(
+            &store,
+            &manual,
+            &GridOverride {
+                key: None,
+                ..grid_override()
+            },
+        )
+        .await
+        .expect("save keyless");
+
+        let listed = <SqliteGridStore as GridStore>::analyzed_hashes(&store)
+            .await
+            .expect("list");
+
+        assert!(listed.contains("analyzed"), "keyed grid counts as analyzed");
+        assert!(
+            !listed.contains("manual"),
+            "manual grid saved with key: None must not count"
+        );
+    }
+
+    // Given a saved grid with key.
+    // When the same hash is re-saved with key: None.
+    // Then the analyzed listing still contains the hash (COALESCE keeps
+    // the key), matching the fast-path read semantics.
+    #[tokio::test]
+    async fn sqlite_analyzed_hashes_survives_keyless_upsert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+            .await
+            .expect("open store");
+        let hash = TrackHash("coalesce".to_owned());
+
+        <SqliteGridStore as GridStore>::put(&store, &hash, &grid_override())
+            .await
+            .expect("save keyed");
+        <SqliteGridStore as GridStore>::put(
+            &store,
+            &hash,
+            &GridOverride {
+                key: None,
+                ..grid_override()
+            },
+        )
+        .await
+        .expect("re-save without key");
+
+        let listed = <SqliteGridStore as GridStore>::analyzed_hashes(&store)
+            .await
+            .expect("list");
+        assert!(
+            listed.contains("coalesce"),
+            "COALESCE preserved the key so the hash stays analyzed"
+        );
     }
 
     // Given an empty library.

@@ -314,7 +314,7 @@ impl AutomixahUiApp {
 
     /// Drains the bus under the frame budget, applying each event.
     fn drain_bus(&mut self) {
-        let mut pending_enqueue: Vec<crate::playlist::queue::QueueJob> = Vec::new();
+        let mut pending_enqueue: Vec<(crate::playlist::queue::QueueJob, EnqueueTier)> = Vec::new();
         let mut derive = |event: &Event, tracks: &mut crate::tracks::Tracks| {
             // Derive worker jobs at apply time: hashes arriving without
             // analysis knowledge get analysis jobs immediately.
@@ -326,11 +326,29 @@ impl AutomixahUiApp {
                         tracks.upsert(record.clone());
                     }
                     for hash in hashes {
-                        enqueue_if_needed(tracks, hash, &mut pending_enqueue);
+                        enqueue_if_needed(
+                            tracks,
+                            hash,
+                            EnqueueTier::Playlist,
+                            &mut pending_enqueue,
+                        );
                     }
                 }
                 Event::RowAdded { hash, .. } | Event::TagsResolved { hash, .. } => {
-                    enqueue_if_needed(tracks, hash, &mut pending_enqueue);
+                    enqueue_if_needed(tracks, hash, EnqueueTier::Playlist, &mut pending_enqueue);
+                }
+                Event::LibraryLoaded {
+                    roots,
+                    entries,
+                    analyzed,
+                } => {
+                    enqueue_library_backfill(
+                        tracks,
+                        roots,
+                        entries,
+                        analyzed,
+                        &mut pending_enqueue,
+                    );
                 }
                 _ => {}
             }
@@ -341,8 +359,8 @@ impl AutomixahUiApp {
             derive(&event, &mut self.tracks);
             self.apply(event);
         }
-        for job in pending_enqueue {
-            self.playlist_queue.enqueue(job);
+        for (job, tier) in pending_enqueue {
+            self.playlist_queue.enqueue(job, tier.priority());
         }
     }
 
@@ -889,12 +907,14 @@ impl AutomixahUiApp {
         // shows the no-track placeholder); nothing loads into the deck
         // until the user clicks a playlist row.
         let path = deck.path.clone();
-        self.playlist_queue
-            .enqueue(crate::playlist::queue::QueueJob {
+        self.playlist_queue.enqueue(
+            crate::playlist::queue::QueueJob {
                 hash,
                 path,
                 force: true,
-            });
+            },
+            crate::playlist::queue::Priority::Force,
+        );
     }
 
     /// Splices rows locally and queues exactly one serialized persistence
@@ -943,13 +963,33 @@ impl AutomixahUiApp {
     }
 }
 
+/// How urgently a derived job wants the worker. Maps 1:1 onto the
+/// queue's [`crate::playlist::queue::Priority`]; the distinct type keeps
+/// derivation code from naming queue internals.
+enum EnqueueTier {
+    /// User-visible playlist flow (adds, tag hydration, loads).
+    Playlist,
+    /// Library-refresh backfill: pure prefetch behind all user work.
+    Library,
+}
+
+impl EnqueueTier {
+    fn priority(self) -> crate::playlist::queue::Priority {
+        match self {
+            Self::Playlist => crate::playlist::queue::Priority::Playlist,
+            Self::Library => crate::playlist::queue::Priority::Library,
+        }
+    }
+}
+
 /// Enqueues an analysis job for `hash` when the database holds no
 /// analysis knowledge (hash dedup: `Ready`/in-flight/`Failed` all
 /// suppress).
 fn enqueue_if_needed(
     tracks: &mut crate::tracks::Tracks,
     hash: &TrackHash,
-    pending: &mut Vec<crate::playlist::queue::QueueJob>,
+    tier: EnqueueTier,
+    pending: &mut Vec<(crate::playlist::queue::QueueJob, EnqueueTier)>,
 ) {
     if !tracks.needs_job(hash) {
         return;
@@ -960,12 +1000,74 @@ fn enqueue_if_needed(
     if let Some(path) = tracks.path_of(hash).cloned()
         && !path.as_os_str().is_empty()
     {
-        pending.push(crate::playlist::queue::QueueJob {
-            hash: hash.clone(),
-            path,
-            force: false,
-        });
+        pending.push((
+            crate::playlist::queue::QueueJob {
+                hash: hash.clone(),
+                path,
+                force: false,
+            },
+            tier,
+        ));
     }
+}
+
+/// Derives background analysis jobs for one library refresh: every
+/// indexed hash without a stored analysis is enrolled once, at
+/// [`EnqueueTier::Library`] priority behind all user work.
+///
+/// The `analyzed` set (grid + key stored — the fast-path population)
+/// suppresses enrollment up front, so hashes with a persisted analysis
+/// never even stage a no-op job. The library entry carries real display
+/// facts, so a placeholder record seeded before enrollment renders
+/// artist/title immediately instead of waiting for tags via some playlist.
+/// Duplicate content across roots collapses to one job; first root wins.
+fn enqueue_library_backfill(
+    tracks: &mut crate::tracks::Tracks,
+    roots: &[crate::library::store::LibraryRoot],
+    entries: &[crate::library::store::LibraryEntry],
+    analyzed: &std::collections::HashSet<TrackHash>,
+    pending: &mut Vec<(crate::playlist::queue::QueueJob, EnqueueTier)>,
+) {
+    let paths = root_paths(roots);
+    let mut enrolled = std::collections::HashSet::new();
+    for entry in entries {
+        // Already analyzed anywhere: no job exists at all.
+        if analyzed.contains(&entry.hash) || !enrolled.insert(entry.hash.clone()) {
+            continue;
+        }
+        seed_placeholder(tracks, entry, &paths);
+        enqueue_if_needed(tracks, &entry.hash, EnqueueTier::Library, pending);
+    }
+}
+
+/// Root id → canonical absolute path, for joining entry locations.
+fn root_paths(roots: &[crate::library::store::LibraryRoot]) -> HashMap<i64, std::path::PathBuf> {
+    roots
+        .iter()
+        .map(|root| (root.id, root.path.clone()))
+        .collect()
+}
+
+/// Seeds the track database with what the index knows about an entry so
+/// rows show artist/title/path before any analysis lands.
+fn seed_placeholder(
+    tracks: &mut crate::tracks::Tracks,
+    entry: &crate::library::store::LibraryEntry,
+    paths: &HashMap<i64, std::path::PathBuf>,
+) {
+    let Some(root_path) = paths.get(&entry.root_id) else {
+        return;
+    };
+    let record = TrackRecord {
+        hash: entry.hash.clone(),
+        tags: crate::tracks::TrackTags {
+            title: entry.title.clone(),
+            artist: entry.artist.clone(),
+            path: root_path.join(&entry.rel_path),
+        },
+        analysis: AnalysisState::Queued,
+    };
+    tracks.upsert(record);
 }
 
 /// Imports one M3U file after creating its uniquely named playlist.
@@ -1925,7 +2027,12 @@ mod tests {
         });
         let mut pending = Vec::new();
 
-        enqueue_if_needed(&mut tracks, &TrackHash("known".to_owned()), &mut pending);
+        enqueue_if_needed(
+            &mut tracks,
+            &TrackHash("known".to_owned()),
+            EnqueueTier::Playlist,
+            &mut pending,
+        );
 
         assert!(pending.is_empty(), "ready hash enqueues nothing");
     }
@@ -1939,7 +2046,12 @@ mod tests {
         let mut tracks = crate::tracks::Tracks::default();
         let mut pending = Vec::new();
 
-        enqueue_if_needed(&mut tracks, &TrackHash("fresh".to_owned()), &mut pending);
+        enqueue_if_needed(
+            &mut tracks,
+            &TrackHash("fresh".to_owned()),
+            EnqueueTier::Playlist,
+            &mut pending,
+        );
 
         assert!(pending.is_empty(), "no path known — job withheld");
         assert!(
@@ -2393,5 +2505,233 @@ mod render_tests {
         assert!(first, "first event sends");
         assert!(!repeat, "same class inside the interval is suppressed");
         assert!(class_change, "stage-class change sends immediately");
+    }
+
+    fn lib_root(id: i64, path: &str) -> crate::library::store::LibraryRoot {
+        crate::library::store::LibraryRoot {
+            id,
+            path: std::path::PathBuf::from(path),
+        }
+    }
+
+    fn lib_entry(
+        root_id: i64,
+        rel: &str,
+        title: &str,
+        hash: &str,
+    ) -> crate::library::store::LibraryEntry {
+        crate::library::store::LibraryEntry {
+            root_id,
+            rel_path: std::path::PathBuf::from(rel),
+            hash: TrackHash(hash.to_owned()),
+            title: title.to_owned(),
+            artist: "Artist".to_owned(),
+            duration: Some(61.0),
+            mtime_secs: 0,
+            size_bytes: 0,
+        }
+    }
+
+    // Given a refresh whose index holds one analyzed hash and one
+    // un-analyzed hash (both under a known root).
+    // When the backfill derivation runs.
+    // Then only the un-analyzed hash is enrolled, with the absolute
+    // path joined from its root.
+    #[test]
+    fn refresh_derivation_enrolls_only_missing_hashes() {
+        let mut tracks = crate::tracks::Tracks::default();
+        let mut pending = Vec::new();
+        let roots = vec![lib_root(1, "/music")];
+        let entries = vec![
+            lib_entry(1, "a.flac", "Analyzed", "analyzed-hash"),
+            lib_entry(1, "b.flac", "Missing", "missing-hash"),
+        ];
+        let analyzed = [TrackHash("analyzed-hash".to_owned())].into();
+
+        enqueue_library_backfill(&mut tracks, &roots, &entries, &analyzed, &mut pending);
+
+        assert_eq!(pending.len(), 1, "only the un-analyzed hash enrolls");
+        assert_eq!(pending[0].0.hash.0, "missing-hash");
+        assert_eq!(
+            pending[0].0.path,
+            std::path::PathBuf::from("/music/b.flac"),
+            "absolute path joined from root"
+        );
+        assert!(!pending[0].0.force, "backfill never forces");
+    }
+
+    // Given an index with the same content at two locations.
+    // When the backfill derivation runs.
+    // Then one job is enqueued for the first occurrence only.
+    #[test]
+    fn duplicate_hash_across_roots_enrolls_once() {
+        let mut tracks = crate::tracks::Tracks::default();
+        let mut pending = Vec::new();
+        let roots = vec![lib_root(1, "/music-one"), lib_root(2, "/music-two")];
+        let entries = vec![
+            lib_entry(1, "a.flac", "T", "dup"),
+            lib_entry(2, "b.flac", "T", "dup"),
+        ];
+        let analyzed = std::collections::HashSet::new();
+
+        enqueue_library_backfill(&mut tracks, &roots, &entries, &analyzed, &mut pending);
+
+        assert_eq!(pending.len(), 1, "same content enrolls once");
+        assert_eq!(
+            pending[0].0.path,
+            std::path::PathBuf::from("/music-one/a.flac"),
+            "first root wins"
+        );
+    }
+
+    // Given a refresh over unknown hashes.
+    // When the derivation seeds placeholder records.
+    // Then each record carries the entry's artist/title/path so rows
+    // render real display facts before analysis completes.
+    #[test]
+    fn refresh_seeds_tags_for_placeholder_records() {
+        let mut tracks = crate::tracks::Tracks::default();
+        let mut pending = Vec::new();
+        let roots = vec![lib_root(1, "/music")];
+        let entries = vec![lib_entry(1, "deep/track.flac", "Nightfall", "seed-me")];
+        let analyzed = std::collections::HashSet::new();
+
+        enqueue_library_backfill(&mut tracks, &roots, &entries, &analyzed, &mut pending);
+
+        let record = tracks
+            .get(&TrackHash("seed-me".to_owned()))
+            .expect("seeded");
+        assert_eq!(record.tags.title, "Nightfall");
+        assert_eq!(record.tags.artist, "Artist");
+        assert_eq!(
+            record.tags.path,
+            std::path::PathBuf::from("/music/deep/track.flac")
+        );
+        assert!(matches!(record.analysis, AnalysisState::Queued));
+    }
+
+    // Given a hash that previously failed analysis in this session.
+    // When a later library refresh runs the derivation again.
+    // Then it is not re-enrolled (no retry storm).
+    #[test]
+    fn failed_state_suppresses_reenrollment_on_next_refresh() {
+        let mut tracks = crate::tracks::Tracks::default();
+        tracks.set_analysis(
+            &TrackHash("doomed".to_owned()),
+            AnalysisState::Failed("corrupt".to_owned()),
+        );
+        let mut pending = Vec::new();
+        let roots = vec![lib_root(1, "/music")];
+        let entries = vec![lib_entry(1, "c.flac", "Doomed", "doomed")];
+        let analyzed = std::collections::HashSet::new();
+
+        enqueue_library_backfill(&mut tracks, &roots, &entries, &analyzed, &mut pending);
+
+        assert!(pending.is_empty(), "failed hash never re-enrolls");
+    }
+
+    // Given a populated index (one analyzed hash pre-stored, one not)
+    // and real WAV files behind the entries.
+    // When a `LibraryLoaded` flows through drain_bus with the analysis
+    // worker running and completion events are drained back.
+    // Then only the un-analyzed hash is enqueued at Library priority,
+    // its record ends Ready, and events never address rows — hashes
+    // throughout.
+    // (Plain sync test: `fake_services` owns the runtime; nesting a
+    // #[tokio::test] runtime would deadlock block_on.)
+    #[test]
+    fn backfill_end_to_end_with_fake_analyzer() {
+        // Given: fake services + real files for decodable content.
+        let services = crate::playlist::queue::tests::fake_services(
+            crate::playlist::queue::tests::output_fixture(),
+        );
+        let dir = tempfile::tempdir().expect("temp");
+        let bytes_a = crate::playlist::queue::tests::wav_bytes(1.0);
+        let mut bytes_b = bytes_a.clone();
+        let last = bytes_b.len() - 1;
+        bytes_b[last] = 7; // distinct content → distinct hash
+        std::fs::write(dir.path().join("a.wav"), &bytes_a).expect("write");
+        std::fs::write(dir.path().join("b.wav"), &bytes_b).expect("write");
+        let hash_a = TrackHash(crate::track::identity::hex_sha256(&bytes_a));
+        let hash_b = TrackHash(crate::track::identity::hex_sha256(&bytes_b));
+
+        // And the store already holds an analysis for hash A.
+        services
+            .runtime
+            .block_on(async {
+                services
+                    .grid_store
+                    .put(
+                        &hash_a,
+                        &crate::store::GridOverride {
+                            grid_bpm: 140.0,
+                            anchor_seconds: 0.0,
+                            downbeat_phase: 0,
+                            updated_at: 1,
+                            key: Some(djcore::key::Key {
+                                root: 0,
+                                mode: djcore::key::KeyMode::Major,
+                            }),
+                        },
+                    )
+                    .await
+            })
+            .expect("seed analyzed grid");
+
+        // And an app wired to that container.
+        let mut app =
+            AutomixahUiApp::new(services.clone(), crate::bus::EventBus::without_repaint());
+
+        // When the refresh event arrives (startup hydration shape).
+        app.bus.send(Event::LibraryLoaded {
+            roots: vec![lib_root(1, dir.path().to_str().expect("utf8"))],
+            entries: vec![
+                lib_entry(1, "a.wav", "Analyzed", &hash_a.0),
+                lib_entry(1, "b.wav", "Backfill", &hash_b.0),
+            ],
+            analyzed: [hash_a.clone()].into(),
+        });
+
+        // Drain derives the jobs and flushes them to the worker.
+        app.drain_bus();
+        assert!(
+            matches!(
+                app.tracks.get(&hash_b).map(|r| &r.analysis),
+                Some(AnalysisState::Queued | AnalysisState::Analyzing)
+            ),
+            "un-analyzed hash enrolls"
+        );
+
+        // The analyzed hash must have enrolled nothing (no record from
+        // this derivation beyond what derivation seeds — here neither:
+        // it was filtered before seeding).
+        assert!(app.tracks.get(&hash_a).is_none(), "analyzed hash skipped");
+
+        // The worker reports by hash; repeated drains play the UI frame
+        // role until the record derives Ready.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !matches!(
+            app.tracks.get(&hash_b).map(|r| &r.analysis),
+            Some(AnalysisState::Ready(_))
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backfill never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.drain_bus();
+        }
+        assert!(matches!(
+            app.tracks.get(&hash_b).map(|r| &r.analysis),
+            Some(AnalysisState::Ready(_))
+        ));
+
+        // And the fresh analysis persists (grid + key on hash B).
+        let stored = services
+            .runtime
+            .block_on(async { services.grid_store.get(&hash_b).await })
+            .expect("lookup")
+            .expect("backfilled grid persisted");
+        assert!(stored.key.is_some());
     }
 }

@@ -58,7 +58,8 @@ Entries are added or amended **only with human approval**.
 - (ui) Grid edits save to the grid library keyed by content hash, with save status surfaced in the UI.
 - (ui) automixah-ui's playlist section (bottom panel) lists playlists and their tracks; rows show BPM, Camelot key colored by harmonic distance to the previous row, and duration.
 - (ui) Track loading enters through the playlist: clicking a ready row loads the track into the grid editor; the Open button is removed.
-- (ui) Playlist analysis runs on a single-worker FIFO queue that decodes, analyzes, persists, and drops PCM; jobs are deduplicated by content hash.
+- (ui) Track analysis runs on a single worker draining a priority queue (user-forced highest, playlist above background library); duplicate arrivals deduplicate by content hash with priority escalation.
+- (ui) Every library-index refresh (startup hydration and completed scans) derives background analysis jobs for indexed hashes lacking a stored analysis, deduplicated to one job per unique hash with paths joined from roots.
 - (ui) All async and threaded work reports back through a single UI event bus; frontend state is mutated only when applying events.
 - (ui) UI repaints are scheduled by event-bus sends with a 50 ms debounce; each frame drains events under a 10 ms budget before rendering.
 - (ui) Playlist contents load on selection: the view clears and shows a spinner until the load event replaces them; contents are ordered content-hash lists and store rowids never reach the frontend.

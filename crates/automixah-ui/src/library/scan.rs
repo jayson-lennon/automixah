@@ -92,7 +92,21 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>) {
 async fn send_loaded(services: &Services, tx: &std::sync::mpsc::Sender<Event>) {
     match load_library(&services.library_store).await {
         Ok((roots, entries)) => {
-            let _ = tx.send(Event::LibraryLoaded { roots, entries });
+            // The analyzed set rides along for backfill enrollment; a
+            // failed listing degrades to an empty set (over-enrollment
+            // self-corrects via re-analysis, a stalled hydration does
+            // not).
+            let analyzed = services
+                .grid_store
+                .analyzed_hashes()
+                .await
+                .map(|hexes| hexes.into_iter().map(TrackHash).collect())
+                .unwrap_or_default();
+            let _ = tx.send(Event::LibraryLoaded {
+                roots,
+                entries,
+                analyzed,
+            });
         }
         Err(message) => {
             let _ = tx.send(Event::LibraryScanFailed { message });

@@ -195,12 +195,17 @@ pub enum Event {
     // Library (startup hydration + scan lifecycle; the scan task is a
     // singleton like the renderer).
     /// The full library (roots + entries), sent at startup and after
-    /// each completed scan.
+    /// each completed scan. Carries the already-analyzed hash set so
+    /// consumers can backfill only what is missing.
     LibraryLoaded {
         /// All library roots.
         roots: Vec<crate::library::store::LibraryRoot>,
         /// All indexed files, `(root_id, rel_path)` order.
         entries: Vec<crate::library::store::LibraryEntry>,
+        /// Hashes with a stored analysis (grid + key); a failed lookup
+        /// degrades to an empty set — over-enrollment self-corrects via
+        /// re-analysis, stalling hydration does not.
+        analyzed: std::collections::HashSet<TrackHash>,
     },
     /// A root was added (a scan follows from the action handler).
     LibraryRootAdded(crate::library::store::LibraryRoot),
@@ -401,7 +406,7 @@ impl std::fmt::Debug for Event {
                 .field("warning", warning)
                 .finish(),
             Self::ImportFailed { message } => f.debug_tuple("ImportFailed").field(message).finish(),
-            Self::LibraryLoaded { roots, entries } => f
+            Self::LibraryLoaded { roots, entries, .. } => f
                 .debug_struct("LibraryLoaded")
                 .field("roots", &roots.len())
                 .field("entries", &entries.len())

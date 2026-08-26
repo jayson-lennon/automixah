@@ -1,6 +1,6 @@
 //! In-memory [`GridStore`] backend for tests and headless consumers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use error_stack::Report;
@@ -83,6 +83,17 @@ impl GridStore for InMemoryGridStore {
         Ok(())
     }
 
+    async fn analyzed_hashes(&self) -> Result<HashSet<String>, Report<GridStoreError>> {
+        let grids = self.grids.lock();
+        // "Analyzed" mirrors the fast-path completeness contract:
+        // a stored grid WITH a musical key.
+        Ok(grids
+            .iter()
+            .filter(|(_, grid)| grid.key.is_some())
+            .map(|(hash, _)| hash.clone())
+            .collect())
+    }
+
     fn name(&self) -> &'static str {
         "in-memory"
     }
@@ -155,6 +166,45 @@ async fn missing_hash_is_none_not_error() {
     let result = store.get(&hash).await;
     let value = result.expect("lookup succeeds");
     assert!(value.is_none());
+}
+
+/// Given a store holding a keyed grid and a keyless (legacy) grid.
+/// When the analyzed-hash set is listed.
+/// Then only the keyed hash appears.
+#[tokio::test]
+async fn analyzed_hashes_list_only_keyed_grids() {
+    use super::GridStore as _;
+
+    let store = InMemoryGridStore::new();
+    let analyzed = TrackHash("analyzed".to_owned());
+    let legacy = TrackHash("legacy".to_owned());
+    let keyed = GridOverride {
+        grid_bpm: 138.0,
+        anchor_seconds: 0.0,
+        downbeat_phase: 0,
+        updated_at: 1,
+        key: Some(djcore::key::Key {
+            root: 9,
+            mode: djcore::key::KeyMode::Minor,
+        }),
+    };
+    let keyless = GridOverride {
+        key: None,
+        ..keyed.clone()
+    };
+    store.put(&analyzed, &keyed).await.expect("save keyed");
+    store.put(&legacy, &keyless).await.expect("save keyless");
+
+    let listed = store.analyzed_hashes().await.expect("list");
+
+    assert!(
+        listed.contains("analyzed"),
+        "a grid with a key counts as analyzed"
+    );
+    assert!(
+        !listed.contains("legacy"),
+        "a keyless grid predates key analysis and must not count"
+    );
 }
 
 /// Given an in-memory cue store.
