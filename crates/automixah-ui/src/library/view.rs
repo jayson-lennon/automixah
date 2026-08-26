@@ -33,6 +33,11 @@ pub enum LibraryAction {
         /// The entry's content hash.
         hash: TrackHash,
     },
+    /// An entry was middle-clicked (play it in the instant preview player).
+    PreviewTrack {
+        /// The entry's content hash.
+        hash: TrackHash,
+    },
 }
 
 /// Collected intents from one library-columns paint.
@@ -163,6 +168,12 @@ fn entry_row(
     if let Some(action) = add_action_for_row(&entry.hash, response.double_clicked()) {
         actions.actions.push(action);
     }
+    if let Some(action) = preview_action_for_row(
+        &entry.hash,
+        response.clicked_by(egui::PointerButton::Middle),
+    ) {
+        actions.actions.push(action);
+    }
     response.on_hover_text(entry.rel_path.display().to_string());
 }
 
@@ -171,6 +182,13 @@ fn entry_row(
 #[must_use]
 fn add_action_for_row(hash: &TrackHash, double_clicked: bool) -> Option<LibraryAction> {
     double_clicked.then(|| LibraryAction::AddTrack { hash: hash.clone() })
+}
+
+/// Converts one entry-row response into its preview intent: a middle
+/// click previews; all other gestures stay with the existing actions.
+#[must_use]
+fn preview_action_for_row(hash: &TrackHash, middle_clicked: bool) -> Option<LibraryAction> {
+    middle_clicked.then_some(LibraryAction::PreviewTrack { hash: hash.clone() })
 }
 
 /// Row background tones.
@@ -465,6 +483,60 @@ mod tests {
     #[test]
     fn single_click_emits_no_intent() {
         assert_eq!(add_action_for_row(&TrackHash("h1".to_owned()), false), None);
+    }
+
+    // Given an entry row's response.
+    // When the gesture was a middle click.
+    // Then a PreviewTrack intent for its hash is emitted.
+    #[test]
+    fn middle_click_emits_preview_track() {
+        let hash = TrackHash("h2".to_owned());
+
+        let action = preview_action_for_row(&hash, true);
+
+        assert_eq!(action, Some(LibraryAction::PreviewTrack { hash }));
+    }
+
+    // Given an entry row's response.
+    // When the gesture was not a middle click.
+    // Then no preview intent is emitted.
+    #[test]
+    fn non_middle_click_emits_no_preview_track() {
+        let hash = TrackHash("h2".to_owned());
+
+        let action = preview_action_for_row(&hash, false);
+
+        assert_eq!(action, None);
+    }
+
+    // Given a double-click that must keep adding (regression guard).
+    // When both gesture classifiers run on the same responses.
+    // Then the double click yields AddTrack and yields no PreviewTrack —
+    // middle click would yield exactly the reverse, never both add and
+    // preview from one classifier.
+    #[rstest::rstest]
+    #[case(true, false)]
+    #[case(false, true)]
+    fn double_click_still_adds_and_never_previews(
+        #[case] double_clicked: bool,
+        #[case] middle_clicked: bool,
+    ) {
+        let hash = TrackHash("h3".to_owned());
+
+        let add = add_action_for_row(&hash, double_clicked);
+        let preview = preview_action_for_row(&hash, middle_clicked);
+
+        match (double_clicked, middle_clicked) {
+            (true, false) => {
+                assert!(matches!(add, Some(LibraryAction::AddTrack { .. })));
+                assert!(preview.is_none());
+            }
+            (false, true) => {
+                assert!(add.is_none());
+                assert!(matches!(preview, Some(LibraryAction::PreviewTrack { .. })));
+            }
+            _ => {}
+        }
     }
 
     // Given an entry whose hash is in the selected playlist.

@@ -57,7 +57,7 @@ Entries are added or amended **only with human approval**.
 - (ui) Track loading runs off the UI thread (hash → decode → analyze) with progress stages surfaced in the UI; the re-analyze button drops the record's analysis, deletes the stored grid before reloading, and playlist rows reflect the re-analysis automatically.
 - (ui) Grid edits save to the grid library keyed by content hash, with save status surfaced in the UI.
 - (ui) automixah-ui's playlist section (bottom panel) lists playlists and their tracks; rows show BPM, Camelot key colored by harmonic distance to the previous row, and duration.
-- (ui) Track loading enters through the playlist: clicking a ready row loads the track into the grid editor; the Open button is removed.
+- (ui) Track loading enters through the playlist: clicking a ready playlist row loads the track into the grid editor.
 - (ui) Track analysis runs on a single worker draining a priority queue (user-forced highest, playlist above background library); duplicate arrivals deduplicate by content hash with priority escalation.
 - (ui) Every library-index refresh (startup hydration and completed scans) derives background analysis jobs for indexed hashes lacking a stored analysis, deduplicated to one job per unique hash with paths joined from roots.
 - (ui) All async and threaded work reports back through a single UI event bus; frontend state is mutated only when applying events.
@@ -88,10 +88,13 @@ Entries are added or amended **only with human approval**.
 - (ui) Library rescans are triggered manually or by adding a root, never at startup; a scan reads each changed file once (hash, tags, duration), skips unchanged files by mtime+size, and prunes removed files.
 - (ui) A rescan refreshes a track's stored path when its content hash appears at a new location; playlists reference hashes, so moved files keep rendering and mixing.
 - (ui) The bottom panel has four columns: library roots, library entries, playlist entries, and playlists (with New and Import at the top of the playlists column).
-- (ui) Adding tracks to a playlist is double-click on a library entry; the system file picker add path is removed.
+- (ui) Adding tracks to a playlist is double-click on a library entry.
 - (ui) Library search uses comma-separated fuzzy terms ANDed over title/artist/path with matched-glyph highlighting; the parser emits typed term nodes so field filters (BPM, key) can extend it.
 - (ui) Library scan progress streams live: the walk enumerates and the scanner processes files incrementally, the display shows processed/discovered file counts during a scan, and the UI repaints while a scan is running.
 - (ui) Library scans split into a blocking-pool walker that streams discovered files to an async classifier (stat/hash/tags via spawn_blocking); progress reports per file as processed/discovered counts.
 - (ui) Scan progress is two-counter concurrent: the walker task reports file discovery (`seen`) independently of the classifier's per-file `done` count; the event sender merges both monotonic high-water marks so the wire event and applier stay unchanged.
 - (ui) Library scans are single-flight app-wide: a latch on `Services` drops any spawn while one scan runs (a concurrent walker pair previously double-counted scan progress), enforced in `spawn_scan` so every call site is covered.
 - (ui) A scan requested while another runs is queued as a follow-up full-library scan instead of dropped, so a folder added mid-scan is always indexed without a manual rescan.
+- (ui) Preview playback is a player separate from the grid-editor deck; the two never sound simultaneously — starting a preview pauses the deck, loading a deck stops the preview.
+- (ui) Middle-clicking a playlist row or library entry plays the track in the preview player via decode-only load (no hash, analysis, or peaks); playlist single-click keeps loading the editor.
+- (ui) An always-visible transport bar spans the window width along the very bottom and scrubs the active preview (click and drag seek, play/pause).

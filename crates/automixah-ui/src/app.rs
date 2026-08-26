@@ -21,6 +21,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// A running instant preview: the player plus the display facts the
+/// transport bar derives from (resolved at request time, not copied into
+/// per-frame state).
+pub(crate) struct ActivePreview {
+    player: crate::audio::preview::PreviewPlayer,
+    /// Track identity (event addressing and record lookup).
+    hash: TrackHash,
+    /// Source path — re-requesting a toggled-off preview needs it.
+    path: std::path::PathBuf,
+    /// Display heading for the transport bar ("artist – title" or file name).
+    title: String,
+}
+
+/// The latest in-flight preview decode. One field guards two facts:
+/// latest-wins event validation, and the bar's decoding indicator.
+#[derive(Debug, Clone)]
+struct PreviewLoad {
+    hash: TrackHash,
+    path: std::path::PathBuf,
+}
+
 /// The automixah-ui application.
 pub struct AutomixahUiApp {
     /// DI container (paths, grid store, async handle). Clone-cheap.
@@ -43,6 +64,10 @@ pub struct AutomixahUiApp {
     /// `true` while an editor load task is in flight (spinner, disables
     /// re-analyze; cleared by `LoadDone`).
     load_in_flight: bool,
+    /// The running preview player, if any (the second lifecycle Option).
+    pub(crate) preview: Option<ActivePreview>,
+    /// The latest requested preview decode; `Some` while decoding.
+    preview_load: Option<PreviewLoad>,
     /// A playlist click on a still-pending row: the hash to load once
     /// its analysis lands (the waveform area shows an analysis message
     /// meanwhile). The deck's only armed source.
@@ -84,6 +109,8 @@ impl AutomixahUiApp {
             reorder_queue,
             deck: None,
             load_in_flight: false,
+            preview: None,
+            preview_load: None,
             pending_deck_load: None,
             status: "pick a track from the playlist to begin".to_owned(),
             render_out: String::new(),
@@ -357,7 +384,16 @@ impl AutomixahUiApp {
         self.bus.drain(|event| events.push(event));
         for event in events {
             derive(&event, &mut self.tracks);
-            self.apply(event);
+            // Terminal preview decodes have a dedicated consumer; they
+            // never enter the general applier.
+            if matches!(
+                event,
+                Event::PreviewLoaded { .. } | Event::PreviewFailed { .. }
+            ) {
+                self.apply_preview(event);
+            } else {
+                self.apply(event);
+            }
         }
         for (job, tier) in pending_enqueue {
             self.playlist_queue.enqueue(job, tier.priority());
@@ -423,6 +459,7 @@ impl AutomixahUiApp {
                 {
                     self.pending_deck_load = None;
                     self.load_in_flight = true;
+                    self.drop_preview();
                     let tx = self.bus.sender();
                     crate::track::spawn_load(&self.services, tx, path);
                 }
@@ -562,6 +599,9 @@ impl AutomixahUiApp {
             | Event::AddStarted { .. }
             | Event::ImportStarted
             | Event::ImportProgress { .. }
+            // Preview events are consumed by the preview apply arms above.
+            | Event::PreviewLoaded { .. }
+            | Event::PreviewFailed { .. }
             // Library events are consumed entirely by the library
             // state's applier below.
             | Event::LibraryLoaded { .. }
@@ -621,6 +661,7 @@ impl AutomixahUiApp {
                 PanelAction::DeletePlaylist(id) => self.delete_playlist(id),
                 PanelAction::ImportPlaylist => self.import_playlist_dialog(),
                 PanelAction::LoadRow(hash) => self.load_row(&hash),
+                PanelAction::PreviewRow(hash) => self.toggle_preview(&hash, None),
                 PanelAction::MoveRow {
                     from,
                     to,
@@ -730,6 +771,12 @@ impl AutomixahUiApp {
                 }
                 LibraryAction::RemoveRoot { id } => self.remove_library_root(id),
                 LibraryAction::AddTrack { hash } => self.spawn_add_library_track(hash),
+                // Library entries resolve paths at request time; the
+                // indexed entry owns the root + relative path join.
+                LibraryAction::PreviewTrack { hash } => {
+                    let path = self.library_entry_path(&hash);
+                    self.toggle_preview(&hash, path);
+                }
             }
         }
     }
@@ -786,6 +833,22 @@ impl AutomixahUiApp {
                 }
             }
         });
+    }
+
+    /// Resolves a library entry's absolute path (root + relative path),
+    /// or `None` when the entry or its root vanished from the index.
+    fn library_entry_path(&self, hash: &TrackHash) -> Option<std::path::PathBuf> {
+        let entry = self
+            .library_state
+            .entries
+            .iter()
+            .find(|entry| &entry.hash == hash)?;
+        let root = self
+            .library_state
+            .roots
+            .iter()
+            .find(|root| root.id == entry.root_id)?;
+        Some(root.path.join(&entry.rel_path))
     }
 
     /// Adds a library entry to the selected playlist: every fact comes
@@ -877,6 +940,7 @@ impl AutomixahUiApp {
     fn load_row(&mut self, hash: &TrackHash) {
         self.deck = None;
         self.pending_deck_load = None;
+        self.drop_preview();
         if self.tracks.is_ready(hash) {
             let Some(path) = self.tracks.path_of(hash).cloned() else {
                 return;
@@ -889,6 +953,157 @@ impl AutomixahUiApp {
         }
     }
 
+    /// Stops and drops the preview outright (deck takes over).
+    fn drop_preview(&mut self) {
+        self.preview = None;
+        self.preview_load = None;
+    }
+
+    /// Renders the transport bar with the live preview's state snapshot.
+    fn show_transport_bar(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> crate::view::transport::TransportActions {
+        let (heading, decoding) = match (&self.preview, &self.preview_load) {
+            (Some(ActivePreview { title, .. }), _) => (title.clone(), false),
+            // Decoding: name from the request (the record may not exist
+            // yet for an unscanned file — the path is always present).
+            (None, Some(load)) => {
+                let tags = self.tracks.get(&load.hash).map(|record| &record.tags);
+                (
+                    crate::view::transport::track_heading(
+                        tags.map_or("", |t| t.artist.as_str()),
+                        tags.map_or("", |t| t.title.as_str()),
+                        &load.path,
+                    ),
+                    true,
+                )
+            }
+            (None, None) => (String::new(), false),
+        };
+        let player = self
+            .preview
+            .as_mut()
+            .map(|ActivePreview { player, .. }| player);
+        crate::view::transport::transport_bar(ctx, player, &heading, decoding)
+    }
+
+    /// Applies the bar's gestures: toggle on the active preview; seeks
+    /// become frame writes through the player.
+    fn handle_transport_actions(&mut self, actions: crate::view::transport::TransportActions) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if actions.toggle_play {
+            preview.player.toggle_play();
+        }
+        for frame in actions.seeks {
+            preview.player.seek_frame(frame);
+        }
+    }
+
+    /// Plays or toggles the preview for `hash`. The stored path wins
+    /// over the record's path (library entries hydrate records from
+    /// indexed locations; rows keep their added-path).
+    fn toggle_preview(&mut self, hash: &TrackHash, preferred_path: Option<std::path::PathBuf>) {
+        // Re-press on a parked preview: play again. Any other toggle or
+        // a fresh track: request a decode (latest-wins).
+        if let Some(preview) = self.preview.as_mut()
+            && preview.hash == *hash
+            && !preview.player.is_audible()
+            && self.preview_load.is_none()
+        {
+            let path = std::mem::take(&mut preview.path);
+            self.preview_load = Some(PreviewLoad {
+                hash: hash.clone(),
+                path: path.clone(),
+            });
+            crate::track::spawn_preview_load(
+                &self.services,
+                self.bus.sender(),
+                crate::track::PreviewJob {
+                    hash: hash.clone(),
+                    path,
+                },
+            );
+            return;
+        }
+        let Some(path) = preferred_path.or_else(|| self.tracks.path_of(hash).cloned()) else {
+            return;
+        };
+        self.preview = None;
+        self.preview_load = Some(PreviewLoad {
+            hash: hash.clone(),
+            path: path.clone(),
+        });
+        crate::track::spawn_preview_load(
+            &self.services,
+            self.bus.sender(),
+            crate::track::PreviewJob {
+                hash: hash.clone(),
+                path,
+            },
+        );
+    }
+
+    /// Applies a terminal preview decode: stale responses are dropped by
+    /// identity, success swaps the player in playing and pauses the deck
+    /// (the solo latch), failure keeps any old preview.
+    fn apply_preview(&mut self, event: Event) {
+        let current: Option<&TrackHash> = self.preview_load.as_ref().map(|load| &load.hash);
+        let stale = match (&event, current) {
+            (
+                Event::PreviewLoaded { hash, .. } | Event::PreviewFailed { hash, .. },
+                Some(pending),
+            ) => hash != pending,
+            _ => true,
+        };
+        if stale {
+            return;
+        }
+        // The request's path is authoritative: it came from the row or
+        // entry the user actually pressed.
+        let requested_path = self.preview_load.as_ref().map(|load| load.path.clone());
+        self.preview_load = None;
+        match event {
+            Event::PreviewLoaded { hash, audio } => {
+                match crate::audio::preview::PreviewPlayer::start(audio) {
+                    Ok(player) => {
+                        let path = requested_path
+                            .or_else(|| self.tracks.path_of(&hash).cloned())
+                            .unwrap_or_default();
+                        let tags = self.tracks.get(&hash).map(|record| &record.tags);
+                        let heading = crate::view::transport::track_heading(
+                            tags.map_or("", |t| t.artist.as_str()),
+                            tags.map_or("", |t| t.title.as_str()),
+                            &path,
+                        );
+                        // Solo latch: one audible source — the deck stays
+                        // loaded but silent (state preserved).
+                        if let Some(deck) = self.deck.as_mut() {
+                            deck.scrub.pause();
+                            deck.push_command();
+                        }
+                        self.preview = Some(ActivePreview {
+                            player,
+                            hash,
+                            path,
+                            title: heading,
+                        });
+                    }
+                    Err(report) => {
+                        self.status = format!("\u{26a0} preview unavailable: {report:?}");
+                    }
+                }
+            }
+            Event::PreviewFailed { message, .. } => {
+                self.status = format!("\u{26a0} preview failed: {message}");
+            }
+            // Filtered above; unreachable.
+            _ => {}
+        }
+    }
+
     /// Re-analyze: the deck drops, the record's analysis clears (rows
     /// everywhere derive "needs analysis"), and a fresh load deletes the
     /// stored grid before re-analyzing (ordered inside the task).
@@ -896,6 +1111,9 @@ impl AutomixahUiApp {
         let Some(deck) = self.deck.take() else {
             return;
         };
+        // Re-analysis always leads to a fresh editor load; the preview
+        // must not outlive that decision.
+        self.drop_preview();
         let hash = deck.hash.clone();
         // The analysis data is GONE: every row referencing this hash
         // derives "needs analysis" on the next frame, then queued —
@@ -1218,7 +1436,10 @@ impl eframe::App for AutomixahUiApp {
         // state only. Leftover events (over the 10 ms budget) land next
         // frame — the drain requests a repaint in that case.
         self.drain_bus();
-        // Bottom panel first: it registers before CentralPanel claims
+        // The transport bar registers before every other bottom panel so
+        // it paints outermost — always visible along the window edge.
+        let transport_actions = self.show_transport_bar(ctx);
+        // Bottom panel next: it registers before CentralPanel claims
         // the remaining space.
         let actions = {
             // Snapshot derivations before the mutable borrow of the
@@ -1243,6 +1464,9 @@ impl eframe::App for AutomixahUiApp {
             )
         };
         self.handle_panel_actions(actions);
+        // Transport intents are applied after row actions: a just-loaded
+        // deck (row click) wins over the same frame's bar gestures.
+        self.handle_transport_actions(transport_actions);
         if ctx.input(|i| i.key_pressed(egui::Key::Space))
             && let Some(deck) = self.deck.as_mut()
         {
@@ -1301,17 +1525,25 @@ impl eframe::App for AutomixahUiApp {
         if let Some(deck) = self.deck.as_mut() {
             deck.push_command();
         }
+        // Per-frame preview upkeep: latches the auto-stop at the true
+        // end and publishes the resulting command.
+        if let Some(preview) = self.preview.as_mut() {
+            preview.player.sync();
+        }
 
         // Keep the UI live while a deck is loaded (playhead ticking), a
         // load is in flight, any shown row is pending, a mixdown is
-        // rendering (throttled progress), or a library scan is running
+        // rendering (throttled progress), a library scan is running
         // (its progress events arrive on the raw bus channel, which
-        // schedules no repaints of its own).
+        // schedules no repaints of its own), or a preview exists
+        // (decoding in flight or its playhead ticking).
         if self.deck.is_some()
             || self.load_in_flight
             || self.playlist_state.any_pending(&self.tracks)
             || self.render_cancel.is_some()
             || self.library_state.is_scanning()
+            || self.preview_load.is_some()
+            || self.preview.is_some()
         {
             ctx.request_repaint();
         }
@@ -2205,6 +2437,219 @@ mod tests {
 
         assert_eq!(app.pending_deck_load, None, "disarmed");
         assert!(!app.load_in_flight, "no load fired");
+    }
+
+    // Given a playing deck and a preview decode for its hash.
+    // When the terminal preview event applies.
+    // Then a preview player exists and the deck scrub is silent —
+    // loaded but not audible.
+    #[tokio::test]
+    async fn preview_loaded_builds_playing_player_and_latches_editor() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("preview-me".to_owned());
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/preview-me.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 1.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 2,
+            },
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 2),
+        });
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "Preview Track".to_owned(),
+                artist: String::new(),
+                path: "/preview-me.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        // The decode was requested before its outcome lands.
+        app.preview_load = Some(PreviewLoad {
+            hash: hash.clone(),
+            path: "/preview-me.wav".into(),
+        });
+        assert!(
+            !app.deck
+                .as_ref()
+                .is_some_and(|deck| deck.scrub.command().playing),
+            "deck starts silent in this fixture"
+        );
+
+        app.apply_preview(Event::PreviewLoaded {
+            hash,
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 88_200],
+                sample_rate: 44_100,
+                channels: 2,
+            },
+        });
+
+        let preview = app.preview.as_ref().expect("playing preview exists");
+        assert!(preview.player.is_audible(), "starts audibly");
+        assert_eq!(preview.hash.0, "preview-me");
+        // And the bar names the track ("artist – title", title-only when
+        // the artist tag is missing).
+        assert_eq!(preview.title, "Preview Track");
+        assert!(app.preview_load.is_none(), "terminal event consumed");
+        let cmd = app.deck.as_ref().expect("deck kept").scrub.command();
+        assert!(!cmd.playing, "solo latch silences the deck");
+    }
+
+    // Given a library entry whose tags carry only a file name (no
+    // metadata).
+    // When the preview decode lands.
+    // Then the bar headline falls back to the base name.
+    #[tokio::test]
+    async fn preview_heading_falls_back_to_file_name_without_tags() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("unnamed".to_owned());
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: String::new(),
+                artist: String::new(),
+                path: "/music/03 - hidden gem.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        app.preview_load = Some(PreviewLoad {
+            hash,
+            path: "/music/03 - hidden gem.wav".into(),
+        });
+
+        app.apply_preview(Event::PreviewLoaded {
+            hash: TrackHash("miss".to_owned()), // stale on purpose
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 8],
+                sample_rate: 44_100,
+                channels: 2,
+            },
+        });
+        assert!(
+            app.preview.is_none() && app.preview_load.is_some(),
+            "stale event never builds the player"
+        );
+
+        app.apply_preview(Event::PreviewLoaded {
+            hash: app.preview_load.as_ref().expect("pending").hash.clone(),
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.1; 88_200],
+                sample_rate: 44_100,
+                channels: 2,
+            },
+        });
+
+        let preview = app.preview.as_ref().expect("playing preview exists");
+        assert_eq!(preview.title, "03 - hidden gem.wav");
+    }
+
+    // Given an in-flight preview for one hash.
+    // When a stale decode for another hash reports back.
+    // Then nothing changes — the response is dropped by identity.
+    #[test]
+    fn stale_preview_event_is_dropped_by_identity() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let requested = TrackHash("requested".to_owned());
+        app.preview_load = Some(PreviewLoad {
+            hash: requested,
+            path: "/requested.wav".into(),
+        });
+
+        app.apply_preview(Event::PreviewLoaded {
+            hash: TrackHash("stale".to_owned()),
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 8],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        });
+
+        assert!(
+            app.preview.is_none(),
+            "a stale decode never becomes the active preview"
+        );
+        assert!(
+            app.preview_load.is_some(),
+            "the live request stays in flight"
+        );
+    }
+
+    // Given a running preview.
+    // When an editor row load runs.
+    // Then the preview is gone and the deck proceeds to load.
+    #[test]
+    fn load_row_stops_preview() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("now-playing".to_owned());
+        let next = TrackHash("next-track".to_owned());
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "Playing".to_owned(),
+                artist: String::new(),
+                path: "/now.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        app.tracks.upsert(TrackRecord {
+            hash: next.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "Next".to_owned(),
+                artist: String::new(),
+                path: "/next.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        // Simulate the runtime wiring end-to-end without cpal.
+        let audio = djcore::decoder::DecodeAudio {
+            samples: vec![0.0; 44_100],
+            sample_rate: 44_100,
+            channels: 1,
+        };
+        let player = crate::audio::preview::PreviewPlayer::start(audio).expect("device available");
+        app.preview = Some(ActivePreview {
+            player,
+            hash: hash.clone(),
+            path: "/now.wav".into(),
+            title: "Playing".to_owned(),
+        });
+        app.load_row(&next);
+
+        assert!(app.preview.is_none(), "loading drops the preview");
+        assert!(app.preview_load.is_none());
     }
 
     // Given a re-analyzed track completing while another is loaded.

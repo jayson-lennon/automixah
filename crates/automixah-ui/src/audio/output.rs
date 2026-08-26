@@ -48,6 +48,12 @@ impl Playhead {
             speed: RwLock::new(0.0),
         }
     }
+
+    /// Current source-frame position (audio thread written).
+    #[must_use]
+    pub fn position(&self) -> f64 {
+        *self.position.read()
+    }
 }
 
 impl Default for Playhead {
@@ -183,6 +189,8 @@ pub struct OutputEngine {
     playhead: Arc<Playhead>,
     /// Scrub commands: (speed, playing).
     pub command: Arc<Mutex<ScrubCommand>>,
+    /// Source sample rate (Hz) this engine was built for.
+    source_rate: u32,
     _stream: cpal::Stream,
 }
 
@@ -291,6 +299,7 @@ impl OutputEngine {
         Ok(Self {
             playhead,
             command,
+            source_rate,
             _stream: stream,
         })
     }
@@ -299,6 +308,12 @@ impl OutputEngine {
     #[must_use]
     pub fn playhead(&self) -> Arc<Playhead> {
         Arc::clone(&self.playhead)
+    }
+
+    /// The source sample rate (Hz) the engine's PCM was decoded at.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        self.source_rate
     }
 }
 

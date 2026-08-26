@@ -90,6 +90,17 @@ pub enum Event {
     AnalysisDone { hash: TrackHash, analysis: Analysis },
     /// Analysis failed for a hash; the message shows in the row tooltip.
     AnalysisFailed { hash: TrackHash, message: String },
+    // Preview pipeline (hash → decode only — no analysis, no peaks).
+    /// Terminal: decoded PCM for a hash is ready for instant playback;
+    /// addressed by content hash so a stale decode never overwrites a
+    /// newer request.
+    PreviewLoaded {
+        hash: TrackHash,
+        audio: djcore::decoder::DecodeAudio,
+    },
+    /// Terminal: the preview load failed; the old preview stays and the
+    /// message surfaces in the status line.
+    PreviewFailed { hash: TrackHash, message: String },
     // Playlist list (one load at startup; deltas afterwards).
     /// The full playlist list, sent once at startup.
     PlaylistsLoaded(Vec<PlaylistSummary>),
@@ -296,6 +307,15 @@ impl std::fmt::Debug for Event {
                 .finish_non_exhaustive(),
             Self::AnalysisFailed { hash, message } => f
                 .debug_struct("AnalysisFailed")
+                .field("hash", hash)
+                .field("message", message)
+                .finish(),
+            Self::PreviewLoaded { hash, .. } => f
+                .debug_struct("PreviewLoaded")
+                .field("hash", hash)
+                .finish_non_exhaustive(),
+            Self::PreviewFailed { hash, message } => f
+                .debug_struct("PreviewFailed")
                 .field("hash", hash)
                 .field("message", message)
                 .finish(),

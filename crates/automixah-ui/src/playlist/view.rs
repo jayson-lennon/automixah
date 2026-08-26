@@ -41,6 +41,8 @@ pub enum PanelAction {
     ImportPlaylist,
     /// A ready row was clicked (load into the grid editor).
     LoadRow(TrackHash),
+    /// A row was middle-clicked (play it in the instant preview player).
+    PreviewRow(TrackHash),
     /// A row was dragged onto another row's slot (reorder).
     MoveRow {
         /// Row being dragged.
@@ -461,6 +463,13 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
             ) {
                 actions.actions.push(action);
             }
+            if let Some(action) = preview_action_for_row(
+                hash,
+                response.clicked_by(egui::PointerButton::Middle),
+                response.dragged_by(egui::PointerButton::Middle),
+            ) {
+                actions.actions.push(action);
+            }
             response.context_menu(|ui| {
                 if ui.button("Remove").clicked() {
                     actions
@@ -505,6 +514,18 @@ fn load_action_for_row(
     } else {
         None
     }
+}
+
+/// Converts one row response into its preview intent: any middle click
+/// that did not become a middle drag previews the row — regardless of
+/// analysis state (a failed row can still be auditioned).
+#[must_use]
+fn preview_action_for_row(
+    hash: &TrackHash,
+    middle_clicked: bool,
+    middle_dragged: bool,
+) -> Option<PanelAction> {
+    (middle_clicked && !middle_dragged).then_some(PanelAction::PreviewRow(hash.clone()))
 }
 
 /// Per-row display facts derived at render time: everything
@@ -879,6 +900,56 @@ mod tests {
         let action = load_action_for_row(&row, false, true, false);
 
         assert_eq!(action, None);
+    }
+
+    // Given a middle click with no drag.
+    // When classifying the row gesture.
+    // Then a PreviewRow action targets that row.
+    #[test]
+    fn middle_click_row_emits_preview_row() {
+        let row = hash(3);
+
+        let action = preview_action_for_row(&row, true, false);
+
+        assert_eq!(action, Some(PanelAction::PreviewRow(row)));
+    }
+
+    // Given a middle-button gesture that became a drag.
+    // When classifying the row gesture.
+    // Then no PreviewRow action is emitted (drag stays reorder territory).
+    #[test]
+    fn middle_drag_suppresses_preview_action() {
+        let row = hash(3);
+
+        let action = preview_action_for_row(&row, true, true);
+
+        assert_eq!(action, None);
+    }
+
+    // Given a primary click or a no-button hover.
+    // When classifying the row gesture for preview.
+    // Then nothing is emitted — only middle clicks preview.
+    #[test]
+    fn non_middle_gestures_never_emit_preview_action() {
+        let row = hash(3);
+
+        let clicked = preview_action_for_row(&row, false, false);
+        let dragged = preview_action_for_row(&row, false, true);
+
+        assert_eq!(clicked, None);
+        assert_eq!(dragged, None);
+    }
+
+    // Given a non-interactive row (failed analysis, unknown record).
+    // When a plain middle click arrives.
+    // Then it still previews — interactivity never gates the gesture.
+    #[test]
+    fn middle_click_previews_non_interactive_row() {
+        let row = hash(4);
+
+        let action = preview_action_for_row(&row, true, false);
+
+        assert_eq!(action, Some(PanelAction::PreviewRow(row)));
     }
 
     // Given a released drag over the upper or lower half of another row.

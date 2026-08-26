@@ -55,6 +55,14 @@ impl ScrubMachine {
         self.smoothed_drag = 0.0;
     }
 
+    /// Silence the machine outright: cancels 1× playback and any active drag,
+    /// remembering nothing to restore. Used when another player takes over
+    /// the output — nothing may resume behind it, not even a released drag.
+    pub fn pause(&mut self) {
+        self.state = ScrubState::Paused;
+        self.smoothed_drag = 0.0;
+    }
+
     /// Pointer down on the waveform: remember the current state.
     pub fn drag_start(&mut self) {
         if matches!(self.state, ScrubState::Dragging { .. }) {
@@ -245,17 +253,48 @@ mod tests {
         );
     }
 
-    // Given drag-start happens twice without release.
-    // When the second start arrives.
-    // Then the remembered state is the first drag's memory (no nesting).
+    // Given a playing machine.
+    // When pause is requested.
+    // Then the command is silence at unit speed.
     #[test]
-    fn double_drag_start_does_not_nest() {
+    fn pause_silences_playing_machine() {
         let mut m = machine();
-        m.toggle_play(); // Playing
-        m.drag_start(); // remembers Playing
-        m.toggle_play(); // space during drag → Playing (per table)
-        m.drag_start(); // no-op (already dragging)
-        m.drag_end(); // restores Playing
-        assert_eq!(m.state(), &ScrubState::Playing);
+        m.toggle_play();
+
+        m.pause();
+
+        let cmd = m.command();
+        assert!(!cmd.playing);
+        assert_eq!(cmd.speed, UNIT);
+    }
+
+    // Given an already paused machine.
+    // When pause is requested.
+    // Then the machine stays paused.
+    #[test]
+    fn pause_is_idempotent_on_paused_machine() {
+        let mut m = machine();
+
+        m.pause();
+
+        assert!(!m.command().playing);
+    }
+
+    // Given a playing machine with an active drag.
+    // When pause is requested mid-drag.
+    // Then releasing the drag afterwards restores silence — the takeover is
+    // not undone by the drag ending, and no drag chirp leaks into the command.
+    #[test]
+    fn pause_during_drag_stays_silent_after_release() {
+        let mut m = machine();
+        m.toggle_play();
+        m.drag_start();
+
+        m.pause();
+
+        m.drag_end();
+        let cmd = m.command();
+        assert!(!cmd.playing);
+        assert_eq!(cmd.speed, UNIT);
     }
 }

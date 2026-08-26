@@ -312,6 +312,9 @@ impl PlaylistState {
             | Event::RenderFailed { .. }
             | Event::CommandFailed(_)
             | Event::ReorderCommandFailed { .. }
+            // Preview events are applied by the app's preview state.
+            | Event::PreviewLoaded { .. }
+            | Event::PreviewFailed { .. }
             // Library events are applied by the library state, not here.
             | Event::LibraryLoaded { .. }
             | Event::LibraryRootAdded(_)

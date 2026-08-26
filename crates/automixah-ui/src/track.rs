@@ -239,6 +239,55 @@ pub fn spawn_load(services: &Services, tx: std::sync::mpsc::Sender<Event>, path:
     });
 }
 
+/// An instant-preview request. Identity is supplied, not derived: rows
+/// and entries already carry content hashes, so the preview path reads,
+/// decodes, and nothing else.
+#[derive(Debug, Clone)]
+pub struct PreviewJob {
+    /// Content hash the outcome is addressed by (trusted, never recomputed).
+    pub hash: TrackHash,
+    /// File to read + decode.
+    pub path: PathBuf,
+}
+
+/// Spawns the instant-preview pipeline on the blocking pool: read →
+/// decode, full stop. No analysis, no store lookups, no peaks, no
+/// persistence, no stage events — the faster the decode lands, the sooner
+/// sound starts. Exactly one terminal event reaches the bus
+/// ([`Event::PreviewLoaded`] or [`Event::PreviewFailed`]).
+pub fn spawn_preview_load(
+    services: &Services,
+    tx: std::sync::mpsc::Sender<Event>,
+    job: PreviewJob,
+) {
+    let handle = services.runtime.handle().clone();
+    handle.spawn_blocking(move || {
+        let send = |event: Event| {
+            let _ = tx.send(event);
+        };
+        let fail = |message: String| {
+            send(Event::PreviewFailed {
+                hash: job.hash.clone(),
+                message,
+            })
+        };
+
+        let bytes = match std::fs::read(&job.path) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("read {}: {e}", job.path.display())),
+        };
+        let extension = identity::extension_of(&job.path);
+        let registry = DecoderRegistry::with_symphonia();
+        match registry.decode(&bytes, &extension) {
+            Ok(audio) => send(Event::PreviewLoaded {
+                hash: job.hash,
+                audio,
+            }),
+            Err(report) => fail(format!("{report:#}")),
+        }
+    });
+}
+
 /// Builds the analysis package from an analyzer output.
 fn analysis_from(output: &AnalyzerOutput, audio: &DecodeAudio, cues: CuePoints) -> Analysis {
     #[expect(clippy::cast_precision_loss, reason = "frame count to f32")]
@@ -581,6 +630,151 @@ mod tests {
             Ok(_) => panic!("missing file must fail"),
         };
         assert!(err.contains("nope.wav"), "rendered error present: {err}");
+    }
+
+    // Given a written WAV file.
+    // When preview-spawned.
+    // Then exactly one terminal event carries the decoded PCM — and no
+    // analysis-related event ever fires (the whole point of the path).
+    #[test]
+    fn spawn_preview_emits_pcm_without_analysis() {
+        let (services, dir) = test_services();
+        let analyzer = std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
+            djcore::analyzer::AnalyzerOutput {
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 2.0,
+                beat_grid: Default::default(),
+                bpm_confidence: 1.0,
+                key_confidence: 1.0,
+                grid_stability: 1.0,
+            },
+        ));
+        let services = Services {
+            analyzer: analyzer.clone(),
+            ..services
+        };
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(2.0)).expect("write wav");
+        let bytes = std::fs::read(&path).expect("read back");
+        let hash = TrackHash(identity::hex_sha256(&bytes));
+
+        let bus = EventBus::without_repaint();
+        spawn_preview_load(
+            &services,
+            bus.sender(),
+            PreviewJob {
+                hash: hash.clone(),
+                path,
+            },
+        );
+
+        let rx = bus.receiver_for_test();
+        let mut events = Vec::new();
+        // Drain until the terminal preview event lands (the bus holds its
+        // own sender, so the channel never disconnects).
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(event @ (Event::PreviewLoaded { .. } | Event::PreviewFailed { .. })) => {
+                    events.push(event);
+                    break;
+                }
+                Ok(event) => events.push(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("bus hung"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("bus closed"),
+            }
+        }
+        let Event::PreviewLoaded {
+            hash: loaded,
+            audio,
+        } = &events[events.len() - 1]
+        else {
+            let names: Vec<String> = events.iter().map(|e| format!("{e:?}")).collect();
+            panic!("expected PreviewLoaded terminal, got [{names:?}]");
+        };
+        assert_eq!(loaded, &hash);
+        assert_eq!(audio.sample_rate, 44_100);
+        assert_eq!(audio.frames(), 2 * 44_100_usize, "two seconds of frames");
+        assert!(!audio.samples.is_empty());
+        // And nothing analytical happened anywhere on the path.
+        assert_eq!(analyzer.call_count(), 0, "preview must not analyze");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::AnalysisStarted { .. } | Event::AnalysisDone { .. }
+            )),
+            "no analysis events may fire"
+        );
+    }
+
+    // Given identical content stored under two different filenames.
+    // When preview-spawned.
+    // Then the caller-supplied identity is trusted — no hashing work runs.
+    #[test]
+    fn spawn_preview_trusts_supplied_hash_not_content() {
+        let (services, dir) = test_services();
+        let path = dir.path().join("tone.wav");
+        std::fs::write(&path, wav_bytes(1.0)).expect("write wav");
+
+        let bus = EventBus::without_repaint();
+        let supplied = TrackHash("not-the-real-hash".to_owned());
+        spawn_preview_load(
+            &services,
+            bus.sender(),
+            PreviewJob {
+                hash: supplied.clone(),
+                path,
+            },
+        );
+
+        let rx = bus.receiver_for_test();
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("one terminal event");
+        match event {
+            Event::PreviewLoaded { hash, audio } => {
+                assert_eq!(hash, supplied, "identity passes through untouched");
+                assert!(!audio.samples.is_empty());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    // Given a nonexistent file.
+    // When preview-spawned.
+    // Then PreviewFailed is the terminal event and it is addressed by hash.
+    #[test]
+    fn spawn_preview_reports_missing_file_by_hash() {
+        let (services, dir) = test_services();
+
+        let bus = EventBus::without_repaint();
+        let hash = TrackHash("deadbeef".to_owned());
+        spawn_preview_load(
+            &services,
+            bus.sender(),
+            PreviewJob {
+                hash: hash.clone(),
+                path: dir.path().join("nope.wav"),
+            },
+        );
+
+        let rx = bus.receiver_for_test();
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("terminal event");
+        match event {
+            Event::PreviewFailed {
+                hash: failed_hash,
+                message,
+            } => {
+                assert_eq!(failed_hash, hash);
+                assert!(message.contains("nope.wav"), "rendered error: {message}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     // Given identical file bytes.
