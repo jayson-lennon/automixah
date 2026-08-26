@@ -131,13 +131,13 @@ Do not do these. Each one has shipped as a bug.
 
 Sparse by design — the crate list below is the only fixed map:
 
-| Crate | Role |
-| --- | --- |
-| `stratum-dsp` | DSP feature extraction (onsets, tempo, beat grids) |
-| `djcore` | Decode + analyze: files in, `AnalyzerOutput` (grid, key, BPM) out |
-| `automixah-schema` | Shared data types |
-| `automixah-engine` | Transition planning and mix rendering (`mixdown`: playlist → WAV) |
-| `automixah-ui` | egui application: grid alignment, scrub audition, playlist, mixdown render |
+| Crate              | Role                                                                       |
+| ------------------ | -------------------------------------------------------------------------- |
+| `stratum-dsp`      | DSP feature extraction (onsets, tempo, beat grids)                         |
+| `djcore`           | Decode + analyze: files in, `AnalyzerOutput` (grid, key, BPM) out          |
+| `automixah-schema` | Shared data types                                                          |
+| `automixah-engine` | Transition planning and mix rendering (`mixdown`: playlist → WAV)          |
+| `automixah-ui`     | egui application: grid alignment, scrub audition, playlist, mixdown render |
 
 Data flows one direction:
 
@@ -187,16 +187,17 @@ Locate concerns by convention, not hardcoded paths — `grep`/`rg` for the curre
 
 Read the `justfile` for the full list; prefer `just` recipes over manual invocation.
 
-| Role | Command | Description |
-| --- | --- | --- |
-| `vcs` | Git | This repo uses git. |
-| `check` | `just check` | `cargo check --workspace --all-targets` |
-| `test` | `just test` | `cargo nextest run --workspace` + doc tests — the fast suite; all must pass before committing |
-| `test-heavy` | `just test-heavy` | the `#[ignore]`d real-audio tests (`--run-ignored only`) |
-| `lint` | `just lint` | clippy with warnings as errors |
-| `format` | `just fmt` | `cargo fmt --all` |
-| `commit` | `just commit '<message>'` | Stages everything and commits |
-| `build` | `just build` | Debug build of the egui app |
+| Role         | Command                   | Description                                                                                   |
+| ------------ | ------------------------- | --------------------------------------------------------------------------------------------- |
+| `vcs`        | Git                       | This repo uses git.                                                                           |
+| `check`      | `just check`              | `cargo check --workspace --all-targets`                                                       |
+| `test`       | `just test`               | `cargo nextest run --workspace` + doc tests — the fast suite; all must pass before committing |
+| `test-heavy` | `just test-heavy`         | the `#[ignore]`d real-audio tests (`--run-ignored only`)                                      |
+| `lint`       | `just lint`               | clippy with warnings as errors                                                                |
+| `format`     | `just fmt`                | `cargo fmt --all`                                                                             |
+| `commit`     | `just commit '<message>'` | Stages everything and commits                                                                 |
+| `build`      | `just build`              | Debug build of the egui app                                                                   |
+| `sync-trunk` | `git pull --rebase`       | Fetch latest `origin/main` and surface conflicts locally.                                     |
 
 ### Plan Directory
 
