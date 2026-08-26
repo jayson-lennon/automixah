@@ -39,7 +39,7 @@ pub const DEBOUNCE: Duration = Duration::from_millis(50);
 pub const DRAIN_BUDGET: Duration = Duration::from_millis(10);
 
 /// Terminal outcome of an editor load: everything a fresh [`Deck`] needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoadOutcome {
     /// Identity of the loaded content.
     pub hash: TrackHash,
@@ -192,6 +192,41 @@ pub enum Event {
     },
     /// An import failed before a playlist could be completed.
     ImportFailed { message: String },
+    // Library (startup hydration + scan lifecycle; the scan task is a
+    // singleton like the renderer).
+    /// The full library (roots + entries), sent at startup and after
+    /// each completed scan.
+    LibraryLoaded {
+        /// All library roots.
+        roots: Vec<crate::library::store::LibraryRoot>,
+        /// All indexed files, `(root_id, rel_path)` order.
+        entries: Vec<crate::library::store::LibraryEntry>,
+    },
+    /// A root was added (a scan follows from the action handler).
+    LibraryRootAdded(crate::library::store::LibraryRoot),
+    /// A root (and its files) was removed, by root id.
+    LibraryRootRemoved(i64),
+    /// A scan began.
+    LibraryScanStarted,
+    /// Scan progress: files processed so far vs discovered so far.
+    LibraryScanProgress {
+        /// Supported-audio files examined so far.
+        files_done: usize,
+        /// Supported-audio files discovered so far (the walk discovers
+        /// incrementally; not a final total).
+        files_seen: usize,
+    },
+    /// Terminal: the scan committed; the counts summarize the work.
+    LibraryScanDone {
+        /// Files newly indexed.
+        added: usize,
+        /// Files re-read (changed on disk).
+        updated: usize,
+        /// Files removed from the index (vanished or moved).
+        pruned: usize,
+    },
+    /// Terminal: the scan failed; the message carries the rendered report.
+    LibraryScanFailed { message: String },
     // Render pipeline (one job at a time; a singleton, so events
     // address nothing).
     /// Staged progress from the active mixdown (throttled upstream).
@@ -366,6 +401,37 @@ impl std::fmt::Debug for Event {
                 .field("warning", warning)
                 .finish(),
             Self::ImportFailed { message } => f.debug_tuple("ImportFailed").field(message).finish(),
+            Self::LibraryLoaded { roots, entries } => f
+                .debug_struct("LibraryLoaded")
+                .field("roots", &roots.len())
+                .field("entries", &entries.len())
+                .finish(),
+            Self::LibraryRootAdded(root) => {
+                f.debug_tuple("LibraryRootAdded").field(&root.id).finish()
+            }
+            Self::LibraryRootRemoved(id) => f.debug_tuple("LibraryRootRemoved").field(id).finish(),
+            Self::LibraryScanStarted => f.debug_tuple("LibraryScanStarted").finish(),
+            Self::LibraryScanProgress {
+                files_done,
+                files_seen,
+            } => f
+                .debug_struct("LibraryScanProgress")
+                .field("files_done", files_done)
+                .field("files_seen", files_seen)
+                .finish(),
+            Self::LibraryScanDone {
+                added,
+                updated,
+                pruned,
+            } => f
+                .debug_struct("LibraryScanDone")
+                .field("added", added)
+                .field("updated", updated)
+                .field("pruned", pruned)
+                .finish(),
+            Self::LibraryScanFailed { message } => {
+                f.debug_tuple("LibraryScanFailed").field(message).finish()
+            }
             Self::RenderProgress { stage } => f
                 .debug_struct("RenderProgress")
                 .field("stage", stage)
@@ -437,7 +503,7 @@ impl EventBus {
     }
 
     /// Direct receiver access (tests block on it; the UI drains).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__test-hooks"))]
     pub(crate) fn receiver_for_test(&self) -> &Receiver<Event> {
         &self.rx
     }

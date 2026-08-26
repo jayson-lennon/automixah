@@ -29,6 +29,10 @@ pub struct AutomixahUiApp {
     tracks: crate::tracks::Tracks,
     /// Playlist section state (playlists + selected ordering).
     pub(crate) playlist_state: crate::playlist::PlaylistState,
+    /// Library section state (roots, entries, scan lifecycle).
+    pub(crate) library_state: crate::library::LibraryState,
+    /// Library search box buffer (view-owned, like the render path).
+    pub(crate) library_filter: String,
     /// Single-worker analysis queue (jobs in; bus events out).
     pub(crate) playlist_queue: crate::playlist::queue::AnalysisQueue,
     /// FIFO playlist reorder persistence queue.
@@ -74,6 +78,8 @@ impl AutomixahUiApp {
             services,
             tracks: crate::tracks::Tracks::default(),
             playlist_state: crate::playlist::PlaylistState::default(),
+            library_state: crate::library::LibraryState::default(),
+            library_filter: String::new(),
             playlist_queue,
             reorder_queue,
             deck: None,
@@ -89,7 +95,7 @@ impl AutomixahUiApp {
         }
     }
 
-    /// Spawns the startup playlist-list load (one `PlaylistsLoaded`).
+    /// Spawns the startup loads: playlist list + library index (no scan).
     pub fn spawn_startup_load(&self) {
         let store = self.services.playlist_store.clone();
         let tx = self.bus.sender();
@@ -103,6 +109,7 @@ impl AutomixahUiApp {
                 }
             }
         });
+        crate::library::scan::spawn_load(&self.services, self.bus.sender());
     }
 
     /// Spawns a contents fetch for the selected playlist: the event
@@ -378,23 +385,23 @@ impl AutomixahUiApp {
                     crate::track::LoadStage::CacheHit => "cached analysis…".to_owned(),
                 };
             }
-            Event::LoadDone(boxed) => {
+            Event::LoadDone(ref boxed) => {
                 self.load_in_flight = false;
-                match *boxed {
-                    Ok(outcome) => self.apply_load_done(outcome),
+                match boxed.as_ref() {
+                    Ok(outcome) => self.apply_load_done(outcome.clone()),
                     Err(message) => self.status = format!("\u{26a0} load failed: {message}"),
                 }
             }
-            Event::AnalysisStarted { hash } => {
-                self.tracks.set_analysis(&hash, AnalysisState::Analyzing);
+            Event::AnalysisStarted { ref hash } => {
+                self.tracks.set_analysis(hash, AnalysisState::Analyzing);
             }
-            Event::AnalysisDone { hash, analysis } => {
+            Event::AnalysisDone { ref hash, ref analysis } => {
                 self.tracks
-                    .set_analysis(&hash, AnalysisState::Ready(analysis));
+                    .set_analysis(hash, AnalysisState::Ready(analysis.clone()));
                 // The armed click fires now: the worker just persisted
                 // this analysis, so the load is a cache-hit (one pass).
-                if self.pending_deck_load.as_ref() == Some(&hash)
-                    && let Some(path) = self.tracks.path_of(&hash).cloned()
+                if self.pending_deck_load.as_ref() == Some(hash)
+                    && let Some(path) = self.tracks.path_of(hash).cloned()
                 {
                     self.pending_deck_load = None;
                     self.load_in_flight = true;
@@ -402,52 +409,52 @@ impl AutomixahUiApp {
                     crate::track::spawn_load(&self.services, tx, path);
                 }
             }
-            Event::AnalysisFailed { hash, message } => {
+            Event::AnalysisFailed { ref hash, ref message } => {
                 self.tracks
-                    .set_analysis(&hash, AnalysisState::Failed(message.clone()));
-                if self.pending_deck_load.as_ref() == Some(&hash) {
+                    .set_analysis(hash, AnalysisState::Failed(message.clone()));
+                if self.pending_deck_load.as_ref() == Some(hash) {
                     self.pending_deck_load = None;
                     self.status = format!("\u{26a0} analysis failed: {message}");
                 }
             }
-            Event::TagsResolved { hash, tags } => {
-                let mut record = self.tracks.get(&hash).cloned().unwrap_or(TrackRecord {
+            Event::TagsResolved { ref hash, ref tags } => {
+                let mut record = self.tracks.get(hash).cloned().unwrap_or(TrackRecord {
                     hash: hash.clone(),
                     tags: tags.clone(),
                     analysis: AnalysisState::Queued,
                 });
-                record.tags = tags;
+                record.tags = tags.clone();
                 self.tracks.upsert(record);
             }
-            Event::GridSaved { hash, grid } => {
-                self.tracks.refresh_grid(&hash, &grid);
+            Event::GridSaved { ref hash, ref grid } => {
+                self.tracks.refresh_grid(hash, grid);
                 self.status = format!("grid saved ({:.8})", hash.0);
             }
-            Event::GridSaveFailed(message) => {
+            Event::GridSaveFailed(ref message) => {
                 self.status = format!("\u{26a0} save failed: {message}");
             }
-            Event::CuesSaved { hash, cues } => {
+            Event::CuesSaved { ref hash, ref cues } => {
                 let is_current_snapshot = self
                     .deck
                     .as_ref()
-                    .is_none_or(|deck| deck.hash != hash || deck.cues == cues);
+                    .is_none_or(|deck| deck.hash != *hash || deck.cues == *cues);
                 if let Some(deck) = self.deck.as_mut()
-                    && deck.hash == hash
+                    && deck.hash == *hash
                     && deck
                         .cue_save_in_flight
                         .as_ref()
-                        .is_some_and(|(_, saved)| *saved == cues)
+                        .is_some_and(|(_, saved)| *saved == *cues)
                 {
                     deck.cue_save_in_flight = None;
                 }
                 if is_current_snapshot {
                     if let Some(deck) = self.deck.as_mut()
-                        && deck.hash == hash
-                        && deck.cues == cues
+                        && deck.hash == *hash
+                        && deck.cues == *cues
                     {
                         deck.cues_dirty = false;
                     }
-                    self.tracks.refresh_cues(&hash, &cues);
+                    self.tracks.refresh_cues(hash, cues);
                     self.status = format!("cues saved ({:.8})", hash.0);
                 }
                 // A different cue snapshot is an older save completion. The
@@ -455,40 +462,40 @@ impl AutomixahUiApp {
                 // reports success.
             }
             Event::CuesSaveFailed {
-                hash,
-                cues,
-                message,
+                ref hash,
+                ref cues,
+                ref message,
             } => {
                 if let Some(deck) = self.deck.as_mut()
-                    && deck.hash == hash
+                    && deck.hash == *hash
                     && deck
                         .cue_save_in_flight
                         .as_ref()
-                        .is_some_and(|(_, saved)| *saved == cues)
+                        .is_some_and(|(_, saved)| *saved == *cues)
                 {
                     deck.cue_save_in_flight = None;
                 }
                 self.status = format!("\u{26a0} cue save failed: {message}");
             }
-            Event::RowsLoaded { hashes, .. } => {
+            Event::RowsLoaded { ref hashes, .. } => {
                 // Retry semantics: hashes whose store hydration found no
                 // analysis clear a terminal Failed state.
-                self.tracks.retry_failed(&hashes);
+                self.tracks.retry_failed(hashes);
             }
-            Event::ReorderFailed { message, .. } if apply_reorder => {
+            Event::ReorderFailed { ref message, .. } if apply_reorder => {
                 self.status = format!("⚠ {message}");
             }
-            Event::ReorderCommandFailed { message, .. } if apply_reorder => {
+            Event::ReorderCommandFailed { ref message, .. } if apply_reorder => {
                 self.status = format!("⚠ {message}");
             }
-            Event::AddFailed { message } => {
+            Event::AddFailed { ref message } => {
                 self.status = format!("\u{26a0} add failed: {message}");
             }
             Event::ImportCompleted {
-                summary,
+                ref summary,
                 imported,
                 skipped,
-                warning,
+                ref warning,
             } => {
                 self.playlist_state.selected = Some(summary.id);
                 self.playlist_state.contents = Contents::Loading;
@@ -498,16 +505,16 @@ impl AutomixahUiApp {
                     None => format!("imported {imported}, skipped {skipped}"),
                 };
             }
-            Event::ImportFailed { message } => {
+            Event::ImportFailed { ref message } => {
                 self.status = format!("\u{26a0} import failed: {message}");
             }
-            Event::CommandFailed(message) => {
+            Event::CommandFailed(ref message) => {
                 self.status = format!("\u{26a0} {message}");
             }
             Event::RenderProgress { stage } => {
                 self.render_stage = Some(stage);
             }
-            Event::RenderDone { out } => {
+            Event::RenderDone { ref out } => {
                 self.render_cancel = None;
                 self.render_stage = None;
                 self.status = format!("wrote {}", out.display());
@@ -517,7 +524,7 @@ impl AutomixahUiApp {
                 self.render_stage = None;
                 self.status = "render cancelled".to_owned();
             }
-            Event::RenderFailed { message } => {
+            Event::RenderFailed { ref message } => {
                 self.render_cancel = None;
                 self.render_stage = None;
                 self.status = format!("\u{26a0} render failed: {message}");
@@ -536,8 +543,19 @@ impl AutomixahUiApp {
             | Event::DuplicateSkipped { .. }
             | Event::AddStarted { .. }
             | Event::ImportStarted
-            | Event::ImportProgress { .. } => {}
+            | Event::ImportProgress { .. }
+            // Library events are consumed entirely by the library
+            // state's applier below.
+            | Event::LibraryLoaded { .. }
+            | Event::LibraryRootAdded(_)
+            | Event::LibraryRootRemoved(_)
+            | Event::LibraryScanStarted
+            | Event::LibraryScanProgress { .. }
+            | Event::LibraryScanDone { .. }
+            | Event::LibraryScanFailed { .. } => {}
         }
+        // Library state mutates only here, after the playlist applier.
+        self.library_state.apply(&event);
     }
 
     /// Applies a terminal load outcome: the record gains the analysis
@@ -570,6 +588,7 @@ impl AutomixahUiApp {
     /// Store round-trips spawn on the runtime and report back as events;
     /// the panel never mutates state itself.
     fn handle_panel_actions(&mut self, actions: crate::playlist::view::PanelActions) {
+        self.handle_library_actions(actions.library.clone());
         use crate::playlist::view::PanelAction;
         for action in actions.actions {
             match action {
@@ -583,7 +602,6 @@ impl AutomixahUiApp {
                 PanelAction::RenamePlaylist { id, name } => self.rename_playlist(id, name),
                 PanelAction::DeletePlaylist(id) => self.delete_playlist(id),
                 PanelAction::ImportPlaylist => self.import_playlist_dialog(),
-                PanelAction::AddTracks => self.add_tracks_dialog(),
                 PanelAction::LoadRow(hash) => self.load_row(&hash),
                 PanelAction::MoveRow {
                     from,
@@ -680,52 +698,154 @@ impl AutomixahUiApp {
         });
     }
 
-    /// add-track task (hash → tags → duplicate check → insert → events).
-    fn add_tracks_dialog(&mut self) {
-        let Some(playlist_id) = self.playlist_state.selected else {
-            return;
-        };
-        let registry = djcore::decoder::DecoderRegistry::with_symphonia();
-        let extensions = registry.supported_extensions();
-        let paths = rfd::FileDialog::new()
-            .set_title("Add tracks to playlist")
-            .add_filter("audio", &extensions)
-            .pick_files();
-        let Some(paths) = paths else {
-            return;
-        };
-        self.bus.send(Event::AddStarted { count: paths.len() });
-        for path in paths {
-            self.spawn_add_track(playlist_id, path);
+    /// Library-column intents (add root, rescan, remove root, add
+    /// track from the index).
+    fn handle_library_actions(&mut self, actions: crate::library::view::LibraryActions) {
+        use crate::library::view::LibraryAction;
+        for action in actions.actions {
+            match action {
+                LibraryAction::AddRoot => self.add_library_root_dialog(),
+                LibraryAction::Rescan => {
+                    if !self.library_state.scanning {
+                        crate::library::scan::spawn_scan(&self.services, self.bus.sender());
+                    }
+                }
+                LibraryAction::RemoveRoot { id } => self.remove_library_root(id),
+                LibraryAction::AddTrack { hash } => self.spawn_add_library_track(hash),
+            }
         }
     }
 
-    /// One add-track task per file; the row appears on its insert event.
-    fn spawn_add_track(&self, playlist_id: i64, path: std::path::PathBuf) {
-        let services = self.services.clone();
+    /// Directory picker → store root → scan (which indexes it).
+    fn add_library_root_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Add library folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let store = self.services.library_store.clone();
         let tx = self.bus.sender();
-        let path_display = path.display().to_string();
+        let services = self.services.clone();
         let handle = services.runtime.handle().clone();
         handle.spawn(async move {
-            match add_track_task(&services, playlist_id, &path).await {
-                Ok(Some((hash, tags))) => {
+            match store.add_root(&canonical.display().to_string()).await {
+                Ok(root) => {
+                    let _ = tx.send(Event::LibraryRootAdded(root));
+                    // Scan immediately: the new root indexes on arrival.
+                    crate::library::scan::spawn_scan(&services, tx.clone());
+                }
+                Err(report) => {
+                    let _ = tx.send(Event::CommandFailed(format!(
+                        "add library root: {report:#}"
+                    )));
+                }
+            }
+        });
+    }
+
+    /// Root removal: prune the root's files, drop the root, report.
+    fn remove_library_root(&mut self, root_id: i64) {
+        let store = self.services.library_store.clone();
+        let tx = self.bus.sender();
+        let handle = self.services.runtime.handle().clone();
+        handle.spawn(async move {
+            let outcome = async {
+                store.delete_files_for_root(root_id).await?;
+                store.remove_root(root_id).await?;
+                Ok::<(), error_stack::Report<crate::library::store::LibraryStoreError>>(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => {
+                    let _ = tx.send(Event::LibraryRootRemoved(root_id));
+                }
+                Err(report) => {
+                    let _ = tx.send(Event::CommandFailed(format!(
+                        "remove library root: {report:#}"
+                    )));
+                }
+            }
+        });
+    }
+
+    /// Adds a library entry to the selected playlist: every fact comes
+    /// from the index (hash, tags, duration, path) — zero file reads.
+    fn spawn_add_library_track(&mut self, hash: TrackHash) {
+        let Some(playlist_id) = self.playlist_state.selected else {
+            return;
+        };
+        let Some(entry) = self
+            .library_state
+            .entries
+            .iter()
+            .find(|entry| entry.hash == hash)
+            .cloned()
+        else {
+            return;
+        };
+        // Derive the absolute path from the owning root.
+        let Some(root) = self
+            .library_state
+            .roots
+            .iter()
+            .find(|root| root.id == entry.root_id)
+        else {
+            return;
+        };
+        let abs_path = root.path.join(&entry.rel_path);
+        let services = self.services.clone();
+        let tx = self.bus.sender();
+        self.bus.send(Event::AddStarted { count: 1 });
+        let handle = services.runtime.handle().clone();
+        handle.spawn(async move {
+            let duplicate = services
+                .playlist_store
+                .contains_hash(playlist_id, &hash)
+                .await;
+            match duplicate {
+                Ok(false) => {
+                    if let Err(report) = services
+                        .playlist_store
+                        .ensure_track(
+                            playlist_id,
+                            &hash,
+                            &abs_path.display().to_string(),
+                            &entry.title,
+                            &entry.artist,
+                            entry.duration,
+                        )
+                        .await
+                    {
+                        let _ = tx.send(Event::AddFailed {
+                            message: format!("{report:#}"),
+                        });
+                        return;
+                    }
                     // Tags first: the record (with its path) must exist
                     // before the row event makes the enqueue derivation
                     // run — otherwise the job has no path to decode.
                     let _ = tx.send(Event::TagsResolved {
                         hash: hash.clone(),
-                        tags,
+                        tags: crate::tracks::TrackTags {
+                            title: entry.title.clone(),
+                            artist: entry.artist.clone(),
+                            path: abs_path.clone(),
+                        },
                     });
                     let _ = tx.send(Event::RowAdded { playlist_id, hash });
                 }
-                Ok(None) => {
+                Ok(true) => {
                     let _ = tx.send(Event::DuplicateSkipped {
                         playlist_id,
-                        path: path_display,
+                        path: abs_path.display().to_string(),
                     });
                 }
-                Err(message) => {
-                    let _ = tx.send(Event::AddFailed { message });
+                Err(report) => {
+                    let _ = tx.send(Event::AddFailed {
+                        message: format!("{report:#}"),
+                    });
                 }
             }
         });
@@ -990,41 +1110,6 @@ async fn import_entry(
 
 /// Returns the new row's hash or `None` for a duplicate (skipped
 /// silently — no row, no queue job).
-async fn add_track_task(
-    services: &Services,
-    playlist_id: i64,
-    path: &std::path::Path,
-) -> Result<Option<(TrackHash, crate::tracks::TrackTags)>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let hash = TrackHash(crate::track::identity::hex_sha256(&bytes));
-    let tags = crate::track::identity::resolve_tags(&bytes, path);
-    let duration = crate::track::identity::probe_duration(&bytes, path);
-
-    if services
-        .playlist_store
-        .contains_hash(playlist_id, &hash)
-        .await
-        .map_err(|report| format!("{report:#}"))?
-    {
-        return Ok(None);
-    }
-
-    services
-        .playlist_store
-        .ensure_track(
-            playlist_id,
-            &hash,
-            &path.display().to_string(),
-            &tags.title,
-            &tags.artist,
-            duration,
-        )
-        .await
-        .map_err(|report| format!("{report:#}"))?;
-
-    Ok(Some((hash, tags)))
-}
-
 impl eframe::App for AutomixahUiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The bus drain is the frame's first act: render with confirmed
@@ -1046,7 +1131,14 @@ impl eframe::App for AutomixahUiApp {
                 stage,
                 bpm: &mut self.render_bpm,
             };
-            crate::playlist::view::panel(ctx, &mut self.playlist_state, &self.tracks, render)
+            crate::playlist::view::panel(
+                ctx,
+                &mut self.playlist_state,
+                &self.tracks,
+                &mut self.library_state,
+                &mut self.library_filter,
+                render,
+            )
         };
         self.handle_panel_actions(actions);
         if ctx.input(|i| i.key_pressed(egui::Key::Space))
@@ -1109,12 +1201,15 @@ impl eframe::App for AutomixahUiApp {
         }
 
         // Keep the UI live while a deck is loaded (playhead ticking), a
-        // load is in flight, any shown row is pending, or a mixdown is
-        // rendering (throttled progress).
+        // load is in flight, any shown row is pending, a mixdown is
+        // rendering (throttled progress), or a library scan is running
+        // (its progress events arrive on the raw bus channel, which
+        // schedules no repaints of its own).
         if self.deck.is_some()
             || self.load_in_flight
             || self.playlist_state.any_pending(&self.tracks)
             || self.render_cancel.is_some()
+            || self.library_state.is_scanning()
         {
             ctx.request_repaint();
         }
@@ -1307,6 +1402,33 @@ impl AutomixahUiApp {
     /// Flushes a pending save now.
     pub fn flush_save_if_due_for_test(&mut self) {
         self.flush_save_if_due();
+    }
+
+    /// Seeds library state as if a `LibraryLoaded` had applied.
+    pub fn seed_library_for_test(
+        &mut self,
+        roots: Vec<crate::library::store::LibraryRoot>,
+        entries: Vec<crate::library::store::LibraryEntry>,
+    ) {
+        self.library_state.roots = roots;
+        self.library_state.entries = entries;
+    }
+
+    /// Drives the library add-track path like a double-click would.
+    pub fn add_library_track_for_test(&mut self, hash: TrackHash) {
+        self.spawn_add_library_track(hash);
+    }
+
+    /// Selects a playlist by id without the contents load round-trip
+    /// (tests that only exercise the add path).
+    pub fn select_playlist_for_test(&mut self, id: i64) {
+        self.playlist_state.selected = Some(id);
+        self.playlist_state.contents = Contents::Loaded(Vec::new());
+    }
+
+    /// Blocks on the runtime until spawned tasks settle, then drains.
+    pub fn bus_receiver_for_test(&mut self) -> &std::sync::mpsc::Receiver<Event> {
+        self.bus.receiver_for_test()
     }
 }
 

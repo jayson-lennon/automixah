@@ -6,10 +6,64 @@
 //! jinn `AGENTS.md` pattern.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use error_stack::Report;
 
 use crate::store::{CueStoreService, GridStoreService};
+
+/// Single-flight latch for library scans.
+///
+/// The record's rule — one scan at a time — must hold across every spawn
+/// site, not just the guarded ones: the add-root path spawns
+/// unconditionally inside an async task, and two concurrent walkers
+/// double-count `files_seen`. `try_acquire` returns a `Drop`-released
+/// guard, so a crashed scan task can never wedge the latch shut.
+#[derive(Debug, Default)]
+pub struct ScanLatch {
+    busy: std::sync::atomic::AtomicBool,
+    /// A scan was requested while one ran; the finishing scan starts a
+    /// follow-up (roots are snapshotted at scan start, so a root added
+    /// mid-scan would otherwise stay unindexed).
+    rerun: std::sync::atomic::AtomicBool,
+}
+
+impl ScanLatch {
+    /// Acquires the latch; `None` while a scan is running.
+    #[must_use]
+    pub fn try_acquire(self: &std::sync::Arc<Self>) -> Option<ScanGuard> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+            .then(|| ScanGuard {
+                busy: std::sync::Arc::clone(self),
+            })
+    }
+
+    /// Records a request while a scan runs; the finishing task calls
+    /// `take_rerun` and starts a follow-up scan when it returns `true`.
+    pub fn request_rerun(&self) {
+        self.rerun.store(true, Ordering::Release);
+    }
+
+    /// Claims a pending rerun request, if any.
+    #[must_use]
+    pub fn take_rerun(&self) -> bool {
+        self.rerun.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Releases the owning `ScanLatch` on drop.
+#[derive(Debug)]
+pub struct ScanGuard {
+    busy: std::sync::Arc<ScanLatch>,
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.busy.busy.store(false, Ordering::Release);
+    }
+}
 
 /// Application filesystem paths, resolved once at startup.
 #[derive(Debug, Clone)]
@@ -44,7 +98,7 @@ impl AppPaths {
     }
 
     /// Test paths rooted in a temp dir.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__test-hooks"))]
     #[must_use]
     pub fn for_test(root: &std::path::Path) -> Self {
         Self {
@@ -73,6 +127,10 @@ pub struct Services {
     pub cue_store: CueStoreService,
     /// Playlist + track-tag persistence (SQLite behind a trait).
     pub playlist_store: crate::playlist::store::PlaylistStoreService,
+    /// Library index persistence (SQLite behind a trait).
+    pub library_store: crate::library::store::LibraryStoreService,
+    /// Single-flight latch: only one library scan runs at a time.
+    pub scan_latch: std::sync::Arc<ScanLatch>,
     /// Analysis backend used by the playlist queue (injected so tests
     /// can swap in `FakeAnalyzer`).
     pub analyzer: std::sync::Arc<dyn djcore::analyzer::AudioAnalyzer>,

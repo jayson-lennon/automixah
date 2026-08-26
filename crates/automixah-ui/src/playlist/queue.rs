@@ -246,6 +246,10 @@ pub(crate) mod tests {
             playlist_store: PlaylistStoreService::new(std::sync::Arc::new(
                 InMemoryPlaylistStore::new(),
             )),
+            library_store: crate::library::store::LibraryStoreService::new(std::sync::Arc::new(
+                crate::library::store::in_memory::InMemoryLibraryStore::new(),
+            )),
+            scan_latch: std::sync::Arc::default(),
             analyzer: std::sync::Arc::new(FakeAnalyzer::with_output(analyzer_output)),
             runtime,
         }

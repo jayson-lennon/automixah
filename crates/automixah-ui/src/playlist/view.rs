@@ -39,8 +39,6 @@ pub enum PanelAction {
     DeletePlaylist(i64),
     /// The Import button was clicked (the app opens the single-file M3U dialog).
     ImportPlaylist,
-    /// The Add… button was clicked (the app opens the file dialog).
-    AddTracks,
     /// A ready row was clicked (load into the grid editor).
     LoadRow(TrackHash),
     /// A row was dragged onto another row's slot (reorder).
@@ -82,18 +80,24 @@ pub struct RenderUiState<'a> {
     pub bpm: &'a mut f32,
 }
 
-/// Collected user intents from one panel paint; drained by the app.
+/// Intents from the whole bottom panel: playlist-side plus
+/// library-side in paint order.
 #[derive(Debug, Default)]
 pub struct PanelActions {
-    /// Intents in paint order.
+    /// Playlist-side intents in paint order.
     pub actions: Vec<PanelAction>,
+    /// Library-side intents in paint order.
+    pub library: crate::library::view::LibraryActions,
 }
 
-/// Draws the whole playlist panel. Returns the collected intents.
+/// Draws the whole bottom panel (four columns: library roots, library
+/// entries, playlist entries, playlists). Returns the collected intents.
 pub fn panel(
     ctx: &egui::Context,
     state: &mut PlaylistState,
     tracks: &Tracks,
+    library: &mut crate::library::LibraryState,
+    library_filter: &mut String,
     render: RenderUiState<'_>,
 ) -> PanelActions {
     let mut actions = PanelActions::default();
@@ -101,60 +105,108 @@ pub fn panel(
         .resizable(true)
         .default_height(220.0)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Playlists");
-                if ui.button("New").clicked() {
-                    actions.actions.push(PanelAction::NewPlaylist);
-                }
-                let import = ui.add_enabled(!state.import.busy, egui::Button::new("Import"));
-                if import.clicked() {
-                    actions.actions.push(PanelAction::ImportPlaylist);
-                }
-                if state.import.busy {
-                    ui.spinner();
-                    if let Some(progress) = state.import.progress {
-                        ui.weak(format!(
-                            "{} / {} · imported {} · skipped {}",
-                            progress.processed, progress.total, progress.imported, progress.skipped
-                        ));
-                    }
-                }
-                if let Some(status) = &state.import.result {
-                    ui.weak(status);
-                }
-                ui.separator();
-                if state.selected.is_some() {
-                    let add = ui.button("Add…");
-                    if state.adds_in_flight > 0 {
-                        ui.spinner();
-                    }
-                    if add.clicked() {
-                        actions.actions.push(PanelAction::AddTracks);
-                    }
-                }
-                if let Some(selected) = state.selected {
-                    ui.label(
-                        state
-                            .playlists
-                            .iter()
-                            .find(|p| p.id == selected)
-                            .map_or("", |p| p.name.as_str()),
-                    );
-                }
-            });
             render_controls(ui, render, &mut actions);
             ui.separator();
-            egui::SidePanel::left("playlist_list")
-                .resizable(false)
-                .default_width(160.0)
-                .show_inside(ui, |ui| {
-                    playlist_list(ui, state, &mut actions);
-                });
-            egui::CentralPanel::default().show_inside(ui, |ui| {
-                rows(ui, state, tracks, &mut actions);
-            });
+            four_columns(ui, state, tracks, library, library_filter, &mut actions);
         });
     actions
+}
+
+/// The four content columns under the render controls.
+fn four_columns(
+    ui: &mut egui::Ui,
+    state: &mut PlaylistState,
+    tracks: &Tracks,
+    library: &mut crate::library::LibraryState,
+    library_filter: &mut String,
+    actions: &mut PanelActions,
+) {
+    // Fixed-ish roots column on the far left.
+    egui::SidePanel::left("library_roots")
+        .resizable(true)
+        .default_width(170.0)
+        .show_inside(ui, |ui| {
+            crate::library::view::roots_column(ui, library, &mut actions.library);
+        });
+    // Entries column takes half of the remaining space; the playlist
+    // entries and playlists columns split the other half.
+    let remaining = ui.available_width();
+    let entries_width = remaining * 0.5;
+    let selected_hashes: Option<Vec<TrackHash>> = state.selected_rows().map(<[TrackHash]>::to_vec);
+    egui::SidePanel::left("library_entries")
+        .resizable(false)
+        .exact_width(entries_width)
+        .show_inside(ui, |ui| {
+            crate::library::view::entries_column(
+                ui,
+                library,
+                library_filter,
+                selected_hashes.as_deref(),
+                &mut actions.library,
+            );
+        });
+    egui::SidePanel::left("playlist_tracks")
+        .resizable(false)
+        .exact_width(remaining - entries_width - 150.0)
+        .show_inside(ui, |ui| {
+            playlist_tracks_column(ui, state, tracks, actions);
+        });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        playlists_column(ui, state, actions);
+    });
+}
+
+/// The playlist-entries column: header (selection name + add spinner)
+/// and the track rows.
+fn playlist_tracks_column(
+    ui: &mut egui::Ui,
+    state: &mut PlaylistState,
+    tracks: &Tracks,
+    actions: &mut PanelActions,
+) {
+    ui.horizontal(|ui| {
+        let name = state
+            .selected
+            .and_then(|id| state.playlists.iter().find(|p| p.id == id))
+            .map_or("", |p| p.name.as_str());
+        ui.strong(name);
+        if state.adds_in_flight > 0 {
+            ui.spinner();
+        }
+    });
+    ui.separator();
+    rows(ui, state, tracks, actions);
+}
+
+/// The playlists column: New/Import controls on top, the playlist list
+/// below.
+fn playlists_column(ui: &mut egui::Ui, state: &mut PlaylistState, actions: &mut PanelActions) {
+    ui.horizontal(|ui| {
+        ui.strong("Playlists");
+        if ui.button("New").clicked() {
+            actions.actions.push(PanelAction::NewPlaylist);
+        }
+        let import = ui.add_enabled(!state.import.busy, egui::Button::new("Import"));
+        if import.clicked() {
+            actions.actions.push(PanelAction::ImportPlaylist);
+        }
+    });
+    if state.import.busy {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            if let Some(progress) = state.import.progress {
+                ui.weak(format!(
+                    "{} / {} · imported {} · skipped {}",
+                    progress.processed, progress.total, progress.imported, progress.skipped
+                ));
+            }
+        });
+    }
+    if let Some(status) = &state.import.result {
+        ui.weak(status);
+    }
+    ui.separator();
+    playlist_list(ui, state, actions);
 }
 
 /// Mixdown controls: output path field, Browse, Render↔Cancel, and
@@ -988,6 +1040,8 @@ mod tests {
     #[test]
     fn no_ready_tracks_yields_none_and_fallback_color() {
         let tracks = crate::tracks::Tracks::default();
+        let _library = crate::library::LibraryState::default();
+        let _filter = String::new();
         let hashes: Vec<TrackHash> = Vec::new();
 
         let median = playlist_median_bpm(&tracks, &hashes);
@@ -1043,8 +1097,17 @@ mod tests {
         let mut out = String::new();
         let mut bpm = 138.0;
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            let _ = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
         state.rename.buffer = "  new  ".to_owned();
         let input = egui::RawInput {
@@ -1059,8 +1122,17 @@ mod tests {
         };
         let mut actions = PanelActions::default();
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            actions = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
 
         assert_eq!(
@@ -1084,8 +1156,17 @@ mod tests {
         let mut out = String::new();
         let mut bpm = 138.0;
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            let _ = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -1099,8 +1180,17 @@ mod tests {
         };
         let mut actions = PanelActions::default();
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(input, |ctx| {
-            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            actions = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
 
         assert!(actions.actions.is_empty(), "nothing submitted");
@@ -1118,20 +1208,38 @@ mod tests {
         let mut out = String::new();
         let mut bpm = 138.0;
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            let _ = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
         state.rename.buffer = "new".to_owned();
         // Click-away is another widget grabbing focus during a frame.
         let mut actions = PanelActions::default();
         let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.ctx()
                     .memory_mut(|m| m.request_focus(egui::Id::new("click_away_target")));
                 let _ = ui.allocate_space(egui::vec2(1.0, 1.0));
             });
-            actions = panel(ctx, &mut state, &tracks, render_slice(&mut out, &mut bpm));
+            actions = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                render_slice(&mut out, &mut bpm),
+            );
         });
 
         assert_eq!(

@@ -52,6 +52,8 @@ fn run() -> Result<(), Report<UiError>> {
         let playlist_store = automixah_ui_lib::playlist::store::sqlite::SqlitePlaylistStore::new(
             store.pool().clone(),
         );
+        let library_store =
+            automixah_ui_lib::library::store::sqlite::SqliteLibraryStore::new(store.pool().clone());
 
         Services {
             grid_store: GridStoreService::new(std::sync::Arc::new(store.clone())),
@@ -59,6 +61,10 @@ fn run() -> Result<(), Report<UiError>> {
             playlist_store: automixah_ui_lib::playlist::store::PlaylistStoreService::new(
                 std::sync::Arc::new(playlist_store),
             ),
+            library_store: automixah_ui_lib::library::store::LibraryStoreService::new(
+                std::sync::Arc::new(library_store),
+            ),
+            scan_latch: std::sync::Arc::default(),
             analyzer: std::sync::Arc::new(djcore::analyzer::StratumAnalyzer::new()),
             runtime,
             paths,

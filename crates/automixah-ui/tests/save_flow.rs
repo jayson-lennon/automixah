@@ -58,6 +58,10 @@ fn each_grid_mutation_flushes_one_put() {
         grid_store: GridStoreService::new(counting.clone()),
         cue_store: CueStoreService::new(Arc::new(InMemoryCueStore::new())),
         playlist_store: PlaylistStoreService::new(Arc::new(InMemoryPlaylistStore::new())),
+        library_store: automixah_ui_lib::library::store::LibraryStoreService::new(Arc::new(
+            automixah_ui_lib::library::store::in_memory::InMemoryLibraryStore::new(),
+        )),
+        scan_latch: std::sync::Arc::default(),
         analyzer: std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
             djcore::analyzer::AnalyzerOutput {
                 bpm: 128.0,

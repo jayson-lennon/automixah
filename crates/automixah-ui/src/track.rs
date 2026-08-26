@@ -307,6 +307,10 @@ mod tests {
             playlist_store: crate::playlist::store::PlaylistStoreService::new(std::sync::Arc::new(
                 crate::playlist::store::in_memory::InMemoryPlaylistStore::new(),
             )),
+            library_store: crate::library::store::LibraryStoreService::new(std::sync::Arc::new(
+                crate::library::store::in_memory::InMemoryLibraryStore::new(),
+            )),
+            scan_latch: std::sync::Arc::default(),
             analyzer: std::sync::Arc::new(djcore::analyzer::FakeAnalyzer::with_output(
                 djcore::analyzer::AnalyzerOutput {
                     bpm: 128.0,

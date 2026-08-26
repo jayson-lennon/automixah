@@ -10,7 +10,8 @@
 //! call the same [`run_migrations`] before reading grids.
 //!
 //! Versions today: v1 (`beat_grids`), v2 (musical-key columns on
-//! `beat_grids`), v3 (playlist tables), and v4 (`cue_points`). The runner structure mirrors the schema-crate pattern used by jinn's session store so additional versions slot in mechanically.
+//! `beat_grids`), v3 (playlist tables), v4 (`cue_points`), and v5 (library
+//! index tables). The runner structure mirrors the schema-crate pattern used by jinn's session store so additional versions slot in mechanically.
 
 use error_stack::{Report, ResultExt as _};
 use wherror::Error;
@@ -19,7 +20,7 @@ use wherror::Error;
 ///
 /// `run_pending` skips `BEGIN` when the DB is already at this version, so an
 /// up-to-date database pays no transaction cost on startup.
-const LATEST_VERSION: i32 = 4;
+const LATEST_VERSION: i32 = 5;
 
 /// Runs all pending schema migrations on the given connection.
 ///
@@ -149,6 +150,10 @@ fn apply_migration_chain(
         migrate_v4(conn)?;
         record_version(conn, 4, "create_cue_points")?;
     }
+    if current < 5 {
+        migrate_v5(conn)?;
+        record_version(conn, 5, "create_library_index")?;
+    }
     Ok(())
 }
 
@@ -239,6 +244,36 @@ fn migrate_v4(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrat
     Ok(())
 }
 
+/// v5: Library index — scanned root directories and their indexed audio
+/// files.
+///
+/// `library_files` rows are keyed by `(root_id, rel_path)`; the same
+/// content hash legitimately appears under multiple roots or paths, so
+/// there is no UNIQUE on `track_hash`. Referential behavior (children die
+/// with the root) is enforced in store code, not FK pragmas — the pool
+/// does not promise `foreign_keys` is enabled.
+fn migrate_v5(conn: &mut rusqlite::Connection) -> Result<(), Report<SchemaMigrationError>> {
+    conn.execute_batch(
+        "CREATE TABLE library_roots (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT,\
+         path TEXT NOT NULL UNIQUE,\
+         added_at INTEGER NOT NULL);\
+         CREATE TABLE library_files (\
+         root_id INTEGER NOT NULL,\
+         rel_path TEXT NOT NULL,\
+         track_hash TEXT NOT NULL,\
+         title TEXT NOT NULL,\
+         artist TEXT NOT NULL,\
+         duration_seconds REAL,\
+         mtime_secs INTEGER NOT NULL,\
+         size_bytes INTEGER NOT NULL,\
+         PRIMARY KEY (root_id, rel_path));",
+    )
+    .change_context(SchemaMigrationError)
+    .attach("failed to create library index tables")?;
+    Ok(())
+}
+
 /// Error type for schema migration failures.
 ///
 /// Carries no variants — the failure detail lives in the `error_stack::Report`
@@ -272,7 +307,81 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .expect("count versions");
-        assert_eq!(count, 4, "one version row per applied migration");
+        assert_eq!(count, 5, "one version row per applied migration");
+    }
+
+    // Given a fresh in-memory database.
+    // When migrations run.
+    // Then the library index tables exist and accept rows.
+    #[test]
+    fn v5_creates_library_index_tables() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("migrations apply");
+
+        conn.execute(
+            "INSERT INTO library_roots (path, added_at) VALUES ('/music', 1)",
+            [],
+        )
+        .expect("insert root");
+        conn.execute(
+            "INSERT INTO library_files (root_id, rel_path, track_hash, title, artist, \
+             duration_seconds, mtime_secs, size_bytes) \
+             VALUES (1, 'a/one.flac', 'h1', 'One', 'Artist', 61.0, 100, 2048)",
+            [],
+        )
+        .expect("insert file");
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM library_files WHERE root_id = 1 AND rel_path = 'a/one.flac'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read back");
+        assert_eq!(title, "One");
+    }
+
+    // Given a database migrated only to v4 with a stored grid row.
+    // When pending migrations run.
+    // Then the legacy row survives and the library tables exist.
+    #[test]
+    fn legacy_v4_row_survives_to_v5() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("full migrate");
+        // Rewind to v4 state: drop the v5 artifacts and its version row.
+        conn.execute_batch(
+            "DROP TABLE library_files;\
+             DROP TABLE library_roots;\
+             DELETE FROM _migrations WHERE version = 5;",
+        )
+        .expect("rewind to v4");
+        conn.execute(
+            "INSERT INTO beat_grids (track_hash, grid_bpm, anchor_seconds, downbeat_phase, \
+             key_root, key_mode, updated_at) VALUES ('legacy', 128.0, 0.5, 2, 9, 1, 1)",
+            [],
+        )
+        .expect("seed v4 row");
+        assert_eq!(current_version(&mut conn).expect("version"), 4);
+
+        // When the pending v5 migration runs.
+        run_migrations(&mut conn).expect("migrate v4 to v5");
+
+        let bpm: f64 = conn
+            .query_row(
+                "SELECT grid_bpm FROM beat_grids WHERE track_hash = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row survives");
+        assert!((bpm - 128.0).abs() < 1e-9);
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                 AND name IN ('library_roots', 'library_files')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count library tables");
+        assert_eq!(tables, 2);
     }
 
     // Given a migrated database.
@@ -526,7 +635,7 @@ mod tests {
             )
             .is_ok()
         );
-        assert_eq!(current_version(&mut conn).expect("version"), 4);
+        assert_eq!(current_version(&mut conn).expect("version"), 5);
     }
 
     #[test]

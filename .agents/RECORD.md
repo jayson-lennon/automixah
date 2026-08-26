@@ -83,3 +83,14 @@ Entries are added or amended **only with human approval**.
 - (ui) Playlist track reordering is hash-addressed and optimistic: all loaded rows are draggable, upper/lower drop halves select before/after placement, and one FIFO persistence worker serializes writes with sequence-filtered success or rollback events.
 - (ui) automixah-ui imports one .m3u file per action into a newly created playlist named from the file stem, suffixing duplicate names with the lowest available (N) suffix.
 - (ui) M3U import accepts absolute local file paths, skips non-entry lines and unsupported entries, deduplicates tracks by content hash, preserves valid entry order, and reports imported and skipped counts.
+- (db) The library index persists multiple root directories and their indexed files to the library database (path, content hash, tags, duration, mtime, size), behind a `LibraryStore` trait with SQLite and in-memory backends.
+- (ui) Library rescans are triggered manually or by adding a root, never at startup; a scan reads each changed file once (hash, tags, duration), skips unchanged files by mtime+size, and prunes removed files.
+- (ui) A rescan refreshes a track's stored path when its content hash appears at a new location; playlists reference hashes, so moved files keep rendering and mixing.
+- (ui) The bottom panel has four columns: library roots, library entries, playlist entries, and playlists (with New and Import at the top of the playlists column).
+- (ui) Adding tracks to a playlist is double-click on a library entry; the system file picker add path is removed.
+- (ui) Library search uses comma-separated fuzzy terms ANDed over title/artist/path with matched-glyph highlighting; the parser emits typed term nodes so field filters (BPM, key) can extend it.
+- (ui) Library scan progress streams live: the walk enumerates and the scanner processes files incrementally, the display shows processed/discovered file counts during a scan, and the UI repaints while a scan is running.
+- (ui) Library scans split into a blocking-pool walker that streams discovered files to an async classifier (stat/hash/tags via spawn_blocking); progress reports per file as processed/discovered counts.
+- (ui) Scan progress is two-counter concurrent: the walker task reports file discovery (`seen`) independently of the classifier's per-file `done` count; the event sender merges both monotonic high-water marks so the wire event and applier stay unchanged.
+- (ui) Library scans are single-flight app-wide: a latch on `Services` drops any spawn while one scan runs (a concurrent walker pair previously double-counted scan progress), enforced in `spawn_scan` so every call site is covered.
+- (ui) A scan requested while another runs is queued as a follow-up full-library scan instead of dropped, so a folder added mid-scan is always indexed without a manual rescan.

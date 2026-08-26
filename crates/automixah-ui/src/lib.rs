@@ -6,6 +6,7 @@ pub mod audio;
 pub mod bus;
 pub mod deck;
 pub mod grid;
+pub mod library;
 pub mod playlist;
 pub mod services;
 pub mod store;

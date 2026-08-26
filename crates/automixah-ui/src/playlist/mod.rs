@@ -311,7 +311,15 @@ impl PlaylistState {
             | Event::RenderCancelled
             | Event::RenderFailed { .. }
             | Event::CommandFailed(_)
-            | Event::ReorderCommandFailed { .. } => {}
+            | Event::ReorderCommandFailed { .. }
+            // Library events are applied by the library state, not here.
+            | Event::LibraryLoaded { .. }
+            | Event::LibraryRootAdded(_)
+            | Event::LibraryRootRemoved(_)
+            | Event::LibraryScanStarted
+            | Event::LibraryScanProgress { .. }
+            | Event::LibraryScanDone { .. }
+            | Event::LibraryScanFailed { .. } => {}
         }
     }
 }
