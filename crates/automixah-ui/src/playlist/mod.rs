@@ -12,6 +12,7 @@
 //! is a delta event. Persistence lives in [`store`]; the analysis
 //! worker in [`queue`].
 
+pub mod layout;
 pub mod m3u;
 pub mod queue;
 pub mod reorder;

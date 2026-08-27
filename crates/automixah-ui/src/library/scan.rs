@@ -417,6 +417,10 @@ fn read_file(
         title: tags.title,
         artist: tags.artist,
         duration,
+        // Scan facts only: analysis columns are read-time joins over
+        // `beat_grids`, never written by the scanner.
+        bpm: None,
+        key: None,
         mtime_secs,
         size_bytes: i64::try_from(stat.len()).unwrap_or(0),
     })

@@ -212,6 +212,8 @@ mod tests {
             title: format!("Title {hash}"),
             artist: "Artist".to_owned(),
             duration: Some(61.0),
+            bpm: None,
+            key: None,
             mtime_secs: 100,
             size_bytes: 2048,
         }

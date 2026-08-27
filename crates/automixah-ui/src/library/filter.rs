@@ -176,6 +176,8 @@ mod tests {
             title: title.to_owned(),
             artist: artist.to_owned(),
             duration: None,
+            bpm: None,
+            key: None,
             mtime_secs: 0,
             size_bytes: 0,
         }

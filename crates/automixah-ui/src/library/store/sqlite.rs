@@ -48,7 +48,8 @@ impl From<RootRow> for LibraryRoot {
     }
 }
 
-/// Row shape for `SELECT … FROM library_files`.
+/// Row shape for the library-files listing (`LEFT JOIN` against
+/// `beat_grids` for analysis columns).
 #[derive(Debug, Clone)]
 struct FileRow {
     root_id: i64,
@@ -57,6 +58,9 @@ struct FileRow {
     title: String,
     artist: String,
     duration_seconds: Option<f64>,
+    grid_bpm: Option<f64>,
+    key_root: Option<i64>,
+    key_mode: Option<i64>,
     mtime_secs: i64,
     size_bytes: i64,
 }
@@ -70,6 +74,9 @@ impl FromRow for FileRow {
             title: row.get("title")?,
             artist: row.get("artist")?,
             duration_seconds: row.get("duration_seconds")?,
+            grid_bpm: row.get("grid_bpm")?,
+            key_root: row.get("key_root")?,
+            key_mode: row.get("key_mode")?,
             mtime_secs: row.get("mtime_secs")?,
             size_bytes: row.get("size_bytes")?,
         })
@@ -85,9 +92,31 @@ impl From<FileRow> for LibraryEntry {
             title: row.title,
             artist: row.artist,
             duration: row.duration_seconds,
+            bpm: row.grid_bpm,
+            key: crate::store::sqlite::decode_key(row.key_root, row.key_mode),
             mtime_secs: row.mtime_secs,
             size_bytes: row.size_bytes,
         }
+    }
+}
+
+/// Row shape for the scanner's change-detection projection.
+#[derive(Debug, Clone)]
+struct IndexedRow {
+    root_id: i64,
+    rel_path: String,
+    mtime_secs: i64,
+    size_bytes: i64,
+}
+
+impl FromRow for IndexedRow {
+    fn from_row(row: &daow::Row) -> daow::Result<Self> {
+        Ok(Self {
+            root_id: row.get("root_id")?,
+            rel_path: row.get("rel_path")?,
+            mtime_secs: row.get("mtime_secs")?,
+            size_bytes: row.get("size_bytes")?,
+        })
     }
 }
 
@@ -129,11 +158,17 @@ impl LibraryStore for SqliteLibraryStore {
     }
 
     async fn list_entries(&self) -> Result<Vec<LibraryEntry>, Report<LibraryStoreError>> {
+        // Read-time join, never denormalized: analysis facts live only in
+        // `beat_grids`, so saved-grid edits flow straight through.
         let rows: Vec<FileRow> = self
             .pool
             .query_all(
-                "SELECT root_id, rel_path, track_hash, title, artist, duration_seconds, \
-                 mtime_secs, size_bytes FROM library_files ORDER BY root_id, rel_path",
+                "SELECT f.root_id, f.rel_path, f.track_hash, f.title, f.artist, \
+                 f.duration_seconds, b.grid_bpm, b.key_root, b.key_mode, \
+                 f.mtime_secs, f.size_bytes \
+                 FROM library_files f \
+                 LEFT JOIN beat_grids b ON b.track_hash = f.track_hash \
+                 ORDER BY f.root_id, f.rel_path",
                 vec![],
             )
             .await
@@ -194,11 +229,11 @@ impl LibraryStore for SqliteLibraryStore {
     }
 
     async fn indexed_files(&self) -> Result<Vec<IndexedFile>, Report<LibraryStoreError>> {
-        let rows: Vec<FileRow> = self
+        let rows: Vec<IndexedRow> = self
             .pool
             .query_all(
-                "SELECT root_id, rel_path, track_hash, title, artist, duration_seconds, \
-                 mtime_secs, size_bytes FROM library_files ORDER BY root_id, rel_path",
+                "SELECT root_id, rel_path, mtime_secs, size_bytes FROM library_files \
+                 ORDER BY root_id, rel_path",
                 vec![],
             )
             .await
@@ -379,6 +414,10 @@ mod tests {
             title: format!("Title {hash}"),
             artist: "Artist".to_owned(),
             duration: Some(61.0),
+            // Scanner-produced shape: analysis columns are joins, never
+            // written.
+            bpm: None,
+            key: None,
             mtime_secs: 100,
             size_bytes: 2048,
         }
@@ -620,5 +659,130 @@ mod tests {
         assert_eq!(indexed[0].rel_path, PathBuf::from("one.flac"));
         assert_eq!(indexed[0].mtime_secs, 100);
         assert_eq!(indexed[0].size_bytes, 2048);
+    }
+
+    async fn seed_grid(
+        dir: &tempfile::TempDir,
+        hash: &str,
+        bpm: f32,
+        key: Option<djcore::key::Key>,
+    ) {
+        use crate::store::GridStore as _;
+
+        let grids =
+            crate::store::sqlite::SqliteGridStore::open_or_create(&dir.path().join("lib.sqlite"))
+                .await
+                .expect("grid store");
+        grids
+            .put(
+                &TrackHash(hash.to_owned()),
+                &crate::store::GridOverride {
+                    grid_bpm: bpm,
+                    anchor_seconds: 0.0,
+                    downbeat_phase: 0,
+                    updated_at: 100,
+                    key,
+                },
+            )
+            .await
+            .expect("put grid");
+    }
+
+    // Given an indexed file whose hash has a saved analysis grid.
+    // When entries are listed.
+    // Then the entry carries the grid's BPM and key.
+    #[tokio::test]
+    async fn list_entries_carries_saved_analysis() {
+        let (store, dir) = test_store().await;
+        let root = store.add_root("/music").await.expect("root");
+        store
+            .upsert_file(&entry(root.id, "one.flac", "h1"))
+            .await
+            .expect("one");
+        seed_grid(
+            &dir,
+            "h1",
+            174.0,
+            Some(djcore::key::Key {
+                root: 9,
+                mode: djcore::key::KeyMode::Minor,
+            }),
+        )
+        .await;
+
+        let entries = store.list_entries().await.expect("entries");
+
+        assert_eq!(entries[0].bpm, Some(174.0));
+        assert_eq!(
+            entries[0].key,
+            Some(djcore::key::Key {
+                root: 9,
+                mode: djcore::key::KeyMode::Minor,
+            })
+        );
+    }
+
+    // Given an indexed file whose hash was never analyzed.
+    // When entries are listed.
+    // Then the analysis columns are None, not an error.
+    #[tokio::test]
+    async fn list_entries_leaves_unanalyzed_columns_none() {
+        let (store, _dir) = test_store().await;
+        let root = store.add_root("/music").await.expect("root");
+        store
+            .upsert_file(&entry(root.id, "one.flac", "h1"))
+            .await
+            .expect("one");
+
+        let entries = store.list_entries().await.expect("entries");
+
+        assert_eq!(entries[0].bpm, None);
+        assert_eq!(entries[0].key, None);
+    }
+
+    // Given an indexed file whose hash has a saved grid.
+    // When the scanner refreshes the file row.
+    // Then the entry still carries the joined analysis facts.
+    #[tokio::test]
+    async fn rescan_does_not_disturb_joined_analysis() {
+        let (store, dir) = test_store().await;
+        let root = store.add_root("/music").await.expect("root");
+        store
+            .upsert_file(&entry(root.id, "one.flac", "h1"))
+            .await
+            .expect("first");
+        seed_grid(&dir, "h1", 128.0, None).await;
+
+        let mut refreshed = entry(root.id, "one.flac", "h1");
+        refreshed.mtime_secs = 200;
+        store.upsert_file(&refreshed).await.expect("rescan");
+
+        let entries = store.list_entries().await.expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].mtime_secs, 200);
+        assert_eq!(entries[0].bpm, Some(128.0), "join survives the rescan");
+    }
+
+    // Given one content hash indexed under two paths.
+    // When entries are listed.
+    // Then each file row appears once, each carrying the joined grid.
+    #[tokio::test]
+    async fn duplicate_hash_under_two_paths_lists_both_rows_once() {
+        let (store, dir) = test_store().await;
+        let root = store.add_root("/music").await.expect("root");
+        store
+            .upsert_file(&entry(root.id, "a/one.flac", "h1"))
+            .await
+            .expect("a");
+        store
+            .upsert_file(&entry(root.id, "b/one.flac", "h1"))
+            .await
+            .expect("b");
+        seed_grid(&dir, "h1", 140.0, None).await;
+
+        let entries = store.list_entries().await.expect("entries");
+
+        assert_eq!(entries.len(), 2, "no join multiplication");
+        assert!(entries.iter().all(|e| e.bpm == Some(140.0)));
     }
 }

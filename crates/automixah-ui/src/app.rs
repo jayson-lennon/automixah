@@ -54,6 +54,8 @@ pub struct AutomixahUiApp {
     pub(crate) library_state: crate::library::LibraryState,
     /// Library search box buffer (view-owned, like the render path).
     pub(crate) library_filter: String,
+    /// Library entries-table sort state (transient view input).
+    pub(crate) library_sort: crate::library::sort::SortState,
     /// Single-worker analysis queue (jobs in; bus events out).
     pub(crate) playlist_queue: crate::playlist::queue::AnalysisQueue,
     /// FIFO playlist reorder persistence queue.
@@ -105,6 +107,7 @@ impl AutomixahUiApp {
             playlist_state: crate::playlist::PlaylistState::default(),
             library_state: crate::library::LibraryState::default(),
             library_filter: String::new(),
+            library_sort: crate::library::sort::SortState::default(),
             playlist_queue,
             reorder_queue,
             deck: None,
@@ -1460,6 +1463,7 @@ impl eframe::App for AutomixahUiApp {
                 &self.tracks,
                 &mut self.library_state,
                 &mut self.library_filter,
+                &mut self.library_sort,
                 render,
             )
         };
@@ -2972,6 +2976,8 @@ mod render_tests {
             title: title.to_owned(),
             artist: "Artist".to_owned(),
             duration: Some(61.0),
+            bpm: None,
+            key: None,
             mtime_secs: 0,
             size_bytes: 0,
         }

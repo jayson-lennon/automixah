@@ -63,6 +63,8 @@ fn seeded_entry(hash: &str) -> LibraryEntry {
         title: "One".to_owned(),
         artist: "Artist".to_owned(),
         duration: Some(61.0),
+        bpm: None,
+        key: None,
         mtime_secs: 0,
         size_bytes: 0,
     }
@@ -169,4 +171,63 @@ fn add_library_track_duplicate_is_skipped() {
         }
     }
     assert!(saw_duplicate);
+}
+
+// Given a selected playlist that already holds two hydrated rows.
+// When a third track is added from the library.
+// Then the store APPENDS (existing rows keep their facts, the new row
+// carries the index's title/artist) — a regression guard for the
+// reported "double-click replaces the playlist with a blank entry".
+#[test]
+fn add_appends_and_preserves_existing_rows() {
+    let (services, playlist_store) = test_services();
+    let runtime = services.runtime.clone();
+    let list = runtime
+        .block_on(async { playlist_store.create_playlist("mix").await })
+        .expect("playlist");
+    // Pre-existing rows inserted directly through the store.
+    let existing: Vec<automixah_ui_lib::playlist::store::PersistedTrack> =
+        runtime.block_on(async {
+            playlist_store
+                .insert_track(
+                    list.id,
+                    &TrackHash("old1".to_owned()),
+                    "/a",
+                    "Old One",
+                    "A",
+                    None,
+                )
+                .await
+                .expect("insert old1");
+            playlist_store
+                .insert_track(
+                    list.id,
+                    &TrackHash("old2".to_owned()),
+                    "/b",
+                    "Old Two",
+                    "B",
+                    None,
+                )
+                .await
+                .expect("insert old2");
+            playlist_store.tracks_for(list.id).await.expect("rows")
+        });
+    assert_eq!(existing.len(), 2);
+
+    let mut app = seeded_app(services);
+    // The library seeds h1; add it through the double-click path.
+    app.select_playlist_for_test(list.id);
+    app.add_library_track_for_test(TrackHash("h1".to_owned()));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let rx = app.bus_receiver_for_test();
+    while rx.try_recv().is_ok() {}
+
+    let rows = runtime
+        .block_on(async { playlist_store.tracks_for(list.id).await })
+        .expect("rows");
+    assert_eq!(rows.len(), 3, "append, never replace");
+    assert_eq!(rows[0].title, "Old One");
+    assert_eq!(rows[0].track_hash.0, "old1");
+    assert_eq!(rows[2].title, "One");
+    assert_eq!(rows[2].artist, "Artist");
 }

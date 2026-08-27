@@ -18,6 +18,7 @@ use error_stack::Report;
 use wherror::Error;
 
 use automixah_engine::timeline::types::TrackHash;
+use djcore::key::Key;
 
 pub mod in_memory;
 pub mod sqlite;
@@ -54,6 +55,17 @@ pub struct LibraryEntry {
     pub artist: String,
     /// Container-probed duration in seconds, when known.
     pub duration: Option<f64>,
+    /// Joined analysis BPM, read at query time from the grid library;
+    /// `None` when the track has no saved beat grid.
+    ///
+    /// Not a scan fact and not persisted in `library_files` — always
+    /// reflects the current state of `beat_grids`.
+    pub bpm: Option<f64>,
+    /// Joined analysis key, read at query time from the grid library;
+    /// `None` when unknown.
+    ///
+    /// Same join semantics as [`LibraryEntry::bpm`].
+    pub key: Option<Key>,
     /// File mtime at scan time (unix seconds) — the incremental-scan
     /// unchanged check.
     pub mtime_secs: i64,
@@ -352,6 +364,11 @@ mod tests {
             title: "One".to_owned(),
             artist: "Artist".to_owned(),
             duration: Some(61.0),
+            bpm: Some(174.0),
+            key: Some(Key {
+                root: 9,
+                mode: djcore::key::KeyMode::Minor,
+            }),
             mtime_secs: 100,
             size_bytes: 2048,
         };

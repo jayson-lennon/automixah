@@ -27,6 +27,7 @@ automixah-engine = { path = "../automixah-engine" }
 
 eframe = "0.32"
 egui = "0.32"
+egui_extras = { version = "0.32", default-features = false }
 rfd = "0.15"
 cpal = "0.16"
 dirs = "6"

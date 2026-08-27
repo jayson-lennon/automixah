@@ -9,6 +9,7 @@
 
 pub mod filter;
 pub mod scan;
+pub mod sort;
 pub mod store;
 pub mod view;
 
@@ -116,6 +117,8 @@ mod tests {
             title: rel.to_owned(),
             artist: String::new(),
             duration: None,
+            bpm: None,
+            key: None,
             mtime_secs: 0,
             size_bytes: 0,
         }

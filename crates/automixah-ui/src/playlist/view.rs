@@ -22,7 +22,7 @@ use crate::tracks::{AnalysisState, Tracks};
 use automixah_engine::timeline::types::TrackHash;
 
 /// User intents emitted by the panel (the app wires them to stores).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanelAction {
     /// A playlist was clicked (selection change).
     SelectPlaylist(i64),
@@ -93,13 +93,15 @@ pub struct PanelActions {
 }
 
 /// Draws the whole bottom panel (four columns: library roots, library
-/// entries, playlist entries, playlists). Returns the collected intents.
+/// entries, playlist entries, playlists). Returns the intents this
+/// frame collected in emission order.
 pub fn panel(
     ctx: &egui::Context,
     state: &mut PlaylistState,
     tracks: &Tracks,
     library: &mut crate::library::LibraryState,
     library_filter: &mut String,
+    library_sort: &mut crate::library::sort::SortState,
     render: RenderUiState<'_>,
 ) -> PanelActions {
     let mut actions = PanelActions::default();
@@ -109,54 +111,220 @@ pub fn panel(
         .show(ctx, |ui| {
             render_controls(ui, render, &mut actions);
             ui.separator();
-            four_columns(ui, state, tracks, library, library_filter, &mut actions);
+            four_columns(
+                ui,
+                state,
+                tracks,
+                library,
+                library_filter,
+                library_sort,
+                &mut actions,
+            );
         });
     actions
 }
 
+/// Test-only panel-position capture: records where each named panel
+/// landed this frame so layout tests can assert against drift. Compiled
+/// out of non-test builds entirely.
+#[cfg(test)]
+pub(crate) mod panel_capture {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RECTS: RefCell<Vec<(&'static str, egui::Rect)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record(name: &'static str, rect: egui::Rect) {
+        RECTS.with(|r| r.borrow_mut().push((name, rect)));
+    }
+
+    /// Clears the buffer and returns nothing; call before a frame batch.
+    pub fn reset() {
+        RECTS.with(|r| r.borrow_mut().clear());
+        ROWS.with(|r| r.borrow_mut().clear());
+    }
+
+    /// Latest recorded rect for `name`.
+    pub fn latest(name: &str) -> Option<egui::Rect> {
+        RECTS.with(|r| {
+            r.borrow()
+                .iter()
+                .rev()
+                .find(|(n, _)| *n == name)
+                .map(|(_, rect)| *rect)
+        })
+    }
+
+    thread_local! {
+        static ROWS: RefCell<Vec<egui::Rect>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records one laid-out row slot, in paint order.
+    pub fn record_row(rect: egui::Rect) {
+        ROWS.with(|r| r.borrow_mut().push(rect));
+    }
+
+    /// Every row slot laid out during the last captured frame batch,
+    /// ordered top-to-bottom.
+    pub fn rows() -> Vec<egui::Rect> {
+        ROWS.with(|r| r.borrow().clone())
+    }
+}
+
 /// The four content columns under the render controls.
+///
+/// The four content columns under the render controls: two imposed
+/// rectangles — the library half and the playlist half — separated by
+/// a draggable divider. Each half is an egui child `Ui` opened with a
+/// fixed `max_rect`; children are clipped to it and cannot influence
+/// any other rect, because geometry flows top-down from pure math in
+/// [`super::layout`] with no content measurement feeding back.
 fn four_columns(
     ui: &mut egui::Ui,
     state: &mut PlaylistState,
     tracks: &Tracks,
     library: &mut crate::library::LibraryState,
     library_filter: &mut String,
+    library_sort: &mut crate::library::sort::SortState,
     actions: &mut PanelActions,
 ) {
-    // Fixed-ish roots column on the far left.
-    egui::SidePanel::left("library_roots")
-        .resizable(true)
-        .default_width(170.0)
-        .show_inside(ui, |ui| {
+    let row = ui.available_rect_before_wrap();
+    let fraction = ui
+        .ctx()
+        .data_mut(|d| d.get_persisted::<f32>(egui::Id::new(LIBRARY_FRACTION_KEY)))
+        .unwrap_or(crate::playlist::layout::DEFAULT_LIBRARY_FRACTION);
+    let rects = crate::playlist::layout::split_row(row, fraction);
+
+    // The divider: a slim grip whose drag rewrites the stored fraction.
+    let divider_response = ui
+        .interact(
+            rects.divider,
+            egui::Id::new("library_playlist_divider"),
+            egui::Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if divider_response.dragged() {
+        // Fraction straight from the pointer's absolute position: no
+        // delta accumulation, so vertical-only drags change nothing and
+        // no per-frame feedback term can drift the split.
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let new_fraction = (pointer.x - row.left()) / row.width();
+            store_fraction(ui.ctx(), new_fraction);
+        }
+    }
+    if divider_response.double_clicked() {
+        // Double-click resets to the even split.
+        store_fraction(ui.ctx(), crate::playlist::layout::DEFAULT_LIBRARY_FRACTION);
+    }
+    {
+        let painter = ui.painter();
+        let grip = egui::Rect::from_center_size(
+            rects.divider.center(),
+            egui::vec2(2.0, rects.divider.height() * 0.9),
+        );
+        let color = if divider_response.hovered() || divider_response.dragged() {
+            egui::Color32::from_gray(140)
+        } else {
+            egui::Color32::from_gray(60)
+        };
+        painter.rect_filled(grip, 1.0, color);
+    }
+
+    let library_side = super::layout::LibraryWidths::from_side(rects.library.width());
+    open_half(ui, "library", rects.library, |ui| {
+        let roots = egui::Rect::from_min_size(
+            rects.library.min,
+            egui::vec2(library_side.roots, rects.library.height()),
+        );
+        let entries = egui::Rect::from_min_size(
+            roots.right_top(),
+            egui::vec2(library_side.entries, rects.library.height()),
+        );
+        let clip = rects.library;
+        child_column(ui, clip, "roots", roots, |ui| {
             crate::library::view::roots_column(ui, library, &mut actions.library);
         });
-    // Entries column takes half of the remaining space; the playlist
-    // entries and playlists columns split the other half.
-    let remaining = ui.available_width();
-    let entries_width = remaining * 0.5;
-    let selected_hashes: Option<Vec<TrackHash>> = state.selected_rows().map(<[TrackHash]>::to_vec);
-    egui::SidePanel::left("library_entries")
-        .resizable(false)
-        .exact_width(entries_width)
-        .show_inside(ui, |ui| {
+        child_column(ui, clip, "entries", entries, |ui| {
             crate::library::view::entries_column(
                 ui,
                 library,
                 Some(tracks),
                 library_filter,
-                selected_hashes.as_deref(),
+                library_sort,
+                state.selected_rows().map(<[TrackHash]>::to_vec).as_deref(),
                 &mut actions.library,
             );
         });
-    egui::SidePanel::left("playlist_tracks")
-        .resizable(false)
-        .exact_width(remaining - entries_width - 150.0)
-        .show_inside(ui, |ui| {
+    });
+    let playlist_side = super::layout::PlaylistWidths::from_side(rects.playlist.width());
+    open_half(ui, "playlists_half", rects.playlist, |ui| {
+        let tracks_col = egui::Rect::from_min_size(
+            rects.playlist.min,
+            egui::vec2(playlist_side.tracks, rects.playlist.height()),
+        );
+        let playlists_col = egui::Rect::from_min_size(
+            tracks_col.right_top(),
+            egui::vec2(playlist_side.playlists, rects.playlist.height()),
+        );
+        let clip = rects.playlist;
+        child_column(ui, clip, "playlist_tracks", tracks_col, |ui| {
             playlist_tracks_column(ui, state, tracks, actions);
         });
-    egui::CentralPanel::default().show_inside(ui, |ui| {
-        playlists_column(ui, state, actions);
+        child_column(ui, clip, "playlists", playlists_col, |ui| {
+            playlists_column(ui, state, actions);
+        });
     });
+}
+
+const LIBRARY_FRACTION_KEY: &str = "playlist_library_fraction";
+
+fn store_fraction(ctx: &egui::Context, fraction: f32) {
+    ctx.data_mut(|d| d.insert_persisted(egui::Id::new(LIBRARY_FRACTION_KEY), fraction));
+}
+
+/// Opens one half as its own clipped universe: fixed `max_rect`, no
+/// escape hatch. Content painting outside is cut at the boundary;
+/// content *measuring* outside changes nothing elsewhere by
+/// construction.
+fn open_half(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    rect: egui::Rect,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    ui.scope_builder(
+        egui::UiBuilder::new().id_salt(name).max_rect(rect),
+        |child| {
+            child.set_clip_rect(rect);
+            content(child);
+        },
+    );
+}
+
+/// Lays out one fixed-width column inside its half at an explicitly
+/// given rectangle. Rectangles are pre-computed by the caller; no
+/// cursor state participates, so column placement can never depend on
+/// what a previous column contained.
+fn child_column(
+    ui: &mut egui::Ui,
+    parent_clip: egui::Rect,
+    name: &'static str,
+    rect: egui::Rect,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    #[cfg(test)]
+    panel_capture::record(name, rect);
+    // Paint on the half's layer but clip to the exact column slice, so
+    // even unclipped widget internals stay inside their own column.
+    ui.scope_builder(
+        egui::UiBuilder::new().id_salt(name).max_rect(rect),
+        |child| {
+            child.set_clip_rect(rect.intersect(parent_clip));
+            content(child);
+        },
+    );
 }
 
 /// The playlist-entries column: header (selection name + add spinner)
@@ -402,90 +570,506 @@ fn rows(ui: &mut egui::Ui, state: &mut PlaylistState, tracks: &Tracks, actions: 
     };
     let hashes = hashes.as_slice();
     let median_bpm = playlist_median_bpm(tracks, hashes);
-    let row_height = ui.text_style_height(&egui::TextStyle::Body) * 1.4;
+    let style = crate::library::view::RowStyle::resolve(ui);
+    let header_font = egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body));
+
+    // Right-pinned column geometry. Widths are computed ONCE per frame
+    // from the container's right edge — content plays no part, so no
+    // track can ever move or squeeze these columns. Key/Duration keep
+    // their header-derived widths; the artist/title boundary is the
+    // user-adjustable one.
+    let available = ui.available_rect_before_wrap();
+    let [bpm_w, key_w, duration_w] = ["BPM", "Key", "Duration"]
+        .map(|label| crate::library::view::header_column_width(ui.ctx(), label, &header_font));
+
+    const COL_SPACING: f32 = 4.0;
+    // Lay out right-to-left: the pinned metadata cluster first.
+    let duration_r = egui::Rect::from_min_size(
+        egui::pos2(available.right() - duration_w, available.top()),
+        egui::vec2(duration_w, available.height()),
+    );
+    let key_r = egui::Rect::from_min_size(
+        egui::pos2(duration_r.left() - COL_SPACING - key_w, available.top()),
+        egui::vec2(key_w, available.height()),
+    );
+    let bpm_r = egui::Rect::from_min_size(
+        egui::pos2(key_r.left() - COL_SPACING - bpm_w, available.top()),
+        egui::vec2(bpm_w, available.height()),
+    );
+
+    // The user-resizable artist width (persisted across restarts),
+    // clamped so Title always keeps at least half of the text strip.
+    let text_left = available.left();
+    let title_right = bpm_r.left() - COL_SPACING;
+    let artist_max = ((title_right - text_left) * 0.5).max(24.0);
+    // The 50% cap always wins over the floor when the half itself gets
+    // tiny — order the limits so the range can never invert.
+    let artist_min = 40.0_f32.min(artist_max);
+    let artist_w = ui
+        .ctx()
+        .data_mut(|d| d.get_persisted::<f32>(egui::Id::new(ARTIST_WIDTH_KEY)))
+        .unwrap_or(ARTIST_COLUMN_WIDTH)
+        .clamp(artist_min, artist_max);
+    let artist_r = egui::Rect::from_min_size(
+        egui::pos2(text_left + GLYPH_RESERVE, available.top()),
+        egui::vec2(artist_w, available.height()),
+    );
+    let title_r = egui::Rect::from_min_size(
+        egui::pos2(artist_r.right() + COL_SPACING, available.top()),
+        egui::vec2(
+            (title_right - artist_r.right() - COL_SPACING).max(0.0),
+            available.height(),
+        ),
+    );
+    let columns = PlaylistColumns {
+        rows: available,
+        glyph: egui::Rect::from_min_size(
+            available.min,
+            egui::vec2(GLYPH_RESERVE, available.height()),
+        ),
+        artist: artist_r,
+        title: title_r,
+        bpm: bpm_r,
+        key: key_r,
+        duration: duration_r,
+    };
+
+    draw_playlist_header(ui, &columns, &style);
+
+    // The artist/title resize handle sits between those two columns:
+    // dragging it redistributes space inside the text strip while the
+    // pinned metadata cluster never moves.
+    let handle_rect = egui::Rect::from_min_max(
+        egui::pos2(title_r.left() - COL_SPACING - 4.0, available.top()),
+        egui::pos2(title_r.left() + 2.0, available.bottom()),
+    );
+    #[cfg(test)]
+    panel_capture::record("artist_handle", handle_rect);
+    let handle = ui
+        .interact(
+            handle_rect,
+            egui::Id::new("playlist_artist_title_resize"),
+            egui::Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeColumn);
+    if handle.dragged() {
+        // Absolute-position math again: no deltas, no feedback.
+        if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+            let new_artist_w = (pointer.x - artist_r.left()).clamp(artist_min, artist_max);
+            store_artist_width(ui.ctx(), new_artist_w);
+        }
+    }
+    {
+        let painter = ui.painter();
+        let color = if handle.hovered() || handle.dragged() {
+            ui.visuals().widgets.hovered.bg_stroke.color
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        painter.line_segment(
+            [
+                egui::pos2(title_r.left() - COL_SPACING / 2.0, available.top()),
+                egui::pos2(title_r.left() - COL_SPACING / 2.0, available.bottom()),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+
+    #[cfg(test)]
+    for (name, rect) in [
+        ("header_glyph", columns.glyph),
+        ("header_artist", columns.artist),
+        ("header_title", columns.title),
+        ("header_bpm", columns.bpm),
+        ("header_key", columns.key),
+        ("header_duration", columns.duration),
+    ] {
+        panel_capture::record(name, rect);
+    }
+
     let mut drop: Option<(TrackHash, TrackHash, bool)> = None;
     let mut prev_key: Option<djcore::key::Key> = None;
-    egui::ScrollArea::vertical().show_rows(ui, row_height, hashes.len(), |ui, range| {
-        for i in range {
-            let hash = &hashes[i];
-            let record = tracks.get(hash);
-            let analysis = record.map(|r| &r.analysis);
-            // Clicking remains analysis-dependent, but drag payloads are
-            // available for every loaded row so ordering does not depend on
-            // analysis state.
-            let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
-            let item_id = egui::Id::new(("playlist-row", hash));
-            let response = ui
-                .push_id(item_id, |ui| {
-                    row_ui(
-                        ui,
-                        RowDisplay {
-                            record,
-                            analysis,
-                            prev_key: prev_key.clone(),
-                            median_bpm,
-                            interactive,
-                        },
-                        row_height,
-                    )
-                })
-                .inner;
-            response.dnd_set_drag_payload(hash.clone());
-
-            // While another row is dragged, `hovered` is false by design;
-            // dnd_hover_payload/contains_pointer are the drop-zone APIs.
-            if let (Some(pointer), Some(_)) = (
-                ui.input(|input| input.pointer.interact_pos()),
-                response.dnd_hover_payload::<TrackHash>(),
-            ) {
-                let insert_after = pointer.y >= response.rect.center().y;
-                let y = if insert_after {
-                    response.rect.bottom()
-                } else {
-                    response.rect.top()
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, style.height, hashes.len(), |ui, range| {
+            // Rows are hand-painted at exact height multiples; any
+            // inter-item spacing would advance the cursor further than
+            // show_rows' virtualization math strides.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for index in range {
+                let hash = &hashes[index];
+                let record = tracks.get(hash);
+                let analysis = record.map(|r| &r.analysis);
+                let interactive = analysis.is_some_and(|a| a.is_ready() || a.is_pending());
+                let row_context = PlaylistRowContext {
+                    record,
+                    analysis,
+                    prev_key: prev_key.clone(),
+                    median_bpm,
+                    interactive,
+                    path: record.map_or_else(String::new, |r| r.tags.path.display().to_string()),
                 };
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(response.rect.left(), y),
-                        egui::pos2(response.rect.right(), y),
-                    ],
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 60)),
+                let mut drop_here = None;
+                playlist_row(
+                    ui,
+                    (&columns, &style),
+                    row_context,
+                    hash,
+                    actions,
+                    &mut drop_here,
                 );
-                if let Some(released) = response.dnd_release_payload::<TrackHash>() {
-                    drop = Some((released.as_ref().clone(), hash.clone(), insert_after));
+                if let Some(d) = drop_here {
+                    drop = Some(d);
+                }
+                if let Some(AnalysisState::Ready(a)) = analysis {
+                    prev_key = Some(a.key.clone());
                 }
             }
-            if let Some(action) = load_action_for_row(
-                hash,
-                interactive,
-                response.clicked_by(egui::PointerButton::Primary),
-                response.dragged(),
-            ) {
-                actions.actions.push(action);
-            }
-            if let Some(action) = preview_action_for_row(
-                hash,
-                response.clicked_by(egui::PointerButton::Middle),
-                response.dragged_by(egui::PointerButton::Middle),
-            ) {
-                actions.actions.push(action);
-            }
-            response.context_menu(|ui| {
-                if ui.button("Remove").clicked() {
-                    actions
-                        .actions
-                        .push(PanelAction::RemoveRow { hash: hash.clone() });
-                    ui.close();
-                }
-            });
-            if let Some(AnalysisState::Ready(a)) = analysis {
-                prev_key = Some(a.key.clone());
-            }
-        }
-    });
+        });
     if let Some(action) = move_action_for_drop(drop) {
         actions.actions.push(action);
     }
+}
+
+/// Pre-computed column rectangles for one frame of the playlist rows.
+///
+/// Every consumer derives its pixels from these; nothing measures
+/// content horizontally, so track text can never move a column.
+struct PlaylistColumns {
+    /// Full row strip (all six columns).
+    rows: egui::Rect,
+    glyph: egui::Rect,
+    artist: egui::Rect,
+    title: egui::Rect,
+    bpm: egui::Rect,
+    key: egui::Rect,
+    duration: egui::Rect,
+}
+
+/// Header labels painted over the same column rects as the body rows.
+fn draw_playlist_header(
+    ui: &mut egui::Ui,
+    columns: &PlaylistColumns,
+    style: &crate::library::view::RowStyle,
+) {
+    let allocate_label = |ui: &mut egui::Ui, rect: egui::Rect, label: &str| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(label).weak())
+                    .truncate()
+                    .sense(egui::Sense::hover()),
+            );
+        });
+    };
+    let top = columns.rows.top();
+    for (rect, label) in [
+        (columns.glyph, ""),
+        (columns.artist, "Artist"),
+        (columns.title, "Title"),
+        (columns.bpm, "BPM"),
+        (columns.key, "Key"),
+        (columns.duration, "Duration"),
+    ] {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), top),
+            egui::vec2(rect.width(), style.height),
+        );
+        allocate_label(ui, cell, label);
+    }
+}
+
+const ARTIST_WIDTH_KEY: &str = "playlist_artist_column_width";
+
+fn store_artist_width(ctx: &egui::Context, width: f32) {
+    ctx.data_mut(|d| d.insert_persisted(egui::Id::new(ARTIST_WIDTH_KEY), width));
+}
+
+/// Fixed left inset reserving room for the status glyph in every row.
+const GLYPH_RESERVE: f32 = 28.0;
+
+/// Default artist-column width; user-resizable between the drag
+/// handle's clamps.
+const ARTIST_COLUMN_WIDTH: f32 = 140.0;
+
+/// Per-row display facts derived at render time from the record.
+struct PlaylistRowContext<'a> {
+    record: Option<&'a crate::tracks::TrackRecord>,
+    analysis: Option<&'a AnalysisState>,
+    prev_key: Option<djcore::key::Key>,
+    median_bpm: Option<f32>,
+    interactive: bool,
+    /// Full file path for the hover tooltip.
+    path: String,
+}
+
+/// One virtualized playlist row: six cells (glyph, artist, title,
+/// bpm, key, duration); the union of cell responses carries
+/// click-to-load, DnD drag payload, hover tooltip, and context menu.
+fn playlist_row(
+    ui: &mut egui::Ui,
+    layout: (&PlaylistColumns, &crate::library::view::RowStyle),
+    context: PlaylistRowContext<'_>,
+    hash: &TrackHash,
+    actions: &mut PanelActions,
+    drop: &mut Option<(TrackHash, TrackHash, bool)>,
+) {
+    let (columns, style) = layout;
+    // The row OCCUPIES layout space before anything paints on it: hand-
+    // painted cells neither allocate nor advance the cursor, so without
+    // this allocation every virtualized row measures the same frozen
+    // cursor position and stacks on one rect.
+    let row_rect = ui
+        .allocate_exact_size(
+            egui::vec2(columns.rows.width(), style.height),
+            egui::Sense::hover(),
+        )
+        .0;
+    #[cfg(test)]
+    panel_capture::record_row(row_rect);
+    let ready = context.analysis.and_then(|a| match a {
+        AnalysisState::Ready(a) => Some(a),
+        _ => None,
+    });
+
+    // Glyph + spinner state derived from the analysis state.
+    let weak_color = style.metadata;
+    let strong_color = style.main;
+    let (glyph, glyph_color) = match context.analysis {
+        Some(AnalysisState::Ready(_)) => ("\u{25c9}", strong_color),
+        Some(AnalysisState::Queued) | None => ("🕓", weak_color),
+        Some(AnalysisState::Analyzing) => ("⭕", weak_color),
+        Some(AnalysisState::Failed(_)) => ("!", Color32::RED),
+    };
+
+    let artist = context
+        .record
+        .map_or_else(String::new, |r| r.tags.artist.clone());
+    let title = context
+        .record
+        .map_or_else(String::new, |r| r.tags.title.clone());
+    let bpm_text = ready.map_or_else(|| "--".to_owned(), |a| format!("{:.0}", a.bpm));
+    let duration_text = ready.map_or_else(
+        || "---".to_owned(),
+        |a| {
+            format!(
+                "{}:{:02}",
+                (a.duration_seconds / 60.0) as u32,
+                (a.duration_seconds % 60.0) as u32
+            )
+        },
+    );
+    let key_text = ready.map_or_else(
+        || "--".to_owned(),
+        |a| a.key.format_with(djcore::key::KeyFormat::Camelot),
+    );
+    let key_color = key_display_color(ready.map(|a| a.key.clone()), context.prev_key, strong_color);
+    let bpm_color = ready.map_or(weak_color, |a| {
+        bpm_display_color(a.bpm, context.median_bpm, weak_color)
+    });
+
+    let tone = if context.interactive {
+        style.main
+    } else {
+        style.metadata
+    };
+
+    // Cell rects for this row (columns were computed for the full
+    // strip height).
+    let offset = row_rect.min.to_vec2() - columns.rows.min.to_vec2();
+    let cells: Vec<(&'static str, egui::Rect)> = [
+        ("glyph", columns.glyph),
+        ("artist", columns.artist),
+        ("title", columns.title),
+        ("bpm", columns.bpm),
+        ("key", columns.key),
+        ("duration", columns.duration),
+    ]
+    .into_iter()
+    .map(|(name, rect)| (name, rect.translate(offset).intersect(row_rect)))
+    .collect();
+
+    // The row is ONE interactive surface registered after its cells:
+    // sole owner of clicks/drags on the row, reliably hit-tested
+    // (scope containers are not). Cells themselves are paint-only.
+    let analyzing = matches!(context.analysis, Some(AnalysisState::Analyzing));
+    let row_id = egui::Id::new("playlist_row").with(&hash.0);
+    let response = ui
+        .interact(row_rect, row_id, egui::Sense::click_and_drag())
+        .on_hover_text(context.path.clone());
+
+    // Hover background reacts to the row surface, not per-cell probes.
+    let hovered = response.hovered();
+    for (name, rect) in &cells {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            continue;
+        }
+        #[cfg(test)]
+        panel_capture::record(
+            match *name {
+                "glyph" => "cell_glyph",
+                "artist" => "cell_artist",
+                "title" => "cell_title",
+                "bpm" => "cell_bpm",
+                "key" => "cell_key",
+                _ => "cell_duration",
+            },
+            *rect,
+        );
+        let painter = ui.painter_at(*rect);
+        let bg = if !context.interactive {
+            dimmed_color(ui)
+        } else if hovered {
+            hover_color(ui)
+        } else {
+            base_color(ui)
+        };
+        painter.rect_filled(rect.shrink(1.0), 2.0, bg);
+        match *name {
+            "glyph" => {
+                paint_glyph_cell(ui, *rect, analyzing, glyph, glyph_color, weak_color, style)
+            }
+            _ => {
+                let text = match *name {
+                    "artist" => &artist,
+                    "title" => &title,
+                    "bpm" => &bpm_text,
+                    "key" => &key_text,
+                    _ => &duration_text,
+                };
+                let color = match *name {
+                    "bpm" => bpm_color,
+                    "key" => key_color,
+                    "duration" => weak_color,
+                    _ => tone,
+                };
+                crate::library::view::painted_text_cell(ui, *rect, text.clone(), color, style);
+            }
+        }
+    }
+
+    response.dnd_set_drag_payload(hash.clone());
+
+    // While another row is dragged, `hovered` is false by design;
+    // dnd_hover_payload/contains_pointer are the drop-zone APIs.
+    if let (Some(pointer), Some(_)) = (
+        response.ctx.input(|input| input.pointer.interact_pos()),
+        response.dnd_hover_payload::<TrackHash>(),
+    ) {
+        let rect = response.rect;
+        let insert_after = pointer.y >= rect.center().y;
+        let y = if insert_after {
+            rect.bottom()
+        } else {
+            rect.top()
+        };
+        let painter = egui::Painter::new(response.ctx.clone(), response.layer_id, response.rect);
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 60)),
+        );
+        if let Some(released) = response.dnd_release_payload::<TrackHash>() {
+            *drop = Some((released.as_ref().clone(), hash.clone(), insert_after));
+        }
+    }
+    if let Some(action) = load_action_for_row(
+        hash,
+        context.interactive,
+        response.clicked_by(egui::PointerButton::Primary),
+        response.dragged(),
+    ) {
+        actions.actions.push(action);
+    }
+    if let Some(action) = preview_action_for_row(
+        hash,
+        response.clicked_by(egui::PointerButton::Middle),
+        response.dragged_by(egui::PointerButton::Middle),
+    ) {
+        actions.actions.push(action);
+    }
+    response.context_menu(|ui| {
+        if ui.button("Remove").clicked() {
+            actions
+                .actions
+                .push(PanelAction::RemoveRow { hash: hash.clone() });
+            ui.close();
+        }
+    });
+}
+
+/// Dimmed/lifted/fallback background shared by every playlist cell.
+fn dimmed_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_gray(22)
+    } else {
+        Color32::from_gray(252)
+    }
+}
+
+fn hover_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_gray(45)
+    } else {
+        Color32::from_gray(232)
+    }
+}
+
+fn base_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_gray(30)
+    } else {
+        Color32::from_gray(248)
+    }
+}
+
+/// Status glyph or animated spinner in the leading narrow cell.
+#[allow(clippy::too_many_arguments)]
+fn paint_glyph_cell(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    analyzing: bool,
+    glyph: &str,
+    glyph_color: Color32,
+    weak_color: Color32,
+    style: &crate::library::view::RowStyle,
+) {
+    let center_y = rect.center().y;
+    if analyzing {
+        let icon_size = ui.text_style_height(&egui::TextStyle::Body).min(16.0);
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 14.0, center_y),
+            egui::vec2(icon_size, icon_size),
+        );
+        egui::Spinner::new()
+            .color(weak_color)
+            .paint_at(ui, icon_rect);
+    } else {
+        let g = plain_galley(ui, glyph, style.font.clone(), glyph_color);
+        ui.painter_at(rect).galley(
+            egui::pos2(rect.left() + 8.0, center_y - g.size().y / 2.0),
+            g,
+            glyph_color,
+        );
+    }
+}
+
+/// A single-line galley of `text` in `color`.
+fn plain_galley(
+    ui: &egui::Ui,
+    text: &str,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut layout = egui::text::LayoutJob::default();
+    layout.append(
+        text,
+        0.0,
+        egui::text::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        },
+    );
+    ui.fonts(|f| f.layout_job(layout))
 }
 
 /// Converts a released payload into a reorder intent, ignoring cancellation
@@ -526,182 +1110,6 @@ fn preview_action_for_row(
     middle_dragged: bool,
 ) -> Option<PanelAction> {
     (middle_clicked && !middle_dragged).then_some(PanelAction::PreviewRow(hash.clone()))
-}
-
-/// Per-row display facts derived at render time: everything
-/// `paint_row_content` needs beyond the row's geometry.
-struct RowDisplay<'a> {
-    record: Option<&'a crate::tracks::TrackRecord>,
-    analysis: Option<&'a AnalysisState>,
-    prev_key: Option<djcore::key::Key>,
-    median_bpm: Option<f32>,
-    interactive: bool,
-}
-
-/// One track row: an interaction rect plus painted content.
-///
-/// Painting (not widgets) keeps scrolling with hundreds of rows cheap;
-/// the response carries click/drag/context-menu sense.
-fn row_ui(ui: &mut egui::Ui, display: RowDisplay<'_>, row_height: f32) -> egui::Response {
-    let desired = egui::vec2(ui.available_width(), row_height);
-    let (rect, response) = ui.allocate_at_least(desired, egui::Sense::click_and_drag());
-    let hovered = response.hovered();
-    let painter = ui.painter_at(rect);
-    let bg = if !display.interactive {
-        dimmed_row_color(ui)
-    } else if hovered {
-        hover_row_color(ui)
-    } else {
-        base_row_color(ui)
-    };
-    painter.rect_filled(rect.shrink(1.0), 2.0, bg);
-    let path = display
-        .record
-        .map_or(String::new(), |r| r.tags.path.display().to_string());
-    paint_row_content(ui, &painter, rect, display);
-    response.on_hover_text(path)
-}
-
-/// Row background by state (non-ready rows dim, hover lightens).
-fn base_row_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_gray(30)
-    } else {
-        Color32::from_gray(248)
-    }
-}
-
-/// See [`base_row_color`].
-fn hover_row_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_gray(45)
-    } else {
-        Color32::from_gray(232)
-    }
-}
-
-/// See [`base_row_color`].
-fn dimmed_row_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_gray(22)
-    } else {
-        Color32::from_gray(252)
-    }
-}
-
-/// Paints status icon, artist–title, and right-aligned metadata.
-///
-/// Every visible fact derives from the record: tags for the title,
-/// analysis state for glyph/metadata/interactivity.
-fn paint_row_content(
-    ui: &mut egui::Ui,
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    display: RowDisplay<'_>,
-) {
-    let font_id = egui::FontId::proportional(ui.text_style_height(&egui::TextStyle::Body) * 0.9);
-    let strong_color = ui.visuals().strong_text_color();
-    let weak_color = ui.visuals().weak_text_color();
-    let galley = |text: &str, color: Color32| {
-        let mut layout = egui::text::LayoutJob::default();
-        layout.append(
-            text,
-            0.0,
-            egui::text::TextFormat {
-                font_id: font_id.clone(),
-                color,
-                ..Default::default()
-            },
-        );
-        ui.fonts(|f| f.layout_job(layout))
-    };
-    let center_y = rect.center().y;
-    let mut x = rect.left() + 8.0;
-
-    // Status / affordance glyph — derived from the analysis state.
-    let (glyph, color) = match display.analysis {
-        Some(AnalysisState::Ready(_)) => (" ", strong_color),
-        Some(AnalysisState::Queued) | None => ("🕓", weak_color),
-        Some(AnalysisState::Analyzing) => ("⭕", weak_color),
-        Some(AnalysisState::Failed(_)) => ("!", Color32::RED),
-    };
-    let icon_size = ui.text_style_height(&egui::TextStyle::Body).min(16.0);
-    if matches!(display.analysis, Some(AnalysisState::Analyzing)) {
-        // Animated spinner at the glyph slot; repaint comes from the
-        // spinner itself.
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + icon_size / 2.0, center_y),
-            egui::vec2(icon_size, icon_size),
-        );
-        egui::Spinner::new()
-            .color(weak_color)
-            .paint_at(ui, icon_rect);
-        x += icon_size + 8.0;
-    } else {
-        let g = galley(glyph, color);
-        painter.galley(egui::pos2(x, center_y - g.size().y / 2.0), g.clone(), color);
-        x += g.size().x + 8.0;
-    }
-
-    // Artist – title from tags (dimmed while pending).
-    let title = display.record.map_or_else(String::new, |r| {
-        if r.tags.artist.is_empty() {
-            r.tags.title.clone()
-        } else {
-            format!("{} – {}", r.tags.artist, r.tags.title)
-        }
-    });
-    let title_color = if display.interactive {
-        strong_color
-    } else {
-        weak_color
-    };
-    let t = galley(&title, title_color);
-    painter.galley(
-        egui::pos2(x, center_y - t.size().y / 2.0),
-        t.clone(),
-        title_color,
-    );
-
-    // Right-aligned metadata: duration, key (colored), BPM — all from
-    // the analysis package when ready.
-    let ready = display.analysis.and_then(|a| match a {
-        AnalysisState::Ready(a) => Some(a),
-        _ => None,
-    });
-    let bpm = ready.map_or_else(|| "--".to_owned(), |a| format!("{:.0}", a.bpm));
-    let duration = ready.map_or_else(
-        || "---".to_owned(),
-        |a| {
-            format!(
-                "{}:{:02}",
-                (a.duration_seconds / 60.0) as u32,
-                (a.duration_seconds % 60.0) as u32
-            )
-        },
-    );
-    let key_text = ready.map_or_else(
-        || "--".to_owned(),
-        |a| a.key.format_with(djcore::key::KeyFormat::Camelot),
-    );
-    let key_color = key_display_color(ready.map(|a| a.key.clone()), display.prev_key, strong_color);
-    let d_galley = galley(&duration, weak_color);
-    let k_galley = galley(&key_text, key_color);
-    let bpm_color = ready.map_or(weak_color, |a| {
-        bpm_display_color(a.bpm, display.median_bpm, weak_color)
-    });
-    let b_galley = galley(&bpm, bpm_color);
-    let gap = 14.0;
-    let mut rx = rect.right() - 8.0;
-    for g in [&d_galley, &k_galley, &b_galley] {
-        rx -= g.size().x;
-        painter.galley(
-            egui::pos2(rx, center_y - g.size().y / 2.0),
-            g.clone(),
-            weak_color,
-        );
-        rx -= gap;
-    }
 }
 
 /// The upper half of a slot inserts before it; the lower half after.
@@ -809,10 +1217,13 @@ pub fn harmonic_color(distance: f32) -> Color32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn render_slice<'a>(mix_path: &'a mut String, bpm: &'a mut f32) -> RenderUiState<'a> {
+    pub(crate) fn render_slice<'a>(
+        mix_path: &'a mut String,
+        bpm: &'a mut f32,
+    ) -> RenderUiState<'a> {
         RenderUiState {
             mix_path,
             running: false,
@@ -1158,6 +1569,63 @@ mod tests {
         state
     }
 
+    // Given a focused, open rename editor.
+    // When the user presses Enter and then keeps rendering frames.
+    // Then exactly one rename action was emitted in total — the commit
+    // neither duplicates nor evaporates across subsequent frames.
+    #[test]
+    fn enter_commit_survives_multipass_frames() {
+        let mut state = editing_state();
+        let ctx = egui::Context::default();
+        ctx.options_mut(|o| o.max_passes = std::num::NonZeroUsize::new(2).expect("2 > 0"));
+        let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        // Frame 0: the editor appears (layout changes → discard + rerun).
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                &mut sort,
+                render_slice(&mut String::new(), &mut 138.0),
+            );
+        });
+
+        state.rename.buffer = "new".to_owned();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            let _ = panel(
+                ctx,
+                &mut state,
+                &tracks,
+                &mut library,
+                &mut filter,
+                &mut sort,
+                render_slice(&mut String::new(), &mut 138.0),
+            );
+        });
+
+        assert_eq!(
+            out.platform_output.num_completed_passes, 1,
+            "commit frame must not trigger another layout change"
+        );
+        assert!(!state.rename.matches(1), "editor closed");
+    }
+
     // Given the inline rename editor focused with a typed name.
     // When Enter is pressed.
     // Then a rename action with the typed name is emitted and the
@@ -1178,6 +1646,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1203,6 +1672,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1237,6 +1707,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1261,6 +1732,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1289,6 +1761,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1310,6 +1783,7 @@ mod tests {
                 &tracks,
                 &mut library,
                 &mut filter,
+                &mut crate::library::sort::SortState::default(),
                 render_slice(&mut out, &mut bpm),
             );
         });
@@ -1403,5 +1877,1546 @@ mod tests {
         let mid = harmonic_color(0.5);
         // 0.5 is halfway between green (40,200,100) and yellow (240,200,40).
         assert_eq!(mid, Color32::from_rgb(140, 200, 70));
+    }
+}
+
+#[cfg(test)]
+mod column_isolation {
+    //! Headless proof that no pointer gesture near the library seam can
+    //! move playlist-section geometry: the row is two imposed halves with
+    //! no resize grips, so sibling displacement has no mechanism.
+    use super::tests::render_slice;
+    use super::{panel_capture, *};
+    use automixah_engine::timeline::types::CuePoints;
+    use djcore::analyzer::BeatGrid;
+    // Given the four-column layout at the production viewport size.
+    // When the pointer presses at the library seam and drags right 80px.
+    // Then playlist_tracks must not move.
+    #[test]
+    fn seam_drag_shifts_playlist_columns() {
+        let ctx = egui::Context::default();
+        let mut state = PlaylistState::default();
+        let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        let mut run = |ctx: &egui::Context, raw: egui::RawInput| -> egui::FullOutput {
+            ctx.run(raw, |ctx| {
+                let mut out = String::new();
+                let mut bpm = 138.0_f32;
+                let render = RenderUiState {
+                    mix_path: &mut out,
+                    running: false,
+                    can_render: false,
+                    stage: None,
+                    bpm: &mut bpm,
+                };
+                panel(
+                    ctx,
+                    &mut state,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    render,
+                );
+            })
+        };
+        let screen = |pos| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events: pos,
+            ..egui::RawInput::default()
+        };
+
+        // Warm-up frames so layout settles.
+        panel_capture::reset();
+        run(&ctx, screen(vec![]));
+        run(&ctx, screen(vec![]));
+        let before = panel_capture::latest("playlist_tracks")
+            .expect("warm frame")
+            .min
+            .x;
+
+        // Hover the roots/entries boundary (formerly a resizable panel
+        // grip), press, and drag right through several frames.
+        let seam_x = 220.0; // inside the library half, far from any grip
+        let y = 300.0;
+        let at = |x: f32| vec![egui::Event::PointerMoved(egui::pos2(x, y))];
+        let press = |x: f32| {
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        run(&ctx, screen(at(seam_x)));
+        run(&ctx, screen(press(seam_x)));
+        for dx in [10.0, 30.0, 55.0, 80.0] {
+            run(&ctx, screen(at(seam_x + dx)));
+        }
+
+        let after = panel_capture::latest("playlist_tracks")
+            .expect("post-drag frame")
+            .min
+            .x;
+        assert_eq!(before, after, "playlist section must not move");
+    }
+
+    // Given the rendered bottom panel with its divider grip.
+    // When the pointer drags the divider left/right across several
+    // frames.
+    // Then the halves follow the pointer while both keep their
+    // minimum widths; releasing keeps the new split (persisted).
+    #[test]
+    fn divider_drag_moves_halves_and_respects_floors() {
+        let ctx = egui::Context::default();
+        let mut state = PlaylistState::default();
+        let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        let mut run = |ctx: &egui::Context, raw: egui::RawInput| {
+            ctx.run(raw, |ctx| {
+                let mut out = String::new();
+                let mut bpm = 138.0_f32;
+                panel(
+                    ctx,
+                    &mut state,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    RenderUiState {
+                        mix_path: &mut out,
+                        running: false,
+                        can_render: false,
+                        stage: None,
+                        bpm: &mut bpm,
+                    },
+                );
+            })
+        };
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        fn assert_close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 1e-3, "{what}: {a} vs {b}");
+        }
+        let press = |x, y| {
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let release = |x, y| {
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let at = |x, y| vec![egui::Event::PointerMoved(egui::pos2(x, y))];
+
+        for _ in 0..3 {
+            panel_capture::reset();
+            run(&ctx, screen(vec![]));
+        }
+        // Default split: divider is a 12px strip just right of the
+        // library half.
+        let divider_x = panel_capture::latest("entries")
+            .expect("warm frame")
+            .right()
+            + 6.0;
+        let y = 560.0;
+
+        // Press on the divider and drag it 100px left.
+        run(&ctx, screen(at(divider_x, y)));
+        run(&ctx, screen(press(divider_x, y)));
+        for dx in [-25.0, -50.0, -75.0, -100.0] {
+            run(&ctx, screen(at(divider_x + dx, y)));
+        }
+        run(&ctx, screen(release(divider_x - 100.0, y)));
+        for _ in 0..2 {
+            run(&ctx, screen(vec![]));
+        }
+        let dragged_left = panel_capture::latest("entries")
+            .expect("left frame")
+            .right();
+        assert!(
+            dragged_left < 634.0 - 90.0,
+            "library half shrank after dragging left: {dragged_left}"
+        );
+        // Halves still tile: playlist tracks starts one divider later.
+        assert_close(
+            panel_capture::latest("playlist_tracks").expect("pt").left() - dragged_left,
+            crate::playlist::layout::DIVIDER_WIDTH,
+            "divider gap after drag",
+        );
+
+        // Drag hard right toward the window edge: floors stop it before
+        // either half collapses.
+        run(&ctx, screen(at(dragged_left + 6.0, y)));
+        run(&ctx, screen(press(dragged_left + 6.0, y)));
+        for _ in 0..6 {
+            run(&ctx, screen(at(1500.0, y)));
+            run(&ctx, screen(at(1900.0, y)));
+        }
+        run(&ctx, screen(release(1900.0, y)));
+        for _ in 0..2 {
+            run(&ctx, screen(vec![]));
+        }
+        let maxed = panel_capture::latest("entries").expect("max").right();
+        // Library cannot take so much that the playlist half drops
+        // under PLAYLIST_MIN (280): entries.right <= 1280 - 12/2? -
+        // margins — check bounds loosely but strictly below full row.
+        assert!(
+            maxed < 1272.0 - crate::playlist::layout::PLAYLIST_MIN + 20.0,
+            "library half hit the floor well before the window edge: {maxed}"
+        );
+
+        // Release then re-render: position persists (no spring-back).
+        for _ in 0..2 {
+            run(&ctx, screen(vec![]));
+        }
+        assert_close(
+            panel_capture::latest("entries").expect("stable").right(),
+            maxed,
+            "split persists after release",
+        );
+    }
+
+    // Given the rendered bottom panel with its divider grip.
+    // When the pointer wiggles the divider purely vertically for many
+    // frames.
+    // Then the split does not drift at all — vertical drags are no-ops,
+    // so neither half can creep in any direction.
+    #[test]
+    fn vertical_divider_drag_causes_no_drift() {
+        let ctx = egui::Context::default();
+        let mut state = PlaylistState::default();
+        let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        let mut run = |ctx: &egui::Context, raw: egui::RawInput| {
+            ctx.run(raw, |ctx| {
+                let mut out = String::new();
+                let mut bpm = 138.0_f32;
+                panel(
+                    ctx,
+                    &mut state,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    RenderUiState {
+                        mix_path: &mut out,
+                        running: false,
+                        can_render: false,
+                        stage: None,
+                        bpm: &mut bpm,
+                    },
+                );
+            })
+        };
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+
+        for _ in 0..3 {
+            panel_capture::reset();
+            run(&ctx, screen(vec![]));
+        }
+        fn assert_close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 1e-3, "{what}: {a} vs {b}");
+        }
+        let x = panel_capture::latest("entries").expect("warm").right() + 6.0;
+        let start = panel_capture::latest("entries").expect("warm").right();
+        let press = |x, y| {
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+
+        // Grab the divider and jiggle up/down across many frames.
+        run(&ctx, screen(press(x, 500.0)));
+        for dy in [5.0, -7.0, 11.0, -3.0, 9.0, -13.0, 4.0, -6.0] {
+            run(
+                &ctx,
+                screen(vec![egui::Event::PointerMoved(egui::pos2(x, 500.0 + dy))]),
+            );
+        }
+        run(&ctx, screen(release_all()));
+        run(&ctx, screen(vec![]));
+
+        let settled = panel_capture::latest("entries").expect("settled");
+        assert_close(
+            settled.right(),
+            start,
+            "library half unmoved by vertical wiggle",
+        );
+    }
+
+    // Given a loaded playlist whose one track has absurdly long tags.
+    // When the panel renders into a deliberately narrow playlist half.
+    // Then the metadata columns sit at identical positions regardless
+    // of tag width — cells elide instead of overlapping.
+    #[test]
+    fn narrow_half_keeps_metadata_columns_content_proof() {
+        let build = |long: bool| {
+            let ctx = egui::Context::default();
+            let mut state = PlaylistState::default();
+            let mut tracks = crate::tracks::Tracks::default();
+            let hash = TrackHash("h1".to_owned());
+            let analysis = crate::tracks::Analysis {
+                grid: BeatGrid {
+                    grid_bpm: 174.0,
+                    anchor_seconds: 0.0,
+                    downbeats: vec![],
+                    beats: vec![],
+                    bars: vec![],
+                },
+                bpm: 174.0,
+                key: djcore::key::Key {
+                    root: 8,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 200.0,
+                cues: CuePoints::default(),
+            };
+            let record = crate::tracks::TrackRecord {
+                hash: hash.clone(),
+                tags: crate::tracks::TrackTags {
+                    title: if long {
+                        "T".repeat(300)
+                    } else {
+                        "t".to_owned()
+                    },
+                    artist: if long {
+                        "A".repeat(300)
+                    } else {
+                        "a".to_owned()
+                    },
+                    path: "/x/a.mp3".into(),
+                },
+                analysis: AnalysisState::Ready(analysis),
+            };
+            tracks.upsert(record);
+            state.contents = Contents::Loaded(vec![hash]);
+            let mut library = crate::library::LibraryState::default();
+            let mut filter = String::new();
+            let mut sort = crate::library::sort::SortState::default();
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1280.0, 720.0),
+                        )),
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| {
+                        let mut out = String::new();
+                        let mut bpm = 138.0_f32;
+                        panel_capture::reset();
+                        panel(
+                            ctx,
+                            &mut state,
+                            &tracks,
+                            &mut library,
+                            &mut filter,
+                            &mut sort,
+                            RenderUiState {
+                                mix_path: &mut out,
+                                running: false,
+                                can_render: false,
+                                stage: None,
+                                bpm: &mut bpm,
+                            },
+                        );
+                    },
+                );
+            }
+            (
+                panel_capture::latest("playlists").expect("col"),
+                panel_capture::latest("playlist_tracks").expect("half"),
+            )
+        };
+        let (playlists_short, _) = build(false);
+        let (playlists_long, _) = build(true);
+
+        // The far-right playlists column keeps the exact same rect
+        // under both contents: nothing leaked out of its cell.
+        assert_eq!(playlists_short, playlists_long);
+    }
+
+    // Given a loaded playlist with a very long title and the split
+    // dragged so the playlist half is at its narrowest.
+    // When the panel renders.
+    // Then every metadata header cell stays fully inside the tracks
+    // half — the title column absorbs the squeeze instead of
+    // overflowing and pinning BPM/Key/Duration off-screen.
+    #[test]
+    fn squeezed_half_keeps_metadata_cells_inside_tracks_rect() {
+        let ctx = egui::Context::default();
+        let mut state = PlaylistState::default();
+        let mut tracks = crate::tracks::Tracks::default();
+        let hash = TrackHash("h1".to_owned());
+        let analysis = crate::tracks::Analysis {
+            bpm: 174.0,
+            key: djcore::key::Key {
+                root: 8,
+                mode: djcore::key::KeyMode::Minor,
+            },
+            duration_seconds: 200.0,
+            grid: BeatGrid {
+                grid_bpm: 174.0,
+                anchor_seconds: 0.0,
+                downbeats: vec![],
+                beats: vec![],
+                bars: vec![],
+            },
+            cues: CuePoints::default(),
+        };
+        tracks.upsert(crate::tracks::TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "T".repeat(300),
+                artist: "A".repeat(300),
+                path: "/x/a.mp3".into(),
+            },
+            analysis: AnalysisState::Ready(analysis),
+        });
+        state.contents = Contents::Loaded(vec![hash]);
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        fn assert_close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 1e-3, "{what}: {a} vs {b}");
+        }
+
+        for _ in 0..3 {
+            panel_capture::reset();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let mut out = String::new();
+                    let mut bpm = 138.0_f32;
+                    panel(
+                        ctx,
+                        &mut state,
+                        &tracks,
+                        &mut library,
+                        &mut filter,
+                        &mut sort,
+                        RenderUiState {
+                            mix_path: &mut out,
+                            running: false,
+                            can_render: false,
+                            stage: None,
+                            bpm: &mut bpm,
+                        },
+                    );
+                },
+            );
+        }
+        let half = panel_capture::latest("playlist_tracks").expect("half");
+        for name in ["header_bpm", "header_key", "header_duration"] {
+            let cell = panel_capture::latest(name).expect(name);
+            assert!(
+                cell.right() <= half.right() + 1e-3,
+                "{name} escaped the tracks half: cell right {} > half right {}",
+                cell.right(),
+                half.right()
+            );
+            assert!(cell.width() > 20.0, "{name} collapsed");
+        }
+        // And duration ends flush inside the half (the table fills it).
+        let duration = panel_capture::latest("header_duration").expect("dur");
+        assert_close(
+            duration.right(),
+            half.right(),
+            "table fills the half exactly",
+        );
+    }
+
+    // Given a playlist rendered while its half was WIDE, with long
+    // titles.
+    // When the half then shrinks to its narrowest over more frames.
+    // Then BPM/Key/Duration header cells remain inside the tracks half.
+    #[test]
+    fn shrinking_half_keeps_metadata_visible_after_wide_start() {
+        let ctx = egui::Context::default();
+        let state = PlaylistState::default();
+        let mut tracks = crate::tracks::Tracks::default();
+        let hash = TrackHash("h1".to_owned());
+        let analysis = crate::tracks::Analysis {
+            bpm: 174.0,
+            key: djcore::key::Key {
+                root: 8,
+                mode: djcore::key::KeyMode::Minor,
+            },
+            duration_seconds: 200.0,
+            grid: BeatGrid {
+                grid_bpm: 174.0,
+                anchor_seconds: 0.0,
+                downbeats: vec![],
+                beats: vec![],
+                bars: vec![],
+            },
+            cues: CuePoints::default(),
+        };
+        tracks.upsert(crate::tracks::TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "T".repeat(300),
+                artist: "A".repeat(2),
+                path: "/x/a.mp3".into(),
+            },
+            analysis: AnalysisState::Ready(analysis),
+        });
+        let mut st = state;
+        st.contents = Contents::Loaded(vec![hash]);
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        let mut frame = |ctx: &egui::Context| {
+            panel_capture::reset();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let mut out = String::new();
+                    let mut bpm = 138.0_f32;
+                    panel(
+                        ctx,
+                        &mut st,
+                        &tracks,
+                        &mut library,
+                        &mut filter,
+                        &mut sort,
+                        RenderUiState {
+                            mix_path: &mut out,
+                            running: false,
+                            can_render: false,
+                            stage: None,
+                            bpm: &mut bpm,
+                        },
+                    );
+                },
+            );
+        };
+
+        // Wide start (this is where a huge title cell would get baked
+        // into egui_extras state, if that were possible).
+        for f in [0.8_f32; 4] {
+            ctx.data_mut(|d| d.insert_persisted(egui::Id::new(LIBRARY_FRACTION_KEY), f));
+            frame(&ctx);
+        }
+        // Squeeze far left across frames (like holding the drag).
+        for _ in 0..8 {
+            ctx.data_mut(|d| d.insert_persisted(egui::Id::new(LIBRARY_FRACTION_KEY), 0.02_f32));
+            frame(&ctx);
+        }
+        let half = panel_capture::latest("playlist_tracks").expect("half");
+        for name in ["header_bpm", "header_key", "header_duration"] {
+            let cell = panel_capture::latest(name).unwrap_or_else(|| panic!("{name} not painted"));
+            assert!(
+                cell.right() <= half.right() + 1e-3,
+                "{name} pinned off-screen after squeeze: right {} vs half {}",
+                cell.right(),
+                half.right()
+            );
+            assert!(cell.width() > 10.0, "{name} collapsed after squeeze");
+        }
+    }
+
+    // Given a seeded library entry and one ready playlist track, both
+    // rendered through the real panel.
+    // When the pointer single-clicks a playlist row's title cell.
+    // Then exactly one LoadRow action is emitted — the row must not
+    // require a double click and cell scoping must not swallow clicks.
+    #[test]
+    fn playlist_row_single_click_loads_into_editor() {
+        let ctx = egui::Context::default();
+        let mut tracks = crate::tracks::Tracks::default();
+        let hash = TrackHash("h1".to_owned());
+        let analysis = crate::tracks::Analysis {
+            bpm: 174.0,
+            key: djcore::key::Key {
+                root: 8,
+                mode: djcore::key::KeyMode::Minor,
+            },
+            duration_seconds: 200.0,
+            grid: BeatGrid {
+                grid_bpm: 174.0,
+                anchor_seconds: 0.0,
+                downbeats: vec![],
+                beats: vec![],
+                bars: vec![],
+            },
+            cues: CuePoints::default(),
+        };
+        tracks.upsert(crate::tracks::TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "song".into(),
+                artist: "act".into(),
+                path: "/x/s.mp3".into(),
+            },
+            analysis: AnalysisState::Ready(analysis),
+        });
+        let mut st = PlaylistState {
+            contents: Contents::Loaded(vec![hash.clone()]),
+            ..Default::default()
+        };
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut frame = |ctx: &egui::Context, raw: egui::RawInput| {
+            let mut out = String::new();
+            let mut bpm = 138.0_f32;
+            let mut actions = PanelActions::default();
+            let _ = ctx.run(raw, |ctx| {
+                actions = panel(
+                    ctx,
+                    &mut st,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    render_slice(&mut out, &mut bpm),
+                );
+            });
+            actions
+        };
+
+        for _ in 0..3 {
+            let _ = frame(&ctx, screen(vec![]));
+        }
+        // Click inside the playlist half on the first row. The playlist
+        // rows live in the lower strip; aim inside the captured
+        // "playlist_tracks" area, left portion (title zone).
+        panel_capture::reset();
+        let _ = frame(&ctx, screen(vec![]));
+        let half = panel_capture::latest("playlist_tracks").expect("half rect");
+        println!("CELL title={:?}", panel_capture::latest("cell_title"));
+        println!("CELL artist={:?}", panel_capture::latest("cell_artist"));
+        println!("HALF={half:?}");
+        println!("HANDLE={:?}", panel_capture::latest("artist_handle"));
+        // First data row sits below the painted column header.
+        let row_y = half.top() + 60.0;
+        let x = half.left() + 60.0;
+        let click = vec![
+            egui::Event::PointerButton {
+                pos: egui::pos2(x, row_y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: egui::pos2(x, row_y),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let actions = frame(&ctx, screen(click));
+        assert_eq!(
+            actions.actions,
+            vec![PanelAction::LoadRow(hash)],
+            "single click must load"
+        );
+    }
+
+    // Given a rendered library entry column with one indexed file.
+    // When the pointer double-clicks an entry row.
+    // Then an AddTrack intent is emitted to the library side of the
+    // panel's action output.
+    #[test]
+    fn library_row_double_click_emits_add_track() {
+        let ctx = egui::Context::default();
+        let mut tracks = crate::tracks::Tracks::default();
+        let hash = TrackHash("h1".to_owned());
+        let analysis = crate::tracks::Analysis {
+            bpm: 174.0,
+            key: djcore::key::Key {
+                root: 8,
+                mode: djcore::key::KeyMode::Minor,
+            },
+            duration_seconds: 200.0,
+            grid: BeatGrid {
+                grid_bpm: 174.0,
+                anchor_seconds: 0.0,
+                downbeats: vec![],
+                beats: vec![],
+                bars: vec![],
+            },
+            cues: CuePoints::default(),
+        };
+        tracks.upsert(crate::tracks::TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "lib song".into(),
+                artist: "lib act".into(),
+                path: "/x/l.mp3".into(),
+            },
+            analysis: AnalysisState::Ready(analysis),
+        });
+        let st = PlaylistState::default();
+        let mut library = crate::library::LibraryState::default();
+        let entry_hash = hash.clone();
+        library.entries.push(crate::library::LibraryEntry {
+            root_id: 1,
+            rel_path: "/x/l.mp3".into(),
+            hash: entry_hash,
+            title: "lib song".into(),
+            artist: "lib act".into(),
+            duration: Some(200.0),
+            bpm: None,
+            key: None,
+            mtime_secs: 0,
+            size_bytes: 0,
+        });
+        library.roots.push(crate::library::LibraryRoot {
+            id: 1,
+            path: "/x".into(),
+        });
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+        let _ = &mut tracks;
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut state = st;
+        let mut frame = |ctx: &egui::Context, raw: egui::RawInput| {
+            let mut out = String::new();
+            let mut bpm = 138.0_f32;
+            let mut actions = PanelActions::default();
+            let _ = ctx.run(raw, |ctx| {
+                actions = panel(
+                    ctx,
+                    &mut state,
+                    &crate::tracks::Tracks::default(),
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    render_slice(&mut out, &mut bpm),
+                );
+            });
+            actions
+        };
+
+        for _ in 0..3 {
+            let _ = frame(&ctx, screen(vec![]));
+        }
+        // Double-click inside the captured library entries column,
+        // on its first row.
+        panel_capture::reset();
+        let _ = frame(&ctx, screen(vec![]));
+        let _ = panel_capture::latest("entries");
+        // Warm frames ran; now aim at the actual painted title cell of
+        // the first row.
+        let cell = panel_capture::latest("library_cell_title").expect("title cell rect");
+        let pos = egui::pos2(cell.center().x, cell.center().y);
+        // Each pointer phase gets its own frame so egui's click counter
+        // sees a real two-click sequence.
+        let moved = vec![egui::Event::PointerMoved(pos)];
+        // Warm hit-testing: the widget under the pointer must exist for
+        // a full frame before presses register against it.
+        let _ = frame(&ctx, screen(moved.clone()));
+        let _ = frame(&ctx, screen(moved.clone()));
+        let btn = |pressed| {
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let _ = frame(&ctx, screen(btn(true)));
+        let _ = frame(&ctx, screen(btn(false)));
+        let _ = frame(&ctx, screen(btn(true)));
+        let actions = frame(&ctx, screen(btn(false)));
+        assert!(!actions.library.actions.is_empty(), "double click must add");
+    }
+
+    // Given the playlist rows with their right-pinned metadata columns.
+    // When the BPM separator handle is dragged.
+    // Then the persisted BPM width changes and survives restarts of the
+    // context; and when the half shrinks, the metadata columns stay
+    // glued to its right edge while Title absorbs the change.
+    #[test]
+    fn artist_title_handle_resizes_and_metadata_stay_pinned_right() {
+        fn frame_block(
+            ctx: &egui::Context,
+            st: &mut PlaylistState,
+            tracks: &Tracks,
+            library: &mut crate::library::LibraryState,
+            filter: &mut String,
+            sort: &mut crate::library::sort::SortState,
+        ) {
+            panel_capture::reset();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let mut out = String::new();
+                    let mut bpm = 138.0_f32;
+                    panel(
+                        ctx,
+                        st,
+                        tracks,
+                        library,
+                        filter,
+                        sort,
+                        RenderUiState {
+                            mix_path: &mut out,
+                            running: false,
+                            can_render: false,
+                            stage: None,
+                            bpm: &mut bpm,
+                        },
+                    );
+                },
+            );
+        }
+        let build = || {
+            let ctx = egui::Context::default();
+            let mut tracks = crate::tracks::Tracks::default();
+            let hash = TrackHash("h1".to_owned());
+            let analysis = crate::tracks::Analysis {
+                bpm: 174.0,
+                key: djcore::key::Key {
+                    root: 8,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 200.0,
+                grid: BeatGrid {
+                    grid_bpm: 174.0,
+                    anchor_seconds: 0.0,
+                    downbeats: vec![],
+                    beats: vec![],
+                    bars: vec![],
+                },
+                cues: CuePoints::default(),
+            };
+            tracks.upsert(crate::tracks::TrackRecord {
+                hash: hash.clone(),
+                tags: crate::tracks::TrackTags {
+                    title: "t".into(),
+                    artist: "a".into(),
+                    path: "/x".into(),
+                },
+                analysis: AnalysisState::Ready(analysis),
+            });
+            let st = PlaylistState {
+                contents: Contents::Loaded(vec![hash]),
+                ..Default::default()
+            };
+            (ctx, st, tracks)
+        };
+
+        // Drag the BPM handle left by 40px in one absolute move.
+        let (ctx, mut st, tracks) = build();
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+        for _ in 0..3 {
+            frame_block(&ctx, &mut st, &tracks, &mut library, &mut filter, &mut sort);
+        }
+        fn assert_close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 1e-3, "{what}: {a} vs {b}");
+        }
+        let before = panel_capture::latest("header_artist").expect("artist cell");
+        // Handle sits just right of the artist column.
+        let hx = panel_capture::latest("header_title")
+            .expect("title cell")
+            .left()
+            - 2.0;
+        let y = 500.0;
+        let press = |x| {
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let move_to = |x| vec![egui::Event::PointerMoved(egui::pos2(x, y))];
+        frame_block(&ctx, &mut st, &tracks, &mut library, &mut filter, &mut sort);
+        frame_block(&ctx, &mut st, &tracks, &mut library, &mut filter, &mut sort);
+        // press+drag via raw input frames:
+        {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    events: press(hx),
+                    ..egui::RawInput::default()
+                },
+                |_| {},
+            );
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    // Leftward: the artist column starts at its 50%-of-text-strip
+                    // ceiling, so shrinking is the direction with room.
+                    events: move_to(hx - 40.0),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let mut out = String::new();
+                    let mut bpm = 138.0_f32;
+                    panel_capture::reset();
+                    panel(
+                        &ctx.clone(),
+                        &mut st,
+                        &tracks,
+                        &mut library,
+                        &mut filter,
+                        &mut sort,
+                        RenderUiState {
+                            mix_path: &mut out,
+                            running: false,
+                            can_render: false,
+                            stage: None,
+                            bpm: &mut bpm,
+                        },
+                    );
+                },
+            );
+        }
+        // Release + settle.
+        {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    events: release_all(),
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    let mut out = String::new();
+                    let mut bpm = 138.0_f32;
+                    panel(
+                        &ctx.clone(),
+                        &mut st,
+                        &tracks,
+                        &mut library,
+                        &mut filter,
+                        &mut sort,
+                        RenderUiState {
+                            mix_path: &mut out,
+                            running: false,
+                            can_render: false,
+                            stage: None,
+                            bpm: &mut bpm,
+                        },
+                    );
+                },
+            );
+        }
+        frame_block(&ctx, &mut st, &tracks, &mut library, &mut filter, &mut sort);
+        let after = panel_capture::latest("header_artist").expect("artist after");
+        assert!(
+            after.width() < before.width() - 30.0,
+            "artist shrank when handle dragged left: {} -> {}",
+            before.width(),
+            after.width()
+        );
+        // Space redistributed, not destroyed: Title grew accordingly.
+        let title_before = panel_capture::latest("header_title").expect("title before");
+        let _ = title_before;
+        let title_after = panel_capture::latest("header_title")
+            .expect("title after")
+            .width();
+        assert!(
+            title_after > after.width() + 30.0,
+            "title absorbed the space artist gave up"
+        );
+
+        // Pinning: duration stays flush against the half's right edge
+        // under two different widths.
+        let rect_a = panel_capture::latest("header_duration").expect("dur");
+        ctx.data_mut(|d| d.insert_persisted(egui::Id::new(LIBRARY_FRACTION_KEY), 0.65_f32));
+        frame_block(&ctx, &mut st, &tracks, &mut library, &mut filter, &mut sort);
+        let half_wide = panel_capture::latest("playlist_tracks").expect("half");
+        let rect_b = panel_capture::latest("header_duration").expect("dur wide");
+        assert_close(
+            half_wide.right() - rect_b.right(),
+            0.0,
+            "duration pinned to half's right edge",
+        );
+        let _ = rect_a;
+    }
+
+    /// Releases the pointer without caring where it is.
+    fn release_all() -> Vec<egui::Event> {
+        vec![egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    // Given a library containing an entry with very long text fields.
+    // When the four columns render.
+    // Then every column sits at its imposed rect — oversized content
+    // cannot push or shrink siblings.
+    #[test]
+    fn wide_library_content_cannot_displace_columns() {
+        let mut state = PlaylistState::default();
+        let tracks = crate::tracks::Tracks::default();
+        let mut library = crate::library::LibraryState::default();
+        library.entries.push(crate::library::store::LibraryEntry {
+            root_id: 1,
+            rel_path: "a/very/long/path/that/goes/on/and/on/and/on.mp3".into(),
+            hash: TrackHash("h1".to_owned()),
+            artist: "A".repeat(200),
+            title: "T".repeat(200),
+            bpm: None,
+            key: None,
+            duration: None,
+            mtime_secs: 0,
+            size_bytes: 0,
+        });
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+
+        let ctx = egui::Context::default();
+        let screen = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        for _ in 0..3 {
+            panel_capture::reset();
+            let _unused = ctx.run(screen.clone(), |ctx| {
+                panel(
+                    ctx,
+                    &mut state,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    render_slice(&mut String::new(), &mut 138.0),
+                );
+            });
+        }
+        fn assert_close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 1e-3, "{what}: {a} vs {b}");
+        }
+        let get = |name: &str| panel_capture::latest(name).expect("captured");
+        // 1280 viewport minus the panel's 8px inner margin on both
+        // sides: halves split 1264 px evenly around a 12px divider. The
+        // playlist columns sit at fixed offsets no matter how wide the
+        // library's content measures.
+        let panel_left = get("roots").left();
+        let expected_tracks = 646.0 - 8.0 + panel_left;
+        assert_close(
+            get("playlist_tracks").left(),
+            expected_tracks,
+            "tracks x fixed",
+        );
+        // Playlists column: preferred width 170 inside its half.
+        let expected_playlists = get("playlist_tracks").right();
+        assert_close(
+            get("playlists").left(),
+            expected_playlists,
+            "playlists abuts tracks",
+        );
+        // Library half and playlist half are separated by the 12px
+        // divider — nothing overlaps and nothing shares an edge.
+        let gap = get("playlist_tracks").left() - get("entries").right();
+        assert_close(
+            gap,
+            crate::playlist::layout::DIVIDER_WIDTH,
+            "divider gap between halves",
+        );
+        assert!(get("playlists").width() > 100.0, "playlists alive");
+    }
+
+    // Given a context pre-seeded with junk remembered geometry under
+    // every panel id the old SidePanel row persisted, and a fresh
+    // context with none.
+    // When the four columns render on both.
+    // Then the column rects are identical — stale layout state cannot
+    // influence the imposed split.
+    #[test]
+    fn seeded_geometry_cannot_influence_column_layout() {
+        const REMOVED_PANEL_IDS: [&str; 3] =
+            ["library_roots", "library_entries", "playlist_tracks"];
+
+        let run = |ctx: &egui::Context| {
+            let mut state = PlaylistState::default();
+            let tracks = crate::tracks::Tracks::default();
+            let mut library = crate::library::LibraryState::default();
+            let mut filter = String::new();
+            let mut sort = crate::library::sort::SortState::default();
+            let screen = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            for _ in 0..3 {
+                panel_capture::reset();
+                let _unused = ctx.run(screen.clone(), |ctx| {
+                    panel(
+                        ctx,
+                        &mut state,
+                        &tracks,
+                        &mut library,
+                        &mut filter,
+                        &mut sort,
+                        render_slice(&mut String::new(), &mut 138.0),
+                    );
+                });
+            }
+            [
+                ("roots", panel_capture::latest("roots")),
+                ("entries", panel_capture::latest("entries")),
+                ("playlist_tracks", panel_capture::latest("playlist_tracks")),
+                ("playlists", panel_capture::latest("playlists")),
+            ]
+            .map(|(name, rect)| (name, rect.expect("captured")))
+        };
+
+        let pristine = run(&egui::Context::default());
+
+        let seeded = egui::Context::default();
+        for id in REMOVED_PANEL_IDS {
+            // Whatever shape the old panels used to persist their state
+            // under these ids, bury every likely key with junk: the row
+            // must not read any of it.
+            seeded.data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new(id),
+                    egui::Rect::from_min_size(egui::pos2(7_000.0, 7_000.0), egui::vec2(1.0, 1.0)),
+                );
+                d.insert_persisted(
+                    egui::Id::new(id),
+                    egui::Rect::from_min_size(egui::pos2(8_000.0, 8_000.0), egui::vec2(9.0, 9.0)),
+                );
+            });
+            // Also bury the divider fraction the layout legitimately
+            // reads: garbage values must clamp to sane bounds rather
+            // than corrupt the split.
+            seeded.data_mut(|d| {
+                d.insert_persisted(egui::Id::new(LIBRARY_FRACTION_KEY), f32::NAN);
+            });
+        }
+        let polluted = run(&seeded);
+
+        assert_eq!(
+            pristine, polluted,
+            "column rects must not depend on remembered state"
+        );
+    }
+    // Given a bare egui context drawing one click widget inside two
+    // nested scopes (the shape of our column/row containment).
+    // When the pointer moves onto it across warm frames and clicks.
+    // Then clicked() fires on the release frame — hit-testing works in
+    // this environment even under nested scoping.
+    #[test]
+    fn minimal_hover_click_works_headless() {
+        let ctx = egui::Context::default();
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let pos = egui::pos2(100.0, 30.0);
+        let mut results: Vec<(bool, bool, bool)> = Vec::new();
+        let mut frames: Vec<Vec<egui::Event>> = vec![
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ];
+        for events in frames.drain(..) {
+            let _ = ctx.run(screen(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.scope_builder(
+                        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 300.0),
+                        )),
+                        |outer| {
+                            outer.set_clip_rect(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(400.0, 300.0),
+                            ));
+                            outer.scope_builder(
+                                egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                                    egui::pos2(40.0, 20.0),
+                                    egui::vec2(200.0, 60.0),
+                                )),
+                                |inner| {
+                                    let (rect, resp) = inner.allocate_exact_size(
+                                        egui::vec2(120.0, 24.0),
+                                        egui::Sense::click(),
+                                    );
+                                    eprintln!("PROBE rect={rect:?}");
+                                    results.push((
+                                        resp.hovered(),
+                                        resp.clicked(),
+                                        rect.contains(pos),
+                                    ));
+                                },
+                            );
+                        },
+                    );
+                });
+            });
+        }
+        eprintln!("HOVERPROBE {:?}", results);
+        let last = results.last().copied().unwrap_or((false, false, false));
+        assert!(
+            last.1 && last.2,
+            "click must land and register: {results:?}"
+        );
+    }
+
+    fn ready_track(hash: &str, title: &str) -> crate::tracks::TrackRecord {
+        crate::tracks::TrackRecord {
+            hash: TrackHash(hash.to_owned()),
+            tags: crate::tracks::TrackTags {
+                title: title.into(),
+                artist: format!("artist of {title}"),
+                path: format!("/x/{title}.mp3").into(),
+            },
+            analysis: AnalysisState::Ready(crate::tracks::Analysis {
+                bpm: 174.0,
+                key: djcore::key::Key {
+                    root: 8,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 200.0,
+                grid: BeatGrid {
+                    grid_bpm: 174.0,
+                    anchor_seconds: 0.0,
+                    downbeats: vec![],
+                    beats: vec![],
+                    bars: vec![],
+                },
+                cues: CuePoints::default(),
+            }),
+        }
+    }
+
+    /// Headless driver for the row-layout regression tests: a fully
+    /// ready 3-track playlist rendered through the real [`super::panel`].
+    struct RowHarness {
+        ctx: egui::Context,
+        state: PlaylistState,
+        tracks: crate::tracks::Tracks,
+        library: crate::library::LibraryState,
+        filter: String,
+        sort: crate::library::sort::SortState,
+    }
+
+    impl RowHarness {
+        fn new() -> Self {
+            let mut tracks = crate::tracks::Tracks::default();
+            let hashes: Vec<TrackHash> = ["one", "two", "three"]
+                .iter()
+                .enumerate()
+                .map(|(i, title)| {
+                    let hash = TrackHash(format!("t{}", i + 1));
+                    tracks.upsert(ready_track(&hash.0, title));
+                    hash
+                })
+                .collect();
+            Self {
+                ctx: egui::Context::default(),
+                state: PlaylistState {
+                    contents: Contents::Loaded(hashes),
+                    ..Default::default()
+                },
+                tracks,
+                library: crate::library::LibraryState::default(),
+                filter: String::new(),
+                sort: crate::library::sort::SortState::default(),
+            }
+        }
+
+        /// Renders one frame with the given raw input, capturing row and
+        /// panel rects into `panel_capture`; returns emitted actions.
+        fn frame(&mut self, raw: egui::RawInput) -> PanelActions {
+            panel_capture::reset();
+            let Self {
+                ctx,
+                state,
+                tracks,
+                library,
+                filter,
+                sort,
+            } = self;
+            let mut out = String::new();
+            let mut bpm = 138.0_f32;
+            let mut actions = PanelActions::default();
+            let _ = ctx.run(raw, |ctx| {
+                actions = panel(
+                    ctx,
+                    state,
+                    tracks,
+                    library,
+                    filter,
+                    sort,
+                    super::tests::render_slice(&mut out, &mut bpm),
+                );
+            });
+            actions
+        }
+    }
+
+    fn screen(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        }
+    }
+
+    // Given three ready playlist tracks.
+    // When the panel renders warm frames.
+    // Then three distinct row strips are laid out: pairwise disjoint,
+    // vertically contiguous, uniform height, equal width.
+    #[test]
+    fn multi_row_playlist_renders_distinct_rows() {
+        let mut harness = RowHarness::new();
+
+        // When warm-up frames settle the layout.
+        for _ in 0..3 {
+            harness.frame(screen(vec![]));
+        }
+
+        // Then every track occupies its own strip.
+        let rows = panel_capture::rows();
+        assert_eq!(rows.len(), 3, "each visible track lays out one row");
+        for pair in rows.windows(2) {
+            let [a, b] = [pair[0], pair[1]];
+            assert!(
+                b.top() >= a.bottom() - f32::EPSILON && b.top() < a.bottom() + 1e-3,
+                "row strips must abut: {a:?} then {b:?}"
+            );
+        }
+        // And all strips share the row style's geometry.
+        assert!(
+            rows.windows(2)
+                .all(|p| (p[0].height() - p[1].height()).abs() < 1e-3),
+            "uniform row heights"
+        );
+        assert!(
+            rows.windows(2).all(|p| p[0].width() == p[1].width()),
+            "equal row widths"
+        );
+    }
+
+    // Given a warmed 3-track playlist.
+    // When the pointer clicks dead-center on the second row.
+    // Then exactly one LoadRow action fires carrying that row's hash.
+    #[test]
+    fn click_nth_row_loads_nth_track() {
+        let mut harness = RowHarness::new();
+        for _ in 0..3 {
+            harness.frame(screen(vec![]));
+        }
+        let rows = panel_capture::rows();
+        assert_eq!(rows.len(), 3);
+
+        // When clicking the middle of the SECOND row.
+        let target = rows[1].center();
+        let click = vec![
+            egui::Event::PointerMoved(target),
+            egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let actions = harness.frame(screen(click));
+
+        // Then the second track is the only thing loaded.
+        assert_eq!(
+            actions.actions,
+            vec![PanelAction::LoadRow(TrackHash("t2".to_owned()))],
+            "the clicked row decides what loads"
+        );
+    }
+
+    // Given a playlist longer than the scroll viewport.
+    // When the view scrolls down by an exact number of row strides.
+    // Then each visible row's top sits at a whole multiple of the row
+    // stride from the strip top.
+    #[test]
+    fn rows_align_with_scroll_offset() {
+        let ctx = egui::Context::default();
+        let mut tracks = crate::tracks::Tracks::default();
+        let hashes: Vec<TrackHash> = (0..40u32)
+            .map(|i| {
+                let h = TrackHash(format!("r{i}"));
+                tracks.upsert(ready_track(&h.0, &format!("track {i}")));
+                h
+            })
+            .collect();
+        let mut state = PlaylistState {
+            contents: Contents::Loaded(hashes),
+            ..Default::default()
+        };
+        let mut library = crate::library::LibraryState::default();
+        let mut filter = String::new();
+        let mut sort = crate::library::sort::SortState::default();
+        let screen = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..egui::RawInput::default()
+        };
+        let mut run = |events: Vec<egui::Event>| {
+            panel_capture::reset();
+            let mut out = String::new();
+            let mut bpm = 138.0_f32;
+            let _ = ctx.run(screen(events), |ctx| {
+                panel(
+                    ctx,
+                    &mut state,
+                    &tracks,
+                    &mut library,
+                    &mut filter,
+                    &mut sort,
+                    super::tests::render_slice(&mut out, &mut bpm),
+                );
+            });
+        };
+
+        // When scrolling the playlist-entries viewport down some rows.
+        run(vec![]);
+        run(vec![]);
+        // The observed stride between adjacent laid-out strips IS the
+        // virtualization grid; deriving it keeps this test decoupled
+        // from style internals.
+        let warm_rows = panel_capture::rows();
+        assert!(warm_rows.len() >= 2, "viewport shows several rows");
+        let stride = warm_rows[1].top() - warm_rows[0].top();
+        run(vec![egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -(stride * 5.0)),
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        // Let the smooth-scroll animation converge before measuring;
+        // intermediate frames sit at deliberately fractional offsets.
+        for _ in 0..40 {
+            run(vec![]);
+        }
+
+        // Then every visible row sits at the same stride-grid phase as
+        // before scrolling — whole rows slid under the viewport and no
+        // per-row jitter crept in.
+        let rows = panel_capture::rows();
+        assert!(!rows.is_empty(), "scrolled view still renders rows");
+        let phase_of = |top: f32| {
+            let p = top.rem_euclid(stride);
+            if (stride - p).abs() < 1e-3 { 0.0 } else { p }
+        };
+        let base = phase_of(warm_rows[0].top());
+        for rect in &rows {
+            assert!(
+                (phase_of(rect.top()) - base).abs() < 1e-3,
+                "row drifted off the virtualization grid: {rect:?} vs base phase {base}"
+            );
+        }
     }
 }
