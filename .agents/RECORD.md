@@ -18,7 +18,7 @@ The planner consults this file before proposing a plan. If a feature **contradic
 | ----------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | State       | `[Scope] currently [does X / is Y].`                             | "The TUI's first screen at startup is the chat screen."                                 |
 | Persistence | `[Scope] persists [what] to [where].`                            | "Sessions persist to SQLite."                                                           |
-| Flow        | `[Input/event] is handled by [actor/subsystem], which [action].` | "File edits route through the `edit` tool, which validates `LINE#HASH` anchors."        |
+| Flow        | `[Input/event] is handled by [actor/subsystem], which [action].` | "File edits route through the `edit` tool, which requires a unique match or `replace_all`."        |
 | Boundary    | `[Scope] is bounded by [constraint].`                            | "Project discovery walks ancestors until a VCS root or `$HOME`, whichever comes first." |
 
 ## Absence
@@ -31,8 +31,6 @@ Entries are added or amended **only with human approval**.
 
 ---
 
-<!-- Add entries below. Keep them scoped, factual, and high-level. -->
-
 - (analysis) Analysis lives in the shared `djcore` crate (a workspace member at `crates/djcore`, not a separate repository); it wraps stratum-dsp and uses a mono downmix.
 - (analysis) Decode, stretch, render, and WAV output are stereo (interleaved).
 - (analysis) Beat grids are constant-tempo: one rounded BPM and one phase anchor per track; beats/downbeats/bars arrays are projections of that grid, with the downbeat phase chosen by energy.
@@ -43,9 +41,10 @@ Entries are added or amended **only with human approval**.
 - (db) Track analysis persists BPM, key, and the beat grid per content hash; manual grid edits preserve the stored key.
 - (db) Playlists persist to the library database as ordered content-hash references with add-time paths; track tags (artist/title/duration) persist keyed by content hash.
 - (db) A stored grid (manual override or auto-detected) short-circuits re-analysis on load; a fresh analysis persists its auto grid to the library.
-- (engine) Playback is forward-only; seeking is permanently out of scope, and skip moves between transition points.
+- (engine) Playback is forward-only; seeking is out of scope, and skip moves between transition points.
 - (engine) Track order is user-authored; the engine plans transitions between adjacent tracks only.
-- (engine) Transitions overlap: the incoming track cues at a grid downbeat at the window start, the window is phase-snapped to the outgoing track's stretched beat grid so both decks' beats coincide during the overlap, and session length reflects the overlap.
+- (engine) Without user cues, an incoming track cues at its first downbeat when the grid is confident, else at zero.
+- (engine) The constant session grid aligns both decks' beats across an overlap by construction; plan-time verification only warns when an incoming cue drifts off the window's beat phase.
 - (engine) Time-scaling supports pitch-adjusted resampling (default) and pitch-preserving WSOLA; the default heuristic uses pitch-adjusted for stretches within ±8%.
 - (identity) automixah is an experimental auto-DJ application written in Rust, mixing fixed-BPM tracks into a continuous session.
 - (mixing) The mixer is driven by an addressed, MIDI-shaped control bus; automations are data timelines of control events behind a `ControlSource` trait.
@@ -75,7 +74,7 @@ Entries are added or amended **only with human approval**.
 - (ui) The scrub playhead is tracked in f64 frames; playback reaches the true end of any track (an f32 position would freeze at 2²⁴ frames ≈ 6.3 min).
 - (workflow) `just test` runs the fast suite via nextest; slow real-audio tests are `#[ignore]`d and run via `just test-heavy`.
 - (ui) Playlist renaming is inline: right-click → Rename swaps the playlist row for an in-place text editor where Enter or click-away commits (empty input reverts), Escape cancels, and duplicate names are rejected inline before the store.
-- (ui) The waveform peak track advances visual slots by fractional stride accumulation, so non-44.1 kHz sources render on a true-time timeline (an integer counter vs 48000/441 previously stretched 48 kHz renders ~86 ms/min).
+- (ui) The waveform peak track advances visual slots by fractional stride accumulation, so non-44.1 kHz sources render on a true-time timeline.
 - (ui) Grid beat lines render as thin translucent white and hide when beat spacing falls below ~4 px; white lines (downbeats) thin out by beat stride — every 4th, 8th, 16th… beat — once 4-beat spacing falls below ~50 px, and the zoom slider shows the current beats-per-white-line.
 - (ui) Playlist rows color the BPM light red when it deviates more than 8 BPM from the selected playlist's ready-track median.
 - (engine) Transitions overlap: the incoming track starts at its selected source in-cue at the transition window start, and a valid outgoing out-cue starts the configured automation window; when cues are absent or invalid, existing grid-derived placement is used.
@@ -94,14 +93,11 @@ Entries are added or amended **only with human approval**.
 - (ui) The library entries column is a columnar table (Artist, Title, BPM, Key, Duration, Folder): header clicks sort ascending then descending, right-click restores the default artist→title→path order, and missing values render as muted placeholders sorted last.
 - (ui) Library scan progress streams live: the walk enumerates and the scanner processes files incrementally, the display shows processed/discovered file counts during a scan, and the UI repaints while a scan is running.
 - (ui) Library scans split into a blocking-pool walker that streams discovered files to an async classifier (stat/hash/tags via spawn_blocking); progress reports per file as processed/discovered counts.
-- (ui) Scan progress is two-counter concurrent: the walker task reports file discovery (`seen`) independently of the classifier's per-file `done` count; the event sender merges both monotonic high-water marks so the wire event and applier stay unchanged.
-- (ui) Library scans are single-flight app-wide: a latch on `Services` drops any spawn while one scan runs (a concurrent walker pair previously double-counted scan progress), enforced in `spawn_scan` so every call site is covered.
+- (ui) Scan progress is two-counter concurrent: the walker task reports file discovery (`seen`) independently of the classifier's per-file `done` count, merged by monotonic high-water marks.
+- (ui) Library scans are single-flight app-wide: a latch on `Services` drops scan spawns while a scan runs.
 - (ui) A scan requested while another runs is queued as a follow-up full-library scan instead of dropped, so a folder added mid-scan is always indexed without a manual rescan.
-- ~~(ui) The bottom panel's four columns lay out through an egui_taffy flexbox row with fixed library-section widths; no gesture in the library section can move playlist-section geometry.~~
-  <!-- RETRACTED: taffy was removed after it re-shipped the very coupling this entry claimed dead.
-       Proposed replacement, pending human approval:
-  - (ui) The bottom panel splits into two imposed halves (library | playlist) with a draggable divider clamped to per-half minimum widths; the split fraction persists across restarts.
-   -->
+- (ui) The bottom panel splits into two imposed halves (library | playlist) with a draggable divider clamped to per-half minimum widths.
+- (ui) The bottom-panel split fraction persists to egui persisted memory for the session only; double-clicking the divider resets it to even halves.
 - (ui) Preview playback is a player separate from the grid-editor deck; the two never sound simultaneously — starting either pauses the other, loading a deck stops the preview.
 - (ui) Global keyboard shortcuts are ignored while any widget holds keyboard focus; keys route only to the focused input.
 - (ui) Space toggles the deck scrub; it never touches the preview player.
