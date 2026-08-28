@@ -84,8 +84,13 @@ pub fn transport_bar(
             // shrinks it: the scrubber's width derives from both ends so
             // it can never sweep underneath the fixed widgets ahead of it.
             let row = ui.available_rect_before_wrap();
-            if ui.button(if playing { "⏸" } else { "▶" }).clicked() {
+            let play = ui.button(if playing { "⏸" } else { "▶" });
+            if play.clicked() {
                 actions.toggle_play = true;
+                // The global Space handler ignores keys while any widget
+                // holds focus, and a clicked button keeps focus in egui;
+                // surrender it or the next Space would be swallowed.
+                ui.memory_mut(|m| m.surrender_focus(play.id));
             }
             ui.label(elapsed_label(position, source_frames, sample_rate));
 

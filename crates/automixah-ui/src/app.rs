@@ -998,6 +998,14 @@ impl AutomixahUiApp {
             return;
         };
         if actions.toggle_play {
+            // Solo latch: one audible source — the deck stays loaded but
+            // silent (state preserved); fresh loads latch in `apply_preview`.
+            if let Some(deck) = self.deck.as_mut()
+                && deck.scrub.command().playing
+            {
+                deck.scrub.pause();
+                deck.push_command();
+            }
             preview.player.toggle_play();
         }
         for frame in actions.seeks {
@@ -1016,6 +1024,15 @@ impl AutomixahUiApp {
             && !preview.player.is_audible()
             && self.preview_load.is_none()
         {
+            // Solo latch: one audible source — the deck stays
+            // loaded but silent (state preserved). Fresh loads are
+            // latched in `apply_preview`; a resume must latch too.
+            if let Some(deck) = self.deck.as_mut()
+                && deck.scrub.command().playing
+            {
+                deck.scrub.pause();
+                deck.push_command();
+            }
             let path = std::mem::take(&mut preview.path);
             self.preview_load = Some(PreviewLoad {
                 hash: hash.clone(),
@@ -1471,9 +1488,14 @@ impl eframe::App for AutomixahUiApp {
         // Transport intents are applied after row actions: a just-loaded
         // deck (row click) wins over the same frame's bar gestures.
         self.handle_transport_actions(transport_actions);
-        if ctx.input(|i| i.key_pressed(egui::Key::Space))
-            && let Some(deck) = self.deck.as_mut()
-        {
+        // Global transport key, reserved for the deck: ignored while any
+        // widget holds keyboard focus (typing in a search box, rename
+        // editor, or DragValue must never scrub). Stopping a preview is
+        // the preview's own controls or a beatgrid scrub; when Space makes
+        // the deck audible, the per-frame arbitration parks the preview.
+        let space_pressed =
+            ctx.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.wants_keyboard_input();
+        if space_pressed && let Some(deck) = self.deck.as_mut() {
             deck.scrub.toggle_play();
             deck.push_command();
         }
@@ -1528,6 +1550,21 @@ impl eframe::App for AutomixahUiApp {
         // pushed here, so this must not be call-site dependent.
         if let Some(deck) = self.deck.as_mut() {
             deck.push_command();
+        }
+        // Solo arbitration: one choke point keeping exactly one player
+        // audible. A deck that just became audible (Space, a waveform
+        // drag, any future deck-start path) pauses the preview. The deck
+        // command must be read after the push above and before mutating
+        // the preview — one borrow of `self` at a time.
+        let deck_audible = self
+            .deck
+            .as_ref()
+            .is_some_and(|d| d.scrub.command().playing);
+        if deck_audible
+            && let Some(preview) = self.preview.as_mut()
+            && preview.player.is_audible()
+        {
+            preview.player.pause();
         }
         // Per-frame preview upkeep: latches the auto-stop at the true
         // end and publishes the resulting command.
@@ -1721,6 +1758,12 @@ impl AutomixahUiApp {
     /// Simulates a loaded deck for save-path testing.
     pub fn inject_deck_for_test(&mut self, outcome: crate::bus::LoadOutcome) {
         self.deck = Some(crate::deck::Deck::new(outcome).expect("deck"));
+    }
+
+    /// Drives one egui frame against the app, headless. Wrap in
+    /// `ctx.run(raw_input, |ctx| ...)` to feed events.
+    pub fn test_update(&mut self, ctx: &egui::Context) {
+        eframe::App::update(self, ctx, &mut eframe::Frame::_new_kittest());
     }
 
     /// Applies a grid shift and marks dirty, like the gesture path.
@@ -2604,6 +2647,322 @@ mod tests {
             app.preview_load.is_some(),
             "the live request stays in flight"
         );
+    }
+
+    /// Deck fixture: a loaded deck over four silent frames.
+    fn deck_fixture(app: &mut AutomixahUiApp, hash: &TrackHash) {
+        app.inject_deck_for_test(crate::bus::LoadOutcome {
+            hash: hash.clone(),
+            path: "/deck-fixture.wav".into(),
+            analysis: crate::tracks::Analysis {
+                grid: djcore::analyzer::BeatGrid::default(),
+                bpm: 128.0,
+                key: djcore::key::Key {
+                    root: 9,
+                    mode: djcore::key::KeyMode::Minor,
+                },
+                duration_seconds: 1.0,
+                cues: automixah_engine::timeline::types::CuePoints::default(),
+            },
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 4],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+            peaks: crate::audio::peaks::Peaks::build_with_channels(&[0.0; 4], 44_100, 1),
+        });
+    }
+
+    /// True when a Space keypress event reaches the app this frame.
+    fn space_frame() -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    // Given a loaded deck and a widget holding keyboard focus (the gate
+    // only consults `focused().is_some()`, so any id stands in for a
+    // TextEdit).
+    // When a Space press frame runs.
+    // Then the deck scrub stays silent.
+    #[test]
+    fn space_with_focused_text_edit_leaves_deck_unchanged() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
+
+        let _ = ctx.run(space_frame(), |ctx| app.test_update(ctx));
+
+        assert!(
+            !app.deck.as_ref().expect("deck").scrub.command().playing,
+            "Space with a focused widget never touches the deck"
+        );
+    }
+
+    // Given a loaded deck and no focused widget.
+    // When a Space press frame runs.
+    // Then the deck command turns playing; a second Space turns it back.
+    #[test]
+    fn space_without_focus_toggles_deck() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(space_frame(), |ctx| app.test_update(ctx));
+        assert!(
+            app.deck.as_ref().expect("deck").scrub.command().playing,
+            "Space with no focused widget starts the deck"
+        );
+
+        // When a second Space frame runs.
+        let _ = ctx.run(space_frame(), |ctx| app.test_update(ctx));
+
+        // Then the deck is paused again.
+        assert!(
+            !app.deck.as_ref().expect("deck").scrub.command().playing,
+            "second Space pauses the deck"
+        );
+    }
+
+    // Given a loaded deck and an audible preview.
+    // When a Space press frame runs.
+    // Then the deck starts audibly and the preview is parked — one
+    // audible source, and Space belongs to the deck alone.
+    #[test]
+    fn space_starts_deck_and_parks_audible_preview() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        let hash = TrackHash("preview-me".to_owned());
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "P".to_owned(),
+                artist: String::new(),
+                path: "/preview-me.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        app.preview_load = Some(PreviewLoad {
+            hash: hash.clone(),
+            path: "/preview-me.wav".into(),
+        });
+        app.apply_preview(Event::PreviewLoaded {
+            hash,
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 88_200],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        });
+        assert!(
+            app.preview.as_ref().expect("preview").player.is_audible(),
+            "preview starts audibly in this fixture"
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(space_frame(), |ctx| app.test_update(ctx));
+
+        assert!(
+            app.deck.as_ref().expect("deck").scrub.command().playing,
+            "Space starts the deck even while a preview plays"
+        );
+        assert!(
+            !app.preview.as_ref().expect("preview").player.is_audible(),
+            "the audible preview is parked in the same frame"
+        );
+    }
+
+    // Given a playing preview and no deck loaded.
+    // When a Space press frame runs.
+    // Then the preview keeps playing — Space never touches the preview.
+    #[test]
+    fn space_with_no_deck_leaves_preview_audible() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        let hash = TrackHash("preview-me".to_owned());
+        app.tracks.upsert(TrackRecord {
+            hash: hash.clone(),
+            tags: crate::tracks::TrackTags {
+                title: "P".to_owned(),
+                artist: String::new(),
+                path: "/preview-me.wav".into(),
+            },
+            analysis: AnalysisState::Queued,
+        });
+        app.preview_load = Some(PreviewLoad {
+            hash: hash.clone(),
+            path: "/preview-me.wav".into(),
+        });
+        app.apply_preview(Event::PreviewLoaded {
+            hash,
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 88_200],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        });
+        assert!(app.preview.as_ref().expect("preview").player.is_audible());
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(space_frame(), |ctx| app.test_update(ctx));
+
+        assert!(
+            app.preview.as_ref().expect("preview").player.is_audible(),
+            "the preview keeps playing; Space has no preview behavior"
+        );
+        assert!(app.deck.is_none());
+    }
+
+    // Given a loaded deck and a playing preview.
+    // When the deck scrub turns audible directly (as Space or a waveform
+    // drag would) and a frame runs.
+    // Then the preview is parked and the deck stays audible — one
+    // audible source.
+    #[test]
+    fn deck_turning_audible_pauses_audible_preview() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        app.preview_load = Some(PreviewLoad {
+            hash: TrackHash("preview-me".to_owned()),
+            path: "/preview-me.wav".into(),
+        });
+        app.apply_preview(Event::PreviewLoaded {
+            hash: TrackHash("preview-me".to_owned()),
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 88_200],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        });
+        app.deck.as_mut().expect("deck").scrub.toggle_play();
+        assert!(app.preview.as_ref().expect("preview").player.is_audible());
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.test_update(ctx));
+
+        assert!(
+            !app.preview.as_ref().expect("preview").player.is_audible(),
+            "audible deck parks the preview"
+        );
+        assert!(
+            app.deck.as_ref().expect("deck").scrub.command().playing,
+            "the deck keeps playing"
+        );
+    }
+
+    // Given an audible preview and a deck mid-drag (the `Dragging` state
+    // is audible — `command().playing` is true).
+    // When a frame runs.
+    // Then the preview is parked.
+    #[test]
+    fn waveform_drag_while_preview_audible_pauses_preview() {
+        let mut app = AutomixahUiApp::new(
+            crate::playlist::queue::tests::fake_services(
+                crate::playlist::queue::tests::output_fixture(),
+            ),
+            crate::bus::EventBus::without_repaint(),
+        );
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        app.preview_load = Some(PreviewLoad {
+            hash: TrackHash("preview-me".to_owned()),
+            path: "/preview-me.wav".into(),
+        });
+        app.apply_preview(Event::PreviewLoaded {
+            hash: TrackHash("preview-me".to_owned()),
+            audio: djcore::decoder::DecodeAudio {
+                samples: vec![0.0; 88_200],
+                sample_rate: 44_100,
+                channels: 1,
+            },
+        });
+        let deck = app.deck.as_mut().expect("deck");
+        deck.scrub.drag_start();
+        assert!(app.preview.as_ref().expect("preview").player.is_audible());
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.test_update(ctx));
+
+        assert!(
+            !app.preview.as_ref().expect("preview").player.is_audible(),
+            "a deck drag parks an audible preview"
+        );
+    }
+
+    // Given an audible deck and a parked preview for its own hash with no
+    // decode in flight.
+    // When the preview is re-requested (the parked-preview resume branch).
+    // Then the deck is paused — the resume must not layer a second
+    // audible source under the deck.
+    #[test]
+    fn preview_resume_pauses_audible_deck() {
+        let services = crate::playlist::queue::tests::fake_services(
+            crate::playlist::queue::tests::output_fixture(),
+        );
+        let dir = tempfile::tempdir().expect("temp");
+        let bytes = crate::playlist::queue::tests::wav_bytes(1.0);
+        std::fs::write(dir.path().join("t.wav"), &bytes).expect("write");
+        let mut app =
+            AutomixahUiApp::new(services.clone(), crate::bus::EventBus::without_repaint());
+        deck_fixture(&mut app, &TrackHash("deck".to_owned()));
+        app.deck.as_mut().expect("deck").scrub.toggle_play();
+        app.preview = Some(ActivePreview {
+            player: {
+                // `start` begins audibly; park it — the resume branch is
+                // for a preview that exists but is not sounding.
+                let mut player =
+                    crate::audio::preview::PreviewPlayer::start(djcore::decoder::DecodeAudio {
+                        samples: vec![0.0; 88_200],
+                        sample_rate: 44_100,
+                        channels: 1,
+                    })
+                    .expect("player");
+                player.pause();
+                player
+            },
+            hash: TrackHash(crate::track::identity::hex_sha256(&bytes)),
+            path: dir.path().join("t.wav"),
+            title: "P".to_owned(),
+        });
+
+        app.toggle_preview(&app.preview.as_ref().expect("preview").hash.clone(), None);
+
+        assert!(
+            !app.deck.as_ref().expect("deck").scrub.command().playing,
+            "the resume path pauses an audible deck"
+        );
+        assert!(app.preview_load.is_some(), "decode was requested");
     }
 
     // Given a running preview.

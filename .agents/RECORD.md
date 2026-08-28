@@ -102,6 +102,8 @@ Entries are added or amended **only with human approval**.
        Proposed replacement, pending human approval:
   - (ui) The bottom panel splits into two imposed halves (library | playlist) with a draggable divider clamped to per-half minimum widths; the split fraction persists across restarts.
    -->
-- (ui) Preview playback is a player separate from the grid-editor deck; the two never sound simultaneously — starting a preview pauses the deck, loading a deck stops the preview.
+- (ui) Preview playback is a player separate from the grid-editor deck; the two never sound simultaneously — starting either pauses the other, loading a deck stops the preview.
+- (ui) Global keyboard shortcuts are ignored while any widget holds keyboard focus; keys route only to the focused input.
+- (ui) Space toggles the deck scrub; it never touches the preview player.
 - (ui) Middle-clicking a playlist row or library entry plays the track in the preview player via decode-only load (no hash, analysis, or peaks); playlist single-click keeps loading the editor.
 - (ui) An always-visible transport bar spans the window width along the very bottom and scrubs the active preview (click and drag seek, play/pause).
